@@ -144,7 +144,7 @@ class ImplementationWeight(Protocol):
 
 class CandidateWeight(Generic[Weight]):
     weight: Weight
-    def __lt__(self, other: CandidateWeight[Weight]) -> bool:
+    def __lt__(self, other: "CandidateWeight[Weight]") -> bool:
         return self.weight < other.weight
     "#,
 );
@@ -162,7 +162,7 @@ class ImplementationWeight(Protocol):
 
 class CandidateWeight(Generic[Weight]):
     weight: Weight
-    def __add__(self, other: CandidateWeight[Weight]) -> Weight:
+    def __add__(self, other: "CandidateWeight[Weight]") -> Weight:
         return self.weight + other.weight
     "#,
 );
@@ -642,6 +642,70 @@ c = C()
 assert_type(+c, Literal[5])
 assert_type(-c, Literal[-5])
 assert_type(~c, Literal[100])
+    "#,
+);
+
+testcase!(
+    test_unary_dunders_metaclass,
+    r#"
+from typing import assert_type
+
+class Meta(type):
+    def __invert__(cls) -> str:
+        return ""
+    def __neg__(cls) -> bytes:
+        return b""
+    def __pos__(cls) -> float:
+        return 0.0
+
+class C(metaclass=Meta):
+    def __invert__(self) -> int:
+        return 0
+    def __neg__(self) -> int:
+        return 0
+    def __pos__(self) -> int:
+        return 0
+
+class D(C):
+    pass
+
+assert_type(~C, str)
+assert_type(-C, bytes)
+assert_type(+C, float)
+assert_type(~D, str)
+assert_type(-D, bytes)
+assert_type(+D, float)
+assert_type(~C(), int)
+assert_type(-C(), int)
+assert_type(+C(), int)
+
+def check_class(cls: type[C]) -> None:
+    assert_type(~cls, str)
+    assert_type(-cls, bytes)
+    assert_type(+cls, float)
+
+def check_subclass[T: C](cls: type[T]) -> None:
+    assert_type(~cls, str)
+    assert_type(-cls, bytes)
+    assert_type(+cls, float)
+    "#,
+);
+
+testcase!(
+    test_unary_dunders_metaclass_getattr,
+    r#"
+from typing import Callable
+
+class Meta(type):
+    def __getattr__(cls, name: str) -> Callable[[], int]:
+        return lambda: 0
+
+class C(metaclass=Meta):
+    pass
+
+~C  # E: Unary `~` is not supported on `type[C]`
+-C  # E: Unary `-` is not supported on `type[C]`
++C  # E: Unary `+` is not supported on `type[C]`
     "#,
 );
 
@@ -1510,6 +1574,57 @@ assert_type(Left() + Right(), int)  # E: `Left.__add__` is deprecated  # E: `Rig
     "#,
 );
 
+testcase!(
+    test_deprecated_overload_operator,
+    r#"
+from typing import assert_type, overload
+from warnings import deprecated
+
+class Plain:
+    @deprecated("DEPRECATED")
+    def __add__(self, other: int) -> int: ...
+
+class Overloaded:
+    @deprecated("DEPRECATED")
+    @overload
+    def __add__(self, other: int) -> int: ...
+    @overload
+    def __add__(self, other: str) -> str: ...
+    def __add__(self, other: int | str) -> int | str:
+        return other
+
+class Selected[T]:
+    @deprecated("DEPRECATED")
+    @overload
+    def __add__(self: "Selected[int]", other: int) -> int: ...
+    @overload
+    def __add__(self: "Selected[str]", other: str) -> str: ...
+    def __add__(self, other: int | str) -> int | str:
+        return other
+
+class Right:
+    def __radd__(self, other: object) -> str: ...
+
+class Reflected:
+    @deprecated("DEPRECATED")
+    @overload
+    def __add__(self, other: Right) -> int: ...
+    @overload
+    def __add__(self, other: str) -> str: ...
+    def __add__(self, other: Right | str) -> int | str:
+        return 0
+
+def test(g: Selected[int]):
+    assert_type(Reflected() + Right(), int)  # E: Call to deprecated overload `Reflected.__add__`
+    Plain() + 1  # E: `Plain.__add__` is deprecated
+    Overloaded() + 1  # E: Call to deprecated overload `Overloaded.__add__`
+    g + 1  # E: Call to deprecated overload `Selected.__add__`
+    Plain() + 1  # pyrefly: ignore[deprecated]
+    Overloaded() + 1  # pyrefly: ignore[deprecated]
+    g + 1  # pyrefly: ignore[deprecated]
+    "#,
+);
+
 // We try __iadd__ and some fallback dunders. When all fail, the least confusing option is to use __iadd__.
 testcase!(
     test_iadd_error,
@@ -1727,7 +1842,7 @@ assert_type(A() + B(), A)  # E: `A.__add__` is deprecated
     "#,
 );
 
-// https://github.com/facebook/pyrefly/issues/396
+// https://github.com/pyrefly-org/pyrefly/issues/396
 testcase!(
     test_bind_dunder_callable_simple,
     r#"
@@ -1743,7 +1858,7 @@ def test(foo: Foo) -> None:
     "#,
 );
 
-// https://github.com/facebook/pyrefly/issues/396
+// https://github.com/pyrefly-org/pyrefly/issues/396
 testcase!(
     test_bind_dunder_callable_2,
     r#"
@@ -1791,7 +1906,7 @@ True & ThisClassDoesNotWork(False)
     "#,
 );
 
-// https://github.com/facebook/pyrefly/issues/3876
+// https://github.com/pyrefly-org/pyrefly/issues/3876
 testcase!(
     test_reflected_dunder_subclass_priority,
     r#"
@@ -1852,7 +1967,7 @@ def test(a: A, b: B, c: C) -> None:
     "#,
 );
 
-// https://github.com/facebook/pyrefly/issues/4342
+// https://github.com/pyrefly-org/pyrefly/issues/4342
 testcase!(
     test_date_datetime_comparison,
     r#"
@@ -1877,6 +1992,30 @@ dt < datetime.now()
 "#,
 );
 
+// Newer typeshed makes `datetime` generic over its `tzinfo`. The check must still apply when
+// `datetime` has type arguments that differ from its defaults.
+testcase!(
+    test_date_datetime_comparison_generic_datetime,
+    TestEnv::one(
+        "datetime",
+        r#"
+from typing import Generic, TypeVar
+class tzinfo: ...
+_TzInfoT = TypeVar("_TzInfoT", bound=tzinfo | None, default=tzinfo | None)
+class date:
+    def __lt__(self, value: "date", /) -> bool: ...
+class datetime(date, Generic[_TzInfoT]): ...
+"#,
+    ),
+    r#"
+from datetime import date, datetime
+
+def f(d: date, dt: datetime[None]):
+    dt < d  # E: `<` is not supported between `datetime[None]` and `date`
+    d < dt  # E: `<` is not supported between `date` and `datetime[None]`
+"#,
+);
+
 testcase!(
     test_bitor_unknown_operands,
     r#"
@@ -1893,7 +2032,7 @@ def test(x, y):
 "#,
 );
 
-// https://github.com/facebook/pyrefly/issues/972
+// https://github.com/pyrefly-org/pyrefly/issues/972
 testcase!(
     test_int_pow_inference,
     r#"
@@ -2014,7 +2153,7 @@ p += 1  # E: `+=` is not supported
 "#,
 );
 
-// https://github.com/facebook/pyrefly/issues/2914
+// https://github.com/pyrefly-org/pyrefly/issues/2914
 testcase!(
     test_bool_conversion_non_callable,
     r#"
@@ -2025,7 +2164,7 @@ assert BadBool()  # E: The `__bool__` attribute of `BadBool` has type `int`, whi
 "#,
 );
 
-// https://github.com/facebook/pyrefly/issues/2913
+// https://github.com/pyrefly-org/pyrefly/issues/2913
 testcase!(
     test_bool_conversion_in_contains,
     r#"
@@ -2101,11 +2240,11 @@ def f(x: Oops | None, y: None | Oops):  # E:  # E:
     assert_type(y, Any | None)
 
 UnknownType: Any
-def g(x: UnknownType | None, y: None | UnknownType):
+def g(x: "UnknownType | None", y: "None | UnknownType"):
     assert_type(x, Any | None)
     assert_type(y, Any | None)
 
-def h(x: Oops | UnknownType, y: UnknownType | Oops):  # E:  # E:
+def h(x: "Oops | UnknownType", y: "UnknownType | Oops"):  # E:  # E:
     assert_type(x, Any)
     assert_type(y, Any)
     "#,
@@ -2227,4 +2366,12 @@ def literal_union[T: (Literal[0, 1], Literal[2])](x: T, y: T) -> Literal[0]:
         return x + y  # E: is not assignable to declared return type `Literal[0]`
     return 0
 "#,
+);
+
+testcase!(
+    test_eq_on_class_of_typevar_type,
+    r#"
+def f[V](x: type[V]) -> None:
+    x.__class__ == int
+    "#,
 );

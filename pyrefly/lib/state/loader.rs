@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use dupe::Dupe;
+use pyrefly_build::handle::SitePackagePath;
 use pyrefly_config::error_kind::ErrorKind;
 use pyrefly_python::module_name::ModuleName;
 use pyrefly_python::module_path::ModulePath;
@@ -21,7 +22,6 @@ use vec1::vec1;
 
 use crate::config::config::ConfigFile;
 use crate::config::config::ConfigSource;
-use crate::config::config::FallbackSearchPath;
 use crate::config::config::ImportLookupPathPart;
 use crate::error::context::ErrorContext;
 use crate::module::finder::DirEntryCache;
@@ -48,6 +48,8 @@ pub enum FindError {
     /// a message to the user which will allow them to install the stubs for the package.
     /// The string will hold the name of the pip package that we will tell the user to install.
     UntypedImport(ModuleName, Arc<String>),
+    /// An installed library lacks type information, with no known stubs package to recommend.
+    UntypedImportNoStubs(ModuleName),
     /// This is the condition where we are using stubs but we do not have the source files
     MissingSourceForStubs(ModuleName),
 }
@@ -138,6 +140,12 @@ impl FindError {
                 Some(Box::new(|| ErrorContext::ImportNotTyped(*source_package))),
                 vec1![format!("Hint: install the `{stubs_package}` package")],
             ),
+            Self::UntypedImportNoStubs(module) => (
+                None,
+                vec1![format!(
+                    "Module `{module}` has no type stubs or `py.typed` marker"
+                )],
+            ),
         }
     }
 
@@ -150,6 +158,7 @@ impl FindError {
             Self::MissingSource(..) => Some(ErrorKind::MissingSource),
             Self::MissingSourceForStubs(..) => Some(ErrorKind::MissingSourceForStubs),
             Self::UntypedImport(..) => Some(ErrorKind::UntypedImport),
+            Self::UntypedImportNoStubs(..) => Some(ErrorKind::UntypedImportNoStubs),
             Self::Ignored => None,
         }
     }
@@ -255,6 +264,27 @@ pub struct LoaderFindCache {
 }
 
 impl LoaderFindCache {
+    /// A loader that resolves imports with `config`, but in the Python environment with
+    /// site-package path `site_package_path` rather than `config`'s own, if one is given.
+    pub fn new_in_environment(
+        config: &ArcId<ConfigFile>,
+        site_package_path: Option<SitePackagePath>,
+    ) -> Self {
+        let Some(site_package_path) = site_package_path else {
+            return Self::new(config.dupe());
+        };
+        // Clear the paths queried from the interpreter as well, so that `site_package_path()`
+        // is exactly `site_package_path`.
+        let mut config = ConfigFile::clone(config);
+        config.python_environment.site_package_path = Some(site_package_path.paths().to_vec());
+        config
+            .python_environment
+            .interpreter_site_package_path
+            .clear();
+        config.python_environment.interpreter_editable_path.clear();
+        Self::new(ArcId::new(config))
+    }
+
     pub fn new(config: ArcId<ConfigFile>) -> Self {
         // When no config feature uses origin, all import resolutions produce
         // the same result regardless of which file is importing. We can then
@@ -262,10 +292,7 @@ impl LoaderFindCache {
         // (112K files × thousands of modules) to just thousands.
         let is_origin_independent = config.source_db.is_none()
             && config.sub_configs.is_empty()
-            && !matches!(
-                config.fallback_search_path,
-                FallbackSearchPath::DirectoryRelative(_)
-            );
+            && !config.fallback_search_path.depends_on_importing_file();
         Self {
             config,
             is_origin_independent,
@@ -461,10 +488,7 @@ impl LoaderFindCache {
             .as_ref()
             .is_some_and(|source_db| !source_db.may_contain_module(module))
             && self.config.sub_configs.is_empty()
-            && !matches!(
-                self.config.fallback_search_path,
-                FallbackSearchPath::DirectoryRelative(_)
-            )
+            && !self.config.fallback_search_path.depends_on_importing_file()
     }
 
     #[allow(unused)] // will be used soon
@@ -572,6 +596,51 @@ mod tests {
         let other_first = new_loader();
         assert_eq!(find(&other_first, &other), bundled);
         assert_eq!(find(&other_first, &owner), bundled);
+    }
+
+    #[test]
+    fn test_use_shape_comments_and_stubs_bundled_cache() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let root = tempdir.path();
+        TestPath::setup_test_directory(
+            root,
+            vec![
+                TestPath::dir("six", vec![TestPath::file("__init__.py")]),
+                TestPath::dir("six-shape-stubs", vec![TestPath::file("__init__.pyi")]),
+            ],
+        );
+        let first = ModulePath::memory(root.join("first/main.py"));
+        let second = ModulePath::memory(root.join("second/main.py"));
+        for compatibility in [false, true] {
+            let mut config = ConfigFile::parse_config(&format!(
+                "use-shape-comments-and-stubs = {compatibility}\n\
+                 [[sub-config]]\n\
+                 matches = '**/second/**'\n",
+            ))
+            .unwrap();
+            config.python_environment.set_empty_to_default();
+            config.python_environment.site_package_path = Some(vec![root.to_path_buf()]);
+            config.disable_search_path_heuristics = true;
+            config.configure();
+            let config = ArcId::new(config);
+            for origins in [[&first, &second, &first], [&second, &first, &second]] {
+                let loader = LoaderFindCache::new(config.dupe());
+                for origin in origins {
+                    let path = loader
+                        .find_import(ModuleName::from_str("six"), Some(origin), None)
+                        .finding()
+                        .unwrap();
+                    if compatibility {
+                        assert_eq!(
+                            path,
+                            ModulePath::filesystem(root.join("six-shape-stubs/__init__.pyi"))
+                        );
+                    } else {
+                        assert!(path.is_bundled(), "opt-out must restore the bundled stub");
+                    }
+                }
+            }
+        }
     }
 
     #[test]

@@ -6,6 +6,8 @@
  */
 
 use std::collections::VecDeque;
+use std::iter::once;
+use std::iter::successors;
 use std::sync::Arc;
 
 use dupe::Dupe;
@@ -27,7 +29,9 @@ use pyrefly_types::known_class::KnownClass;
 use pyrefly_types::literal::LitStyle;
 use pyrefly_types::quantified::AnchorIndex;
 use pyrefly_types::quantified::Quantified;
+use pyrefly_types::quantified::QuantifiedAnchor;
 use pyrefly_types::quantified::QuantifiedIdentity;
+use pyrefly_types::quantified::QuantifiedKind;
 use pyrefly_types::quantified::QuantifiedOrigin;
 use pyrefly_types::type_level_dsl::ParsedTypeShapeDslFunction;
 use pyrefly_types::type_var::PreInferenceVariance;
@@ -37,6 +41,7 @@ use pyrefly_types::types::BoundMethod;
 use pyrefly_types::types::BoundMethodType;
 use pyrefly_types::types::TParams;
 use pyrefly_types::types::TParamsSource;
+use pyrefly_types::types::UnpackKind;
 use pyrefly_util::display::pluralize;
 use pyrefly_util::owner::Owner;
 use pyrefly_util::prelude::SliceExt;
@@ -74,11 +79,13 @@ use crate::binding::binding::KeyDecorator;
 use crate::binding::binding::KeyLegacyTypeParam;
 use crate::binding::binding::KeyUndecoratedFunction;
 use crate::binding::classmethod::MethodReceiverKind;
+use crate::config::base::ClassDecoratorBehavior;
 use crate::config::error_kind::ErrorKind;
 use crate::error::collector::ErrorCollector;
 use crate::error::context::TypeCheckContext;
 use crate::error::context::TypeCheckKind;
 use crate::solver::solver::QuantifiedHandle;
+use crate::solver::solver::SubsetError;
 use crate::types::callable::Callable;
 use crate::types::callable::DefaultValue;
 use crate::types::callable::Param;
@@ -87,6 +94,7 @@ use crate::types::callable::PrefixParam;
 use crate::types::callable::Required;
 use crate::types::callable::params_are_gradual_variadic;
 use crate::types::class::ClassKind;
+use crate::types::env::TypeEnv;
 use crate::types::function::FuncDefIndex;
 use crate::types::function::FuncFlags;
 use crate::types::function::FuncMetadata;
@@ -94,6 +102,7 @@ use crate::types::function::Function;
 use crate::types::function::FunctionKind;
 use crate::types::function::PropertyMetadata;
 use crate::types::function::PropertyRole;
+use crate::types::keywords::DataclassFieldDefault;
 use crate::types::keywords::DataclassTransformMetadata;
 use crate::types::types::CalleeKind;
 use crate::types::types::Forall;
@@ -113,17 +122,17 @@ fn default_display_for_expr(expr: &Expr, source: &str) -> Option<String> {
     matches!(inner_expr, Expr::NumberLiteral(_)).then(|| source.to_owned())
 }
 
-fn is_class_property_decorator_class_object(cls: &Class) -> bool {
-    let cls_name = cls.name();
+fn is_class_property_decorator_class_object<E: TypeEnv + ?Sized>(env: &E, cls: &Class) -> bool {
+    let cls_name = cls.name(env);
     // Obviously this is just a very naive heuristic. But it's not a crazy convention
     // either and we have important customers that badly wants support of class properties.
     cls_name == "classproperty" || cls_name == "lazy_classproperty"
 }
 
-fn is_class_property_decorator_type(ty: &Type) -> bool {
+fn is_class_property_decorator_type<E: TypeEnv + ?Sized>(env: &E, ty: &Type) -> bool {
     match ty {
-        Type::ClassDef(cls) => is_class_property_decorator_class_object(cls),
-        Type::ClassType(cls) => is_class_property_decorator_class_object(cls.class_object()),
+        Type::ClassDef(cls) => is_class_property_decorator_class_object(env, cls),
+        Type::ClassType(cls) => is_class_property_decorator_class_object(env, cls.class_object()),
         _ => false,
     }
 }
@@ -301,11 +310,23 @@ impl DecoratorParamHints {
     }
 }
 
+/// How a class decorator's result affects the type bound to the class's name.
+enum ClassDecoratorResult {
+    /// The result replaces the class.
+    Applied(Type),
+    /// The decorator explicitly returns `type[Any]`, which erases the class interface.
+    Erased,
+    /// The result is unknown, so the class is kept and the decorator is reported as untyped.
+    Untyped,
+    /// The class is kept without a report.
+    Kept,
+}
+
 impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
     fn decorator_param_hints(&self, decorators: &[(Type, usize)]) -> Option<DecoratorParamHints> {
         decorators.iter().rev().find_map(|(decorator_ty, _)| {
             decorator_ty
-                .callable_first_param(self.heap)
+                .callable_first_param(self.heap, self)
                 .and_then(|param_ty| {
                     param_ty
                         .toplevel_callable_signatures()
@@ -597,22 +618,8 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         !self.set_flag_from_special_decorator(&mut flags, &special_decorator)
                     }
                     None => {
-                        if is_class_property_decorator_type(&decorator.ty) {
+                        if is_class_property_decorator_type(self, &decorator.ty) {
                             found_class_property = true;
-                        }
-                        if matches!(
-                            &decorator.ty,
-                            Type::Any(AnyStyle::Implicit | AnyStyle::Explicit)
-                        ) {
-                            self.error(
-                                errors,
-                                range,
-                                ErrorKind::UntypedFunctionDecorator,
-                                format!(
-                                    "Untyped function decorator obscures the type of function `{}`",
-                                    def.name
-                                ),
-                            );
                         }
                         true
                     }
@@ -676,7 +683,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     Name::new_static("Receiver"),
                     QuantifiedIdentity::new(
                         self.module().name(),
-                        AnchorIndex::first(def.name.range),
+                        AnchorIndex::first(QuantifiedAnchor::Function(def_index)),
                         QuantifiedOrigin::MethodReceiver,
                     ),
                     None,
@@ -701,7 +708,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         // staticmethod that still takes `cls`). Skip `@no_type_check` for ordinary
         // instance methods, properties/staticmethods other than `__new__`, and
         // unresolved custom decorators that may reshape the signature.
-        // See https://github.com/facebook/pyrefly/issues/5295 and #5294.
+        // See https://github.com/pyrefly-org/pyrefly/issues/5295 and #5294.
         let missing_receiver_param = defining_cls.is_some()
             && decorators.is_empty()
             && def.parameters.posonlyargs.is_empty()
@@ -741,7 +748,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         // classmethods including `__init_subclass__`/`__class_getitem__`, properties, and
         // `__new__`); it is `None` for staticmethods and top-level functions. A variadic-only
         // receiver lands in `vararg`, so `.first()` here correctly yields `None`.
-        // See https://github.com/facebook/pyrefly/issues/3729.
+        // See https://github.com/pyrefly-org/pyrefly/issues/3729.
         if self_type.is_some()
             && let Some(first) = def
                 .parameters
@@ -765,7 +772,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         // and the assigned value, so any further required parameter is unreachable at
         // runtime. The decorator path attaches property metadata without checking the
         // signature against `property.__init__`, so validate it here.
-        // See https://github.com/facebook/pyrefly/issues/4918.
+        // See https://github.com/pyrefly-org/pyrefly/issues/4918.
         // Skip when custom (non-special) decorators remain between `@property` and
         // the function, since they may reshape the signature before `@property`
         // sees it (e.g. homeassistant Spotify's `@ensure_item` turns
@@ -836,7 +843,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         let tparams = Arc::new(tparams);
         let func_id = Arc::new(FuncDefId {
             qname: QName::new(def.name.clone(), parent.dupe(), self.module().dupe()),
-            cls: defining_cls.clone(),
+            cls: defining_cls,
             def_index,
         });
 
@@ -876,10 +883,22 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             // don't report the error for `__init__` methods
             && (stmt.name.id != dunder::INIT || def.defining_cls.is_none())
         {
+            let is_public_name = |name: &str| !name.starts_with('_') || name.ends_with("__");
+            let is_public = is_public_name(stmt.name.as_str())
+                && successors(Some(&binding.parent), |context| context.parent()).all(|context| {
+                    !context.is_function()
+                        && context
+                            .identifier()
+                            .is_none_or(|id| is_public_name(self.module().code_at(id.range())))
+                });
             self.error(
                 errors,
                 stmt.name.range(),
-                ErrorKind::UnannotatedReturn,
+                if is_public {
+                    ErrorKind::UnannotatedPublicReturn
+                } else {
+                    ErrorKind::UnannotatedReturn
+                },
                 format!("`{}` is missing a return annotation", stmt.name),
             );
         }
@@ -915,7 +934,37 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 ErrorKind::AbstractMethodWithImplementation,
                 format!(
                     "`{}` is decorated with `@abstractmethod` but has an implementation",
-                    def.metadata.kind.format(self.module().name())
+                    def.metadata.kind.format(self, self.module().name())
+                ),
+            );
+        }
+        // Compare only types the user wrote: an inferred getter return (e.g. `None` from a
+        // `pass` body) or an unannotated value parameter is not evidence of a mismatch.
+        // Overload signatures are skipped because the implementation states the full
+        // accepted type, and custom decorators may reshape the setter's parameters.
+        if def.decorators.is_empty()
+            && !def.metadata.flags.is_overload
+            && let Some(property) = &def.metadata.flags.property_metadata
+            && matches!(property.role, PropertyRole::Setter)
+            && property
+                .getter
+                .toplevel_func_metadata()
+                .is_some_and(|getter| !getter.flags.is_return_inferred)
+            && let Some(getter_ty) = property.getter.callable_return_type(self.heap, self)
+            && let Some(Param::Pos(_, value_ty, _) | Param::PosOnly(_, value_ty, _)) =
+                def.params.get(1)
+            && let Some(annotation) = stmt.parameters.iter().nth(1).and_then(|p| p.annotation())
+            && self.is_provably_disjoint(value_ty, &getter_ty)
+        {
+            self.error(
+                errors,
+                annotation.range(),
+                ErrorKind::PropertyTypeMismatch,
+                format!(
+                    "Setter for property `{}` accepts `{}`, which cannot overlap the getter type `{}`",
+                    stmt.name,
+                    self.display(value_ty.clone()),
+                    self.display(getter_ty),
                 ),
             );
         }
@@ -1026,6 +1075,8 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             }
         }
 
+        self.check_type_var_use(def, &ret, &stmt.name, errors);
+
         let callable = if let Some(q) = &def.paramspec {
             Callable::concatenate(
                 def.params
@@ -1095,7 +1146,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
 
         let mut metadata = def.metadata.clone();
         metadata.flags.unresolved_imports =
-            Some(callable.contains_unresolved_imports(Some(tparams.as_ref())));
+            Some(callable.classify_unresolved_imports(Some(tparams.as_ref())));
         self.record_shape_flag_constructor_sources(
             stmt,
             &def.params,
@@ -1126,21 +1177,39 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 .bindings()
                 .idx_to_key(binding.decorators[*position])
                 .range();
-            // Blame only the decorator that turns a known type into an unknown one. A decorator
-            // whose own type is `Any` is reported where the decorators are collected, and a
-            // decorator applied to an already-unknown type did not cause it.
-            let was_known = !ty.is_any() && !ty.has_top_level_implicit_any();
+            // Blame only the decorator that introduces top-level `Any`. An outer decorator
+            // applied to an already-erased type did not cause the loss.
+            let was_known = !ty.as_unions().iter().any(Type::is_any);
             ty = self.apply_function_decorator(decorator.clone(), ty, &def.metadata, range, errors);
-            if was_known && !decorator.is_any() && ty.has_top_level_implicit_any() {
-                self.error(
-                    errors,
-                    range,
-                    ErrorKind::UntypedFunctionDecorator,
-                    format!(
-                        "Untyped function decorator obscures the type of function `{}`",
-                        stmt.name
-                    ),
-                );
+            if was_known {
+                let diagnostic = if ty.has_top_level_implicit_any() {
+                    Some((
+                        ErrorKind::UntypedFunctionDecorator,
+                        "Untyped function decorator",
+                    ))
+                } else if ty
+                    .as_unions()
+                    .iter()
+                    .any(|member| matches!(member, Type::Any(AnyStyle::Explicit)))
+                {
+                    Some((
+                        ErrorKind::AnyFunctionDecorator,
+                        "Function decorator with explicit `Any`",
+                    ))
+                } else {
+                    None
+                };
+                if let Some((kind, description)) = diagnostic {
+                    self.error(
+                        errors,
+                        range,
+                        kind,
+                        format!(
+                            "{description} obscures the type of function `{}`",
+                            stmt.name
+                        ),
+                    );
+                }
             }
         }
         if def.metadata.flags.is_cached_property && def.metadata.flags.is_return_inferred {
@@ -1189,7 +1258,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         for idx in &func.decorators {
             match self.get_special_decorator(self.get_idx(*idx)) {
                 Some(SpecialDecorator::StaticMethod(_)) => child_has_receiver = false,
-                Some(SpecialDecorator::Property(_) | SpecialDecorator::CachedProperty(_)) => {
+                Some(SpecialDecorator::Property(..) | SpecialDecorator::CachedProperty(_)) => {
                     accessor = Some(PropertyRole::Getter);
                 }
                 Some(SpecialDecorator::PropertySetter(_)) => accessor = Some(PropertyRole::Setter),
@@ -1280,7 +1349,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         {
             return Some(SpecialDecorator::PropertyDeleter(&decorator.ty));
         }
-        match decorator.ty.callee_kind() {
+        match decorator.ty.callee_kind(self) {
             Some(CalleeKind::Function(FunctionKind::Overload)) => Some(SpecialDecorator::Overload),
             Some(CalleeKind::Class(ClassKind::StaticMethod(name))) => {
                 Some(SpecialDecorator::StaticMethod(name))
@@ -1289,7 +1358,15 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 Some(SpecialDecorator::ClassMethod(name))
             }
             Some(CalleeKind::Class(ClassKind::Property(name))) => {
-                Some(SpecialDecorator::Property(name))
+                Some(SpecialDecorator::Property(name, None))
+            }
+            Some(CalleeKind::Class(ClassKind::Class))
+                if let Some(cls) = self.property_subclass(&decorator.ty) =>
+            {
+                Some(SpecialDecorator::Property(
+                    cls.name(self).clone(),
+                    Some(cls),
+                ))
             }
             Some(CalleeKind::Class(ClassKind::CachedProperty(name))) => {
                 Some(SpecialDecorator::CachedProperty(name))
@@ -1350,12 +1427,13 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 flags.is_classmethod = true;
                 true
             }
-            SpecialDecorator::Property(_) => {
+            SpecialDecorator::Property(_, descriptor_class) => {
                 flags.property_metadata = Some(PropertyMetadata {
                     role: PropertyRole::Getter,
                     getter: self.heap.mk_any_error(),
                     setter: None,
                     has_deleter: false,
+                    descriptor_class: descriptor_class.clone().map(Box::new),
                 });
                 true
             }
@@ -1365,6 +1443,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     getter: self.heap.mk_any_error(),
                     setter: None,
                     has_deleter: false,
+                    descriptor_class: None,
                 });
                 flags.is_cached_property = true;
                 true
@@ -1392,6 +1471,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         getter: metadata.getter.clone(),
                         setter: metadata.setter.clone(),
                         has_deleter: metadata.has_deleter,
+                        descriptor_class: metadata.descriptor_class.clone(),
                     });
                 }
                 true
@@ -1402,7 +1482,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             }
             SpecialDecorator::DataclassTransformCall(kws) => {
                 flags.dataclass_transform_metadata =
-                    Some(DataclassTransformMetadata::from_type_map(kws));
+                    Some(DataclassTransformMetadata::from_type_map(kws, self));
                 true
             }
             SpecialDecorator::AbstractMethod => {
@@ -1438,49 +1518,76 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             Some(default) => {
                 let display =
                     default_display_for_expr(default, self.module().code_at(default.range()));
-                let ty = match check {
-                    Some((expected_ty, tcc)) => {
-                        let mut qs = SmallSet::new();
-                        expected_ty.collect_quantifieds(&mut qs);
-                        if qs.is_empty() {
-                            self.expr_check(default, check, errors)
-                        } else {
-                            let owner = Owner::new();
-                            let upper_mp = qs
-                                .iter()
-                                .map(|q| (*q, owner.push(q.upper_bound(self.stdlib, self.heap))))
-                                .collect();
-                            let upper_ty = expected_ty.clone().subst(&upper_mp);
-                            // Check if the default is compatible with the parameter type.
-                            let default_errors = self.error_collector();
-                            self.expr_check(default, Some((&upper_ty, tcc)), &default_errors);
-                            if !default_errors.has_hard() {
-                                // The default is compatible; re-infer using the original expected
-                                // type so that Quantifieds (which will be freshened on each call)
-                                // end up in the default.
-                                self.expr_infer_with_hint(
-                                    default,
-                                    Some(HintRef::soft(expected_ty)),
-                                    errors,
-                                )
-                            } else {
-                                errors.extend(default_errors);
-                                // The default is not compatible; use the parameter type to avoid
-                                // cascading errors on calls.
-                                expected_ty.clone()
-                            }
-                        }
-                    }
-                    None => self.expr_check(default, None, errors),
-                };
-                // Mark literals as explicit so we don't promote them.
-                let ty = ty.with_literal_style(LitStyle::Explicit);
+                let ty = self.infer_checked_default(default, check, errors);
                 Required::Optional(Some(match display {
                     Some(d) => DefaultValue::with_display(ty, d),
                     None => DefaultValue::new(ty),
                 }))
             }
             None => Required::Required,
+        }
+    }
+
+    /// Infer a default expression against an optional expected type.
+    ///
+    /// When the expected type contains a type variable, the default is checked
+    /// against that variable's upper bound. A compatible default is inferred again
+    /// with the original type as a hint, so the variable can appear in the result.
+    /// An incompatible default is reported and replaced with the expected type, so
+    /// later calls do not repeat the error. Literals stay explicit.
+    fn infer_checked_default(
+        &self,
+        default: &Expr,
+        check: Option<(&Type, &dyn Fn() -> TypeCheckContext)>,
+        errors: &ErrorCollector,
+    ) -> Type {
+        let ty = match check {
+            Some((expected_ty, tcc)) => {
+                let mut qs = SmallSet::new();
+                expected_ty.collect_quantifieds(&mut qs);
+                if qs.is_empty() {
+                    self.expr_check(default, check, errors)
+                } else {
+                    let owner = Owner::new();
+                    let upper_mp = qs
+                        .iter()
+                        .map(|q| (*q, owner.push(q.upper_bound(self, self.heap))))
+                        .collect();
+                    let upper_ty = expected_ty.clone().subst(&upper_mp);
+                    let default_errors = self.error_collector();
+                    self.expr_check(default, Some((&upper_ty, tcc)), &default_errors);
+                    if !default_errors.has_hard() {
+                        self.expr_infer_with_hint(default, Some(HintRef::soft(expected_ty)), errors)
+                    } else {
+                        errors.extend(default_errors);
+                        expected_ty.clone()
+                    }
+                }
+            }
+            None => self.expr_check(default, None, errors),
+        };
+        ty.with_literal_style(LitStyle::Explicit)
+    }
+
+    /// Infer a dataclass field default the same way as a parameter default.
+    pub fn field_default_for_expr(
+        &self,
+        value: &Expr,
+        annotated: Option<&Type>,
+        errors: &ErrorCollector,
+    ) -> DataclassFieldDefault {
+        let tcc = || {
+            TypeCheckContext::of_kind(TypeCheckKind::FunctionParameterDefault(Name::new_static(
+                "default",
+            )))
+        };
+        // A default that cannot solve a type variable only needs its inferred type.
+        let check = annotated
+            .filter(|ty| ty.contains_type_variable())
+            .map(|ty| (ty, &tcc as _));
+        DataclassFieldDefault::Value {
+            ty: self.infer_checked_default(value, check, errors),
+            display: default_display_for_expr(value, self.module().code_at(value.range())),
         }
     }
 
@@ -1542,16 +1649,19 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 {
                     // Docstrings rarely say that a parameter defaulting to `None` is optional.
                     match &required {
-                        Required::Optional(Some(default_val)) if default_val.ty.is_none() => {
+                        Required::Optional(Some(default_val))
+                            if default_val.ty.as_ref().is_some_and(Type::is_none) =>
+                        {
                             self.union(ty, self.heap.mk_none())
                         }
                         _ => ty,
                     }
-                } else if let Required::Optional(Some(default_val)) = &required {
+                } else if let Required::Optional(Some(default_val)) = &required
+                    && let Some(default_ty) = &default_val.ty
+                {
                     self.union(
                         self.heap.mk_any_implicit(),
-                        default_val
-                            .ty
+                        default_ty
                             .clone()
                             .with_literal_style(LitStyle::Implicit)
                             .promote(self.stdlib),
@@ -1749,8 +1859,8 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 paramspec_kwargs = Some(q.clone());
             }
 
-            if let Type::Unpack(unpack) = &ty
-                && let Type::TypedDict(typed_dict) = &**unpack
+            if let Type::Unpack(unpack, UnpackKind::Kwargs) = &ty
+                && let Type::ClassType(typed_dict) = &**unpack
             {
                 for (name, _) in self.typed_dict_fields(typed_dict) {
                     if params.iter().any(|param| {
@@ -1853,7 +1963,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         let name = match decorator {
             SpecialDecorator::StaticMethod(name) => name.as_str(),
             SpecialDecorator::ClassMethod(name) => name.as_str(),
-            SpecialDecorator::Property(name) => name.as_str(),
+            SpecialDecorator::Property(name, _) => name.as_str(),
             SpecialDecorator::CachedProperty(name) => name.as_str(),
             SpecialDecorator::EnumMember => "member",
             SpecialDecorator::Override => "override",
@@ -1998,6 +2108,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 if matches!(
                     q.identity().origin,
                     QuantifiedOrigin::Synthetic { is_self: true }
+                        | QuantifiedOrigin::UnboundMethodSelf
                 ) && let Restriction::Bound(bound) = q.restriction() =>
             {
                 Some(bound.clone())
@@ -2292,6 +2403,280 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         self.singledispatch_dispatcher_as_callback(widened, &application.original_decoratee)
     }
 
+    /// Report misused type variables that a function declares.
+    ///
+    /// A type variable that occurs exactly once, as a whole parameter or return type or as a
+    /// member of a union there, relates no types and can be replaced by its bound. A nested
+    /// occurrence such as `list[T]` is exempt because invariance can make it differ from
+    /// `list[object]`. Constrained type variables are exempt, matching pyright.
+    ///
+    /// A type variable in the return type that only parameters without a known default value
+    /// mention (a `...` default in a function whose body is `...`) is left unsolved by a call
+    /// that omits those arguments.
+    ///
+    /// Type variables with defaults are exempt from both checks: an unsolved one falls back to
+    /// its default.
+    fn check_type_var_use(
+        &self,
+        def: &UndecoratedFunction,
+        ret: &Type,
+        name: &Identifier,
+        errors: &ErrorCollector,
+    ) {
+        let signature_types = || def.params.iter().map(Param::as_type).chain(once(ret));
+        for q in def.tparams.iter() {
+            if q.default.is_some()
+                || !matches!(
+                    q.identity().origin,
+                    QuantifiedOrigin::Pep695 | QuantifiedOrigin::ScopedLegacy
+                )
+            {
+                continue;
+            }
+            let occurrences = |ty: &Type| {
+                let mut n = 0;
+                ty.for_each_quantified(&mut |x| {
+                    if x == q {
+                        n += 1;
+                    }
+                });
+                n
+            };
+
+            let is_q = |ty: &Type| matches!(ty, Type::Quantified(x) if **x == *q);
+            if q.kind() == QuantifiedKind::TypeVar
+                && !matches!(q.restriction, Restriction::Constraints(_))
+                && signature_types().map(&occurrences).sum::<usize>() == 1
+                && signature_types().any(|ty| match ty {
+                    Type::Union(union) => union.members.iter().any(is_q),
+                    _ => is_q(ty),
+                })
+            {
+                self.error(
+                    errors,
+                    name.range(),
+                    ErrorKind::UnnecessaryTypeVar,
+                    format!(
+                        "Type variable `{}` appears only once in the signature of `{name}`",
+                        q.name
+                    ),
+                );
+            }
+
+            let mut mentioning_params = def
+                .params
+                .iter()
+                .filter(|p| occurrences(p.as_type()) > 0)
+                .peekable();
+            if occurrences(ret) > 0
+                && let Some(first) = mentioning_params.peek().copied()
+                && mentioning_params.all(|p| {
+                    matches!(
+                        p,
+                        Param::PosOnly(_, _, Required::Optional(None))
+                            | Param::Pos(_, _, Required::Optional(None))
+                            | Param::KwOnly(_, _, Required::Optional(None))
+                    )
+                })
+            {
+                self.error(
+                    errors,
+                    name.range(),
+                    ErrorKind::PossiblyUnsolvedTypeVar,
+                    format!(
+                        "Type variable `{}` may go unsolved if a call to `{name}` omits argument `{}`",
+                        q.name,
+                        first
+                            .name()
+                            .expect("parameters of a function definition are named"),
+                    ),
+                );
+            }
+        }
+    }
+
+    /// Whether a return annotation explicitly opts out of tracking the class interface.
+    fn class_decorator_erases_class(&self, decorator: &Type) -> bool {
+        decorator.clone().into_unions().iter().any(|member| {
+            let inferred = member
+                .toplevel_func_metadata()
+                .is_some_and(|meta| meta.flags.is_return_inferred);
+            !inferred
+                && member.toplevel_callable_signatures().any(|(signature, _)| {
+                    signature.ret.clone().into_unions().iter().any(|ret| {
+                        matches!(ret, Type::Type(inner) if matches!(&**inner, Type::Any(AnyStyle::Explicit)))
+                    })
+                })
+        })
+    }
+
+    /// The type bound to a class's name after its decorators are applied, in application order,
+    /// according to `class-decorator-behavior`.
+    pub(crate) fn decorate_class(
+        &self,
+        cls: &Class,
+        decorators: &[Idx<KeyDecorator>],
+        errors: &ErrorCollector,
+    ) -> Type {
+        let mut ty = self.heap.mk_class_def(cls.dupe());
+        let behavior = self.solver().config.class_decorator_behavior;
+        // Like for functions, only the first decorator (in application order) that makes the
+        // result unknown is reported, unless the decorator itself is `Any`.
+        let mut obscured = false;
+        for decorator_key in decorators.iter().rev() {
+            let decorator = &self.get_idx(*decorator_key).ty;
+            let metadata = match decorator {
+                Type::KwCall(call) => Some(&call.func_metadata),
+                ty => ty.toplevel_func_metadata(),
+            };
+            // Pyrefly models dataclass decorators directly rather than through their return types.
+            // Calling `final` would depend on the standard library classes it is used to define.
+            if decorator.is_error()
+                || metadata.is_some_and(|meta| {
+                    meta.flags.dataclass_transform_metadata.is_some()
+                        || matches!(
+                            meta.kind,
+                            FunctionKind::Dataclass
+                                | FunctionKind::DataclassTransform
+                                | FunctionKind::Final
+                        )
+                })
+            {
+                continue;
+            }
+            let range = self.bindings().idx_to_key(*decorator_key).range();
+            let constructor = match decorator {
+                Type::ClassDef(cls) => Some(cls),
+                Type::Type(inner) if let Type::ClassType(cls) = &**inner => {
+                    Some(cls.class_object())
+                }
+                _ => None,
+            };
+            // A class whose `__new__` has no return annotation may return anything.
+            let callable = if constructor.is_some_and(|cls| {
+                self.get_class_member_with_defining_class(cls, &dunder::NEW)
+                    .is_some_and(|new| new.value.is_function_without_return_annotation())
+            }) {
+                self.heap.mk_any_implicit()
+            } else if let Type::ClassType(instance) = decorator
+                && let Some(call) = self.instance_as_dunder_call(instance)
+            {
+                // An instance decorator is checked through its `__call__` method.
+                call
+            } else {
+                decorator.clone()
+            };
+            let decorator_is_any = matches!(
+                decorator,
+                Type::Any(AnyStyle::Implicit | AnyStyle::Explicit)
+            );
+            let result = match behavior {
+                ClassDecoratorBehavior::Ignore => {
+                    // Decorators are not called in this mode, so whether a decorator returns an
+                    // unknown type is read from its signatures.
+                    let returns_unknown = |callable: &Type| {
+                        let mut signatures = callable.toplevel_callable_signatures().peekable();
+                        signatures.peek().is_some()
+                            && signatures.all(|(sig, _)| sig.ret.has_top_level_implicit_any())
+                    };
+                    if self.class_decorator_erases_class(&callable) {
+                        ClassDecoratorResult::Erased
+                    } else if decorator_is_any
+                        || match decorator {
+                            Type::ClassType(instance) => self
+                                .instance_as_dunder_call(instance)
+                                .is_some_and(|call| returns_unknown(&call)),
+                            _ => returns_unknown(decorator),
+                        }
+                    {
+                        ClassDecoratorResult::Untyped
+                    } else {
+                        ClassDecoratorResult::Kept
+                    }
+                }
+                ClassDecoratorBehavior::TypedOnly => {
+                    let decorated =
+                        self.apply_class_decorator(callable.clone(), ty.clone(), range, errors);
+                    let members = decorated.clone().into_unions();
+                    if decorated == ty {
+                        ClassDecoratorResult::Applied(decorated)
+                    } else if decorator_is_any
+                        || decorated.contains_implicit_any()
+                        || (members.iter().any(|member| {
+                            matches!(member, Type::Type(inner) if matches!(&**inner, Type::Any(AnyStyle::Explicit)))
+                        }) && !self.class_decorator_erases_class(&callable))
+                    {
+                        // An unknown result, or a `type[Any]` that the decorator doesn't
+                        // explicitly declare.
+                        ClassDecoratorResult::Untyped
+                    } else if members.iter().any(|member| match member {
+                        Type::Any(_) => true,
+                        Type::Type(inner) => inner.is_error(),
+                        _ => false,
+                    }) {
+                        // An explicit `Any` return, or the result of a failed call.
+                        ClassDecoratorResult::Kept
+                    } else {
+                        ClassDecoratorResult::Applied(decorated)
+                    }
+                }
+            };
+            match result {
+                ClassDecoratorResult::Applied(decorated) => ty = decorated,
+                ClassDecoratorResult::Erased => {
+                    ty = self.heap.mk_type_of(self.heap.mk_any_explicit());
+                }
+                ClassDecoratorResult::Untyped => {
+                    if !obscured || decorator_is_any {
+                        self.error(
+                            errors,
+                            range,
+                            ErrorKind::UntypedClassDecorator,
+                            format!(
+                                "Untyped class decorator may modify `{}` in unexpected ways",
+                                cls.name(self)
+                            ),
+                        );
+                    }
+                    obscured = true;
+                }
+                ClassDecoratorResult::Kept => {}
+            }
+        }
+        ty
+    }
+
+    /// Calls a class decorator with the class it decorates. A decorator that returns the class
+    /// it is given keeps the class definition itself.
+    fn apply_class_decorator(
+        &self,
+        decorator: Type,
+        decoratee: Type,
+        range: TextRange,
+        errors: &ErrorCollector,
+    ) -> Type {
+        let call_target =
+            self.as_call_target_or_error(decorator, CallStyle::FreeForm, range, errors, None);
+        // Keep the class's type parameters concrete during inference, just as for generic
+        // function decorators. Promoting a class definition here would replace them with defaults.
+        let (decoratee_tparams, decoratee_arg) = match &decoratee {
+            Type::ClassDef(cls) => (
+                self.get_class_tparams(cls).cloned(),
+                self.heap.mk_type_of(self.instantiate(cls)),
+            ),
+            _ => (None, decoratee.clone()),
+        };
+        let arg = CallArg::ty(&decoratee_arg, range);
+        let decorated = self
+            .call_infer(call_target, &[arg], &[], range, errors, None, None, None)
+            .ty;
+        if decorated == decoratee_arg {
+            decoratee
+        } else {
+            self.restore_decoratee_generics(decorated, decoratee_tparams)
+        }
+    }
+
     /// For a type guard function, validate whether it has at least one
     /// positional argument.
     fn validate_type_guard_positional_argument_count(
@@ -2361,8 +2746,8 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 ErrorKind::BadFunctionDefinition,
                 format!(
                     "Return type `{}` must be assignable to the first argument type `{}`",
-                    self.for_display(ty_narrow.clone()),
-                    self.for_display(ty_arg.as_type().clone())
+                    self.display(ty_narrow.clone()),
+                    self.display(ty_arg.as_type().clone())
                 ),
             );
         }
@@ -2448,7 +2833,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     format!(
                         "`{}` has type `{}` after decorator application, which is not callable",
                         func,
-                        self.for_display(t)
+                        self.display(t)
                     ),
                 );
                         OverloadType::Function(Function {
@@ -2502,7 +2887,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
     fn subst_function(&self, tparams: &TParams, func: Function) -> Function {
         let mp = tparams
             .as_vec()
-            .map(|p| (p, p.upper_bound(self.stdlib, self.heap)));
+            .map(|p| (p, p.upper_bound(self, self.heap)));
         match self
             .heap
             .mk_function(func)
@@ -2568,7 +2953,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     Param::PosOnly(Some(name), _, Required::Optional(Some(default)))
                     | Param::Pos(name, _, Required::Optional(Some(default)))
                     | Param::KwOnly(name, _, Required::Optional(Some(default))) => {
-                        Some((name, &default.ty))
+                        default.ty.as_ref().map(|ty| (name, ty))
                     }
                     _ => None,
                 })
@@ -2625,11 +3010,11 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     ErrorKind::InconsistentOverload,
                     format!(
                         "Overload signature `{}` is not consistent with implementation signature `{}`",
-                        self.for_display(
+                        self.display(
                             self.heap
                                 .mk_callable_from(original_overload_func.signature.clone())
                         ),
-                        self.for_display(self.heap.mk_callable_from(impl_sig.clone())),
+                        self.display(self.heap.mk_callable_from(impl_sig.clone())),
                     ),
                 );
                 for e in specialization_errors {
@@ -2825,26 +3210,36 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         self.bind_bound_method_type(&m.func, &m.obj, skip_instantiation, is_subset)
     }
 
-    /// Drop overloads whose first parameter cannot accept `receiver`. Type parameters on both
-    /// sides are replaced with `Any`, so an overload is dropped only if no specialization of it
-    /// could accept the receiver. If every overload would be dropped, `func` is returned
-    /// unchanged so that the callable stays usable.
-    fn filter_overloads_by_receiver(&self, func: Type, receiver: &Type) -> Type {
-        let Type::Overload(overload) = &func else {
-            return func;
-        };
+    /// Whether the first parameter of `function` can accept `receiver`. Type parameters on both
+    /// sides are replaced with `Any`, so this is false only if no specialization of `function`
+    /// could accept the receiver. As with the receiver of a non-overloaded call, a protocol class
+    /// may bind its classmethods even though it cannot be passed explicitly where `type[P]` is
+    /// expected.
+    pub fn accepts_receiver(&self, function: &Function, receiver: &Type) -> bool {
         let any = self.heap.mk_any_implicit();
         let erase_tparams = |ty: &Type| {
             let mut ty = ty.clone();
             ty.subst_mut_fn(&mut |_| Some(any.clone()));
             ty
         };
-        let receiver = erase_tparams(receiver);
+        function.signature.get_first_param().is_none_or(|param| {
+            matches!(
+                self.is_subset_eq_with_reason(&erase_tparams(receiver), &erase_tparams(param)),
+                Ok(()) | Err(SubsetError::TypeOfProtocolNeedsConcreteClass(_))
+            )
+        })
+    }
+
+    /// Drop overloads whose first parameter cannot accept `receiver`, as decided by
+    /// `accepts_receiver`. If every overload would be dropped, `func` is returned unchanged so
+    /// that the callable stays usable.
+    fn filter_overloads_by_receiver(&self, func: Type, receiver: &Type) -> Type {
+        let Type::Overload(overload) = &func else {
+            return func;
+        };
         let signatures = overload.signatures.iter().filter(|sig| {
             let (OverloadType::Function(f) | OverloadType::Forall(Forall { body: f, .. })) = sig;
-            f.signature
-                .get_first_param()
-                .is_none_or(|param| self.is_subset_eq(&receiver, &erase_tparams(param)))
+            self.accepts_receiver(f, receiver)
         });
         match Vec1::try_from_vec(signatures.cloned().collect()) {
             Ok(signatures) => self.heap.mk_overload(Overload {
@@ -2886,7 +3281,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             // Turn a `__init__` that could not be bound into a constructor callable by setting its return
             // type, without stripping the `self` parameter.
             let ret_type = t
-                .callable_first_param(self.heap)
+                .callable_first_param(self.heap, self)
                 .unwrap_or_else(|| self.heap.mk_class_type(cls.clone()));
             t.transform_toplevel_callable_signatures(|c: &mut Callable, _| {
                 c.ret = ret_type.clone()
@@ -3053,6 +3448,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             callable,
             self.uniques,
             is_subset,
+            self,
         )
     }
 
@@ -3074,7 +3470,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             && let Some(Param::PosOnly(_, self_ty, _) | Param::Pos(_, self_ty, _)) =
                 param_list.items().first()
         {
-            let cls_name = cls.name();
+            let cls_name = cls.name(self);
             match self_ty {
                 Type::ClassType(cls_ty) => {
                     // The self type must be the defining class itself or a superclass of it.
@@ -3091,7 +3487,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                                 ErrorKind::InvalidAnnotation,
                                 format!(
                                     "`{method_name}` method self type `{}` is not a superclass of class `{cls_name}`",
-                                    self.for_display(self_ty.clone()),
+                                    self.display(self_ty.clone()),
                                 ),
                             )
                             .emit();
@@ -3143,8 +3539,8 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                                 ErrorKind::InvalidAnnotation,
                                 format!(
                                     "`{method_name}` method self type `{}` refers to class `{}`, which is not a superclass of class `{cls_name}`",
-                                    self.for_display(self_ty.clone()),
-                                    self.for_display((**inner).clone()),
+                                    self.display(self_ty.clone()),
+                                    self.display((**inner).clone()),
                                 ),
                             )
                             .emit();
@@ -3171,12 +3567,12 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             && let Some(Param::PosOnly(_, cls_ty, _) | Param::Pos(_, cls_ty, _)) =
                 param_list.items().first()
         {
-            let cls_name = cls.name();
+            let cls_name = cls.name(self);
             match cls_ty {
                 Type::Type(f) if let Type::ClassType(inner_cls) = &**f => {
                     // Skipping validation for protocols is on par with Pyright's behavior.
                     // TODO: we could consider checking structural subtyping here.
-                    if inner_cls.name() != cls_name
+                    if inner_cls.name(self) != cls_name
                         && !self
                             .type_order()
                             .has_superclass(cls, inner_cls.class_object())
@@ -3192,8 +3588,8 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                                 ErrorKind::InvalidAnnotation,
                                 format!(
                                     "`{method_name}` method cls type `{}` refers to class `{}`, which is not a superclass of class `{cls_name}`",
-                                    self.for_display(cls_ty.clone()),
-                                    self.for_display((**f).clone()),
+                                    self.display(cls_ty.clone()),
+                                    self.display((**f).clone()),
                                 ),
                             )
                             .emit();
@@ -3212,7 +3608,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                             ErrorKind::InvalidAnnotation,
                             format!(
                                 "`{method_name}` method cls type `{}` is not a valid `type[...]` annotation",
-                                self.for_display(cls_ty.clone()),
+                                self.display(cls_ty.clone()),
                             ),
                         )
                         .emit();

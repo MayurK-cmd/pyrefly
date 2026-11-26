@@ -90,6 +90,7 @@ pub struct Stdlib {
     async_generator: StdlibResult<(Class, Arc<TParams>)>,
     awaitable: StdlibResult<(Class, Arc<TParams>)>,
     coroutine: StdlibResult<(Class, Arc<TParams>)>,
+    hashable: StdlibResult<ClassType>,
     type_var: StdlibResult<ClassType>,
     /// Defined in `typing_extensions` util 3.13, defined in `typing` since 3.10.
     /// After 3.13, `typing_extensions` reexports from `typing`.
@@ -272,6 +273,7 @@ impl Stdlib {
             async_generator: lookup_generic(typing, "AsyncGenerator", 2),
             awaitable: lookup_generic(typing, "Awaitable", 1),
             coroutine: lookup_generic(typing, "Coroutine", 3),
+            hashable: lookup_concrete(typing, "Hashable"),
             type_var: lookup_concrete(typing, "TypeVar"),
             param_spec: lookup_concrete(standardised(3, 10), "ParamSpec"),
             param_spec_args: lookup_concrete(standardised(3, 10), "ParamSpecArgs"),
@@ -581,6 +583,10 @@ impl Stdlib {
         &Self::unwrap(&self.coroutine).0
     }
 
+    pub fn hashable(&self) -> &ClassType {
+        Self::primitive(&self.hashable)
+    }
+
     pub fn type_var(&self) -> &ClassType {
         Self::primitive(&self.type_var)
     }
@@ -655,38 +661,16 @@ impl Stdlib {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
-    use pyrefly_python::module_path::ModulePath;
-    use ruff_text_size::TextSize;
-
     use super::*;
-    use crate::class::ClassDefIndex;
-    use crate::class::PrecomputedTParams;
-
-    fn fake_class(module_name: ModuleName, name: &Name) -> Class {
-        let module = Module::new(
-            module_name,
-            ModulePath::filesystem(PathBuf::from("stdlib.pyi")),
-            Arc::new(String::new()),
-        );
-        Class::new(
-            ClassDefIndex(0),
-            Identifier::new(name.clone(), TextRange::empty(TextSize::new(0))),
-            NestingContext::toplevel(),
-            module,
-            PrecomputedTParams::NotGeneric,
-            false,
-            None,
-        )
-    }
+    use crate::test_type_env::TestTypeEnv;
 
     #[test]
     fn none_tparams_are_empty_for_stdlib_lookup() {
+        let env = TestTypeEnv::new();
         let stdlib = Stdlib::new_with_bootstrapping(
             true,
             PythonVersion::default(),
-            &|module, name| Some((fake_class(module, name), None)),
+            &|module, name| Some((env.class(module.as_str(), name.as_str()), None)),
             &|_, _| None,
         );
 
@@ -711,9 +695,10 @@ mod tests {
         expected = "Stdlib class `builtins.slice` is missing or does not have 3 type parameters"
     )]
     fn normal_stdlib_fails_eagerly_when_a_generic_is_invalid() {
+        let env = TestTypeEnv::new();
         Stdlib::new(
             PythonVersion::default(),
-            &|module, name| Some((fake_class(module, name), None)),
+            &|module, name| Some((env.class(module.as_str(), name.as_str()), None)),
             &|_, _| None,
         );
     }

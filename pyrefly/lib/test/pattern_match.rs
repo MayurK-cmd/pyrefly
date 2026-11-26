@@ -53,20 +53,20 @@ def test(x: int | bytes | str):
 testcase!(
     test_pattern_crash,
     r#"
-# Used to crash, see https://github.com/facebook/pyrefly/issues/490
+# Used to crash, see https://github.com/pyrefly-org/pyrefly/issues/490
 match None: # E: Missing cases: None
     case {a: 1}: # E: # E: # E:
         pass
 "#,
 );
 
-// Regression test for https://github.com/facebook/pyrefly/issues/4631.
+// Regression test for https://github.com/pyrefly-org/pyrefly/issues/4631.
 testcase!(
     test_recursive_alias_mapping_pattern_does_not_overflow,
     r#"
 from typing import Mapping
 
-def fn(obj: U):
+def fn(obj: "U"):
     match obj:
         case {'a': {'b': []}}:
             pass
@@ -360,7 +360,7 @@ def attribute_any(h: Holder) -> None:
 "#,
 );
 
-// Regression test for https://github.com/meta/pyrefly/issues/5549.
+// Regression test for https://github.com/pyrefly-org/pyrefly/issues/5549.
 testcase!(
     test_match_case_gradual_base,
     r#"
@@ -1083,6 +1083,32 @@ def test_str_not_sequence(x: str | Sequence[int]) -> None:
 );
 
 testcase!(
+    test_sequence_pattern_string_and_bytes_literals_excluded,
+    r#"
+from typing import Literal, assert_type
+
+type Text = Literal["", "1", "12", "closed", b"", b"1", b"12", b"closed"]
+
+def fixed(x: Text | tuple[int, int]) -> None:
+    match x:
+        case [first, second]:
+            assert_type(x, tuple[int, int])
+            assert_type(first, int)
+            assert_type(second, int)
+        case _:
+            assert_type(x, Text)
+
+def starred(x: Text | tuple[int, int]) -> None:
+    match x:
+        case [*values]:
+            assert_type(x, tuple[int, int])
+            assert_type(values, list[int])
+        case _:
+            assert_type(x, Text)
+"#,
+);
+
+testcase!(
     test_sequence_pattern_list,
     r#"
 from typing import assert_type
@@ -1165,7 +1191,7 @@ def describe(flag: bool):
 "#,
 );
 
-// Regression test for https://github.com/facebook/pyrefly/issues/3294
+// Regression test for https://github.com/pyrefly-org/pyrefly/issues/3294
 testcase!(
     test_open_domain_match_not_checked_by_default,
     r#"
@@ -1463,7 +1489,7 @@ def test_dict_first(dict_or_none: dict[str, Any] | None):
 "#,
 );
 
-// Regression test for https://github.com/facebook/pyrefly/issues/1708
+// Regression test for https://github.com/pyrefly-org/pyrefly/issues/1708
 testcase!(
     test_match_exhaustive_literal_no_unbound,
     r#"
@@ -1482,7 +1508,7 @@ def func(x: Literal[1, 2]) -> None:
 "#,
 );
 
-// Regression test for https://github.com/facebook/pyrefly/issues/1369
+// Regression test for https://github.com/pyrefly-org/pyrefly/issues/1369
 testcase!(
     test_match_object_with_tuple_pattern,
     r#"
@@ -1495,7 +1521,7 @@ def handle(o: object) -> int:
 "#,
 );
 
-// Regression test for https://github.com/facebook/pyrefly/issues/2826
+// Regression test for https://github.com/pyrefly-org/pyrefly/issues/2826
 testcase!(
     test_match_sequence_pattern_on_attribute,
     r#"
@@ -1737,7 +1763,7 @@ def test(w: A | B, x: A | B, y: A | B, z: A | B):
     "#,
 );
 
-// https://github.com/facebook/pyrefly/issues/3731
+// https://github.com/pyrefly-org/pyrefly/issues/3731
 testcase!(
     test_nested_class_pattern_exhaustive,
     r#"
@@ -1900,7 +1926,7 @@ def f(h: Holder) -> int:  # E: one or more paths are missing an explicit
 "#,
 );
 
-// https://github.com/facebook/pyrefly/issues/3805
+// https://github.com/pyrefly-org/pyrefly/issues/3805
 testcase!(
     test_match_tuple_union_narrowing,
     r#"
@@ -1976,7 +2002,7 @@ def f(t: tuple[int, str] | tuple[str, int]) -> int:  # E: one or more paths are 
 "#,
 );
 
-// https://github.com/facebook/pyrefly/issues/4066
+// https://github.com/pyrefly-org/pyrefly/issues/4066
 testcase!(
     test_match_tuple_subject_exhaustive_rows,
     r#"
@@ -2044,7 +2070,7 @@ def f(t: tuple[object, int] | tuple[object, str]) -> None:
 "#,
 );
 
-// https://github.com/facebook/pyrefly/issues/3883
+// https://github.com/pyrefly-org/pyrefly/issues/3883
 testcase!(
     test_match_sequence_literal_element,
     r#"
@@ -2062,7 +2088,7 @@ def exhaustive(value: MyUnion) -> str:
 "#,
 );
 
-// https://github.com/facebook/pyrefly/issues/2474
+// https://github.com/pyrefly-org/pyrefly/issues/2474
 testcase!(
     test_match_mapping_pattern_else_narrow,
     r#"
@@ -2084,7 +2110,7 @@ def keyed_pattern_does_not_narrow_else(x: dict | int) -> None:
 "#,
 );
 
-// https://github.com/facebook/pyrefly/issues/4972
+// https://github.com/pyrefly-org/pyrefly/issues/4972
 testcase!(
     test_match_tuple_optional_captures,
     r#"
@@ -2156,7 +2182,7 @@ def three_elements(a: int | None, b: str | None, c: bytes | None) -> None:
 "#,
 );
 
-// https://github.com/facebook/pyrefly/issues/3213
+// https://github.com/pyrefly-org/pyrefly/issues/3213
 testcase!(
     test_match_tuple_none_cases_narrow,
     r#"
@@ -2356,7 +2382,7 @@ def constant(a: int | None) -> None:
 "#,
 );
 
-// https://github.com/facebook/pyrefly/issues/2932
+// https://github.com/pyrefly-org/pyrefly/issues/2932
 testcase!(
     test_match_false_positive_unbound_name,
     r#"
@@ -2417,6 +2443,23 @@ def f(begin: int | None, end: int | None) -> int:
 "#,
 );
 
+// https://github.com/pyrefly-org/pyrefly/issues/5206
+testcase!(
+    test_match_tuple_refutable_cases_are_exhaustive_return,
+    r#"
+def f(x: bool, y: bool) -> int:
+    match x, y:
+        case True, True:
+            return 0
+        case True, False:
+            return 1
+        case False, True:
+            return 2
+        case False, False:
+            return 3
+"#,
+);
+
 testcase!(
     test_match_starred_tuple_subject_is_not_fixed_arity,
     r#"
@@ -2442,7 +2485,7 @@ def f(c: C) -> None:
     "#,
 );
 
-// Regression test for https://github.com/facebook/pyrefly/issues/4888.
+// Regression test for https://github.com/pyrefly-org/pyrefly/issues/4888.
 testcase!(
     test_match_class_pattern_with_replaced_import,
     TestEnv::new().with_replace_imports_with_any(&["pandas"]),
@@ -2470,7 +2513,7 @@ def f(x: object) -> None:
 "#,
 );
 
-// Regression test for https://github.com/facebook/pyrefly/issues/5340.
+// Regression test for https://github.com/pyrefly-org/pyrefly/issues/5340.
 testcase!(
     test_negated_sequence_pattern_narrows_element,
     r#"
@@ -2625,7 +2668,7 @@ def partial_before_subclass(b: B) -> None:
 
 // A repeated partial class pattern is still not reported: its negation cannot
 // subtract the class, because `ClassCoverageGate` only subtracts when every
-// sub-pattern exhausts its slot. Tracked in https://github.com/facebook/pyrefly/issues/5516.
+// sub-pattern exhausts its slot. Tracked in https://github.com/pyrefly-org/pyrefly/issues/5516.
 testcase!(
     bug = "duplicate partial class pattern is not reported",
     test_match_case_reachable_duplicate_partial_class_pattern,
@@ -2639,5 +2682,62 @@ def duplicate_partial(a: A) -> None:
             pass
         case A(x=1):
             pass
+"#,
+);
+
+testcase!(
+    test_tuple_match_class_pattern_with_capture_exhaustive,
+    r#"
+from typing import assert_never
+
+class A:
+    __match_args__ = ("x",)
+    x: int
+
+def f(a: A, b: bool) -> None:
+    match a, b:
+        case A(x), _:
+            pass
+        case _ as never:
+            assert_never(never)
+"#,
+);
+
+// https://github.com/pyrefly-org/pyrefly/issues/5622
+testcase!(
+    test_sequence_pattern_or_element_exhaustive,
+    r#"
+from typing import Literal, assert_never
+
+def f(value: Literal[1, 2]) -> None:
+    match (value,):
+        case (1 | 2,):
+            pass
+        case remaining:
+            assert_never(remaining)
+"#,
+);
+
+// https://github.com/facebook/pyrefly/issues/5059
+testcase!(
+    bug = "A subclass of `Foo` can implement the protocol, so the branch is reachable",
+    test_union_against_runtime_protocol,
+    r#"
+from typing import Never, Protocol, assert_type, runtime_checkable
+@runtime_checkable
+class SupportsMethod(Protocol):
+    def method(self) -> None: ...
+class Foo: ...
+def check(arg: Foo) -> None:
+    match arg:
+        case SupportsMethod():
+            pass
+def f(arg: Foo | None) -> None:
+    match arg:
+        case SupportsMethod():  # E: Case pattern can never match subject of type `Foo | None`
+            assert_type(arg, Never)
+def g(arg: Foo | None) -> None:
+    if isinstance(arg, SupportsMethod):
+        assert_type(arg, Never)
 "#,
 );

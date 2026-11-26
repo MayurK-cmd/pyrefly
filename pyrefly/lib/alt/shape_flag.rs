@@ -19,6 +19,7 @@ use pyrefly_types::types::Forallable;
 use pyrefly_types::types::OverloadType;
 use pyrefly_types::types::TParams;
 use pyrefly_types::types::Type;
+use pyrefly_util::display::DisplayWithCtx;
 use ruff_python_ast::Expr;
 use ruff_python_ast::name::Name;
 use ruff_text_size::Ranged;
@@ -226,7 +227,7 @@ impl<Ans: LookupAnswer> AnswersSolver<'_, '_, Ans> {
                     if sources.len() != 1 {
                         self.error(
                             errors,
-                            cls.range(),
+                            cls.range(self),
                             ErrorKind::InvalidTypeVar,
                             format!(
                                 "`Flag` type parameter `{}` must directly annotate exactly one constructor parameter, found {}",
@@ -237,16 +238,17 @@ impl<Ans: LookupAnswer> AnswersSolver<'_, '_, Ans> {
                     } else {
                         let source = &sources[0];
                         if let Required::Optional(Some(default)) = &source.required
-                            && !domain.accepts_literal(&default.ty)
+                            && let Some(default_ty) = &default.ty
+                            && !domain.accepts_literal(default_ty)
                         {
                             self.error(
                                 errors,
-                                cls.range(),
+                                cls.range(self),
                                 ErrorKind::InvalidTypeVar,
                                 format!(
                                     "Default for parameter binding `Flag[{domain}]` type parameter `{}` must be a `{domain}` literal, got `{}`",
                                     tparam.name(),
-                                    default.ty,
+                                    default_ty.display_with(self),
                                 ),
                             );
                         }
@@ -254,7 +256,7 @@ impl<Ans: LookupAnswer> AnswersSolver<'_, '_, Ans> {
                             if source.kind != expected.kind {
                                 self.error(
                                     errors,
-                                    cls.range(),
+                                    cls.range(self),
                                     ErrorKind::InvalidTypeVar,
                                     format!(
                                         "`Flag` type parameter `{}` must bind from the same constructor argument in every signature",
@@ -264,7 +266,7 @@ impl<Ans: LookupAnswer> AnswersSolver<'_, '_, Ans> {
                             } else if source.required != expected.required {
                                 self.error(
                                     errors,
-                                    cls.range(),
+                                    cls.range(self),
                                     ErrorKind::InvalidTypeVar,
                                     format!(
                                         "Parameter binding `Flag` type parameter `{}` must have the same default in every constructor signature",
@@ -281,7 +283,7 @@ impl<Ans: LookupAnswer> AnswersSolver<'_, '_, Ans> {
             if !mentioned {
                 self.error(
                     errors,
-                    cls.range(),
+                    cls.range(self),
                     ErrorKind::InvalidTypeVar,
                     format!(
                         "`Flag` type parameter `{}` must directly annotate exactly one constructor parameter, found 0",
@@ -314,7 +316,8 @@ impl<Ans: LookupAnswer> AnswersSolver<'_, '_, Ans> {
                 range,
                 ErrorKind::InvalidTypeVar,
                 format!(
-                    "Default for `Flag[{domain}]` type parameter `{name}` must be a `{domain}` literal, got `{default}`"
+                    "Default for `Flag[{domain}]` type parameter `{name}` must be a `{domain}` literal, got `{}`",
+                    default.display_with(self)
                 ),
             );
             Some(self.heap.mk_any_error())
@@ -368,7 +371,8 @@ impl<Ans: LookupAnswer> AnswersSolver<'_, '_, Ans> {
                 _ => None,
             };
             if let Some(default) = runtime_default
-                && !domain.accepts_literal(&default.ty)
+                && let Some(default_ty) = &default.ty
+                && !domain.accepts_literal(default_ty)
             {
                 self.error(
                     errors,
@@ -377,7 +381,7 @@ impl<Ans: LookupAnswer> AnswersSolver<'_, '_, Ans> {
                     format!(
                         "Default for parameter binding `Flag[{domain}]` type parameter `{}` must be a `{domain}` literal, got `{}`",
                         tparam.name(),
-                        default.ty,
+                        default_ty.display_with(self),
                     ),
                 );
             }

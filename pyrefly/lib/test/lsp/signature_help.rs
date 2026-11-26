@@ -354,7 +354,7 @@ g(
 "#;
     let report = get_batched_lsp_operations_report_allow_error(&[("main", code)], get_test_report);
     assert!(
-        report.contains("def __call__(self: Greeter, name: str, times: int = 1) -> str: ..."),
+        report.contains("def __call__(name: str, times: int = 1) -> str: ..."),
         "Expected signature help to show __call__ signature, got: {report}"
     );
     assert!(
@@ -447,26 +447,251 @@ foo.f("",3,True)
 6 | foo.f()
           ^
 Signature Help Result: active=0
-- def f(self: Foo, a: str, b: int, c: bool) -> None: ..., parameters=[a: str, b: int, c: bool], active parameter = 0
+- def f(a: str, b: int, c: bool) -> None: ..., parameters=[a: str, b: int, c: bool], active parameter = 0
 
 8 | foo.f("", )
              ^
 Signature Help Result: active=0
-- def f(self: Foo, a: str, b: int, c: bool) -> None: ..., parameters=[a: str, b: int, c: bool], active parameter = 1
+- def f(a: str, b: int, c: bool) -> None: ..., parameters=[a: str, b: int, c: bool], active parameter = 1
 
 10 | foo.f("",3, )
                 ^
 Signature Help Result: active=0
-- def f(self: Foo, a: str, b: int, c: bool) -> None: ..., parameters=[a: str, b: int, c: bool], active parameter = 2
+- def f(a: str, b: int, c: bool) -> None: ..., parameters=[a: str, b: int, c: bool], active parameter = 2
 
 12 | foo.f("",3,True)
                 ^
 Signature Help Result: active=0
-- def f(self: Foo, a: str, b: int, c: bool) -> None: ..., parameters=[a: str, b: int, c: bool], active parameter = 2
+- def f(a: str, b: int, c: bool) -> None: ..., parameters=[a: str, b: int, c: bool], active parameter = 2
 "#
         .trim(),
         report.trim(),
     );
+}
+
+#[test]
+fn bound_and_unbound_method_parameters_test() {
+    let definitions = r#"
+from typing import Self
+
+class Foo:
+    def method(self, value: int) -> None: ...
+    def empty(self) -> None: ...
+    def renamed(receiver, /, value: int) -> None: ...
+    def explicit_self(receiver, self: int) -> None: ...
+    @classmethod
+    def class_method(cls, value: int) -> None: ...
+    @staticmethod
+    def static_method(self: int) -> None: ...
+
+class Callback:
+    def __call__(receiver, value: int) -> None: ...
+
+class GenericFoo[T]:
+    def method(self, value: T) -> None: ...
+
+class Constructed:
+    def __init__(self, x: int) -> None: ...
+
+def function(self: int) -> None: ...
+
+bound = Foo().method
+"#;
+    for (call, label, parameters, active_parameter) in [
+        (
+            "Foo().method(|)",
+            "def method(value: int) -> None: ...",
+            vec!["value: int"],
+            Some(0),
+        ),
+        (
+            "bound(|)",
+            "def method(value: int) -> None: ...",
+            vec!["value: int"],
+            Some(0),
+        ),
+        (
+            "Foo.method(|)",
+            "def method(self: Foo, value: int) -> None: ...",
+            vec!["self: Foo", "value: int"],
+            Some(0),
+        ),
+        (
+            "Foo.method(Foo(), |)",
+            "def method(self: Foo, value: int) -> None: ...",
+            vec!["self: Foo", "value: int"],
+            Some(1),
+        ),
+        ("Foo().empty(|)", "def empty() -> None: ...", vec![], None),
+        (
+            "Foo().renamed(|)",
+            "def renamed(value: int) -> None: ...",
+            vec!["value: int"],
+            Some(0),
+        ),
+        (
+            "Foo().explicit_self(|)",
+            "def explicit_self(self: int) -> None: ...",
+            vec!["self: int"],
+            Some(0),
+        ),
+        (
+            "Foo.class_method(|)",
+            "def class_method(value: int) -> None: ...",
+            vec!["value: int"],
+            Some(0),
+        ),
+        (
+            "Foo().class_method(|)",
+            "def class_method(value: int) -> None: ...",
+            vec!["value: int"],
+            Some(0),
+        ),
+        (
+            "Foo.static_method(|)",
+            "def static_method(self: int) -> None: ...",
+            vec!["self: int"],
+            Some(0),
+        ),
+        (
+            "function(|)",
+            "def function(self: int) -> None: ...",
+            vec!["self: int"],
+            Some(0),
+        ),
+        (
+            "Callback()(|)",
+            "def __call__(value: int) -> None: ...",
+            vec!["value: int"],
+            Some(0),
+        ),
+        (
+            "GenericFoo[int]().method(|)",
+            "def method(value: int) -> None: ...",
+            vec!["value: int"],
+            Some(0),
+        ),
+        (
+            "class Factory(Constructed):\n    @classmethod\n    def make(cls) -> None:\n        cls(|)",
+            "(x: int) -> Factory",
+            vec!["x: int"],
+            Some(0),
+        ),
+        (
+            "class Factory(Constructed):\n    @classmethod\n    def make(cls: type[Self]) -> None:\n        cls(|)",
+            "(x: int) -> Factory",
+            vec!["x: int"],
+            Some(0),
+        ),
+        (
+            "def make[T: Constructed](cls: type[T]) -> None:\n    cls(|)",
+            "(x: int) -> Constructed",
+            vec!["x: int"],
+            Some(0),
+        ),
+        (
+            "def make(cls: type[Constructed]) -> None:\n    cls(|)",
+            "(x: int) -> Constructed",
+            vec!["x: int"],
+            Some(0),
+        ),
+    ] {
+        let code = format!("{definitions}\n{call}\n");
+        let position = TextSize::try_from(code.find('|').expect("cursor marker present"))
+            .expect("test source fits in TextSize");
+        let code = code.replace('|', "");
+        let (handles, state) = mk_multi_file_state(&[("main", &code)], Require::Exports, false);
+        let signature = state
+            .transaction()
+            .get_signature_help_at(handles.get("main").unwrap(), position)
+            .expect("signature help available");
+        assert_eq!(signature.signatures.len(), 1, "{call}");
+        let signature = &signature.signatures[0];
+        assert_eq!(signature.label, label, "{call}");
+        assert_eq!(
+            signature
+                .parameters
+                .as_ref()
+                .expect("parameters available")
+                .iter()
+                .map(|param| param.label.clone())
+                .collect_vec(),
+            parameters
+                .into_iter()
+                .map(|label| ParameterInformationLabel::String(label.to_owned()))
+                .collect_vec(),
+            "{call}"
+        );
+        assert_eq!(
+            signature.active_parameter,
+            active_parameter.map(ActiveParameter::Int),
+            "{call}"
+        );
+    }
+}
+
+#[test]
+fn rejected_receiver_overload_parameters_test() {
+    let definitions = r#"
+from typing import overload
+
+class C[T]:
+    @overload
+    def method(self: C[int], value: int) -> int: ...
+    @overload
+    def method(self: C[str], value: str) -> str: ...
+    def method(self, value: object) -> object:
+        return value
+
+def use(obj: C[bytes]) -> None:
+"#;
+    for (call, chosen) in [
+        ("obj.method(|)", 0),
+        ("obj.method(|1)", 0),
+        ("obj.method(|'x')", 1),
+    ] {
+        let code = format!("{definitions}    {call}\n");
+        let position = TextSize::try_from(code.find('|').expect("cursor marker present"))
+            .expect("test source fits in TextSize");
+        let code = code.replace('|', "");
+        let (handles, state) = mk_multi_file_state(&[("main", &code)], Require::Exports, false);
+        let signature = state
+            .transaction()
+            .get_signature_help_at(handles.get("main").unwrap(), position)
+            .expect("signature help available");
+        assert_eq!(signature.active_signature, Some(chosen), "{call}");
+        assert_eq!(
+            signature
+                .signatures
+                .iter()
+                .map(|sig| sig.label.as_str())
+                .collect_vec(),
+            vec!["(value: int) -> int", "(value: str) -> str"],
+            "{call}"
+        );
+        for (signature, parameter) in signature
+            .signatures
+            .iter()
+            .zip(["value: int", "value: str"])
+        {
+            assert_eq!(
+                signature
+                    .parameters
+                    .as_ref()
+                    .expect("parameters available")
+                    .iter()
+                    .map(|parameter| parameter.label.clone())
+                    .collect_vec(),
+                vec![ParameterInformationLabel::String(parameter.to_owned())],
+                "{call}"
+            );
+            assert_eq!(
+                signature.active_parameter,
+                Some(ActiveParameter::Int(0)),
+                "{call}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -547,20 +772,58 @@ foo.overloaded_meth(1, F)
 15 | foo.overloaded_meth()
                          ^
 Signature Help Result: active=0
-- (self: Foo, a: str) -> bool, parameters=[a: str], active parameter = 0
-- (self: Foo, a: int, b: bool) -> str, parameters=[a: int, b: bool], active parameter = 0
+- (a: str) -> bool, parameters=[a: str], active parameter = 0
+- (a: int, b: bool) -> str, parameters=[a: int, b: bool], active parameter = 0
 
 17 | foo.overloaded_meth(1, )
                             ^
 Signature Help Result: active=0
-- (self: Foo, a: str) -> bool, parameters=[a: str]
-- (self: Foo, a: int, b: bool) -> str, parameters=[a: int, b: bool], active parameter = 1
+- (a: str) -> bool, parameters=[a: str]
+- (a: int, b: bool) -> str, parameters=[a: int, b: bool], active parameter = 1
 
 19 | foo.overloaded_meth(1, F)
                             ^
 Signature Help Result: active=1
-- (self: Foo, a: str) -> bool, parameters=[a: str]
-- (self: Foo, a: int, b: bool) -> str, parameters=[a: int, b: bool], active parameter = 1
+- (a: str) -> bool, parameters=[a: str]
+- (a: int, b: bool) -> str, parameters=[a: int, b: bool], active parameter = 1
+"#
+        .trim(),
+        report.trim(),
+    );
+}
+
+#[test]
+fn receiver_selected_overload_test() {
+    let code = r#"
+from typing import overload
+
+class C[T]:
+    @overload
+    def f(self: C[int], x: int) -> int: ...
+    @overload
+    def f(self: C[str], x: str) -> str: ...
+    def f(self, x: int | str) -> int | str:
+        return x
+
+def test(ci: C[int]):
+    ci.f()
+#        ^
+    ci.f(1)
+#         ^
+"#;
+    let report = get_batched_lsp_operations_report_allow_error(&[("main", code)], get_test_report);
+    assert_eq!(
+        r#"
+# main.py
+13 |     ci.f()
+              ^
+Signature Help Result: active=0
+- (x: int) -> int, parameters=[x: int], active parameter = 0
+
+15 |     ci.f(1)
+               ^
+Signature Help Result: active=0
+- (x: int) -> int, parameters=[x: int], active parameter = 0
 "#
         .trim(),
         report.trim(),
@@ -1044,12 +1307,12 @@ Person("Alice", )
 5 | Person()
            ^
 Signature Help Result: active=0
-- (self: Person, name: str, age: int) -> Person, parameters=[name: str, age: int], active parameter = 0
+- (name: str, age: int) -> Person, parameters=[name: str, age: int], active parameter = 0
 
 7 | Person("Alice", )
                    ^
 Signature Help Result: active=0
-- (self: Person, name: str, age: int) -> Person, parameters=[name: str, age: int], active parameter = 1
+- (name: str, age: int) -> Person, parameters=[name: str, age: int], active parameter = 1
 "#
         .trim(),
         report.trim(),
@@ -1077,12 +1340,12 @@ Test(a="", )
 8 | Test()
          ^
 Signature Help Result: active=0
-- (_cls: type[Test], a: str, b: int) -> Test, parameters=[a: str, b: int], active parameter = 0
+- (a: str, b: int) -> Test, parameters=[a: str, b: int], active parameter = 0
 
 10 | Test(a="", )
                 ^
 Signature Help Result: active=0
-- (_cls: type[Test], a: str, b: int) -> Test, parameters=[a: str, b: int], active parameter = 1
+- (a: str, b: int) -> Test, parameters=[a: str, b: int], active parameter = 1
 "#
         .trim(),
         report.trim(),
@@ -1106,7 +1369,7 @@ Person.__init__(p, )
 6 | Person.__init__(p, )
                       ^
 Signature Help Result: active=0
-- def __init__(self: Person, name: str) -> None: ..., parameters=[name: str]
+- def __init__(self: Person, name: str) -> None: ..., parameters=[self: Person, name: str], active parameter = 1
 "#
         .trim(),
         report.trim(),
@@ -1135,12 +1398,12 @@ Box[int](42)
 9 | Box[str]()
              ^
 Signature Help Result: active=0
-- (self: Box[str], value: str) -> Box[str], parameters=[value: str], active parameter = 0
+- (value: str) -> Box[str], parameters=[value: str], active parameter = 0
 
 11 | Box[int](42)
               ^
 Signature Help Result: active=0
-- (self: Box[int], value: int) -> Box[int], parameters=[value: int], active parameter = 0
+- (value: int) -> Box[int], parameters=[value: int], active parameter = 0
 "#
         .trim(),
         report.trim(),
@@ -1148,7 +1411,7 @@ Signature Help Result: active=0
 }
 
 #[test]
-fn method_call_signature_unchanged() {
+fn method_call_signature_omits_receiver() {
     let code = r#"
 class Foo:
     def method(self, x: int) -> str: ...
@@ -1164,7 +1427,7 @@ foo.method()
 6 | foo.method()
                ^
 Signature Help Result: active=0
-- def method(self: Foo, x: int) -> str: ..., parameters=[x: int], active parameter = 0
+- def method(x: int) -> str: ..., parameters=[x: int], active parameter = 0
 "#
         .trim(),
         report.trim(),
@@ -1284,6 +1547,167 @@ Signature Help Result: active=0
 - (x: int) -> int, parameters=[x: int], active parameter = 0
 - (x: str) -> str, parameters=[x: str], active parameter = 0
 - (x: bool) -> bool, parameters=[x: bool], active parameter = 0
+"#
+        .trim(),
+        report.trim(),
+    );
+}
+
+/// Reports each parameter of the active signature with its documentation.
+fn get_parameter_documentation_report(
+    state: &State,
+    handle: &Handle,
+    position: TextSize,
+) -> String {
+    let Some(SignatureHelp {
+        signatures,
+        active_signature,
+        ..
+    }) = state.transaction().get_signature_help_at(handle, position)
+    else {
+        return "Signature Help: None".to_owned();
+    };
+    let active_signature = active_signature.expect("signature help sets the active signature");
+    let signature = &signatures[active_signature as usize];
+    signature
+        .parameters
+        .iter()
+        .flatten()
+        .map(|param| {
+            let ParameterInformationLabel::String(label) = &param.label else {
+                unreachable!("signature help uses string labels")
+            };
+            let doc = match &param.documentation {
+                Some(Documentation::MarkupContent(content)) => content.value.as_str(),
+                Some(Documentation::String(s)) => s.as_str(),
+                None => "<none>",
+            };
+            format!("- {label}: {doc}")
+        })
+        .join("\n")
+}
+
+const ANNOTATED_DOC: &str = r#"
+class Doc:
+    def __init__(self, documentation: str, /) -> None: ...
+"#;
+
+#[test]
+fn annotated_doc_parameter_documentation_test() {
+    let code = r#"
+from typing import Annotated
+from annotated_doc import Doc
+import annotated_doc
+
+def greet(
+    name: Annotated[str, Doc("Who to greet")],
+    times: Annotated[int, annotated_doc.Doc(
+        """
+        How many times
+        to greet.
+        """
+    )],
+    loud: bool,
+) -> None:
+    """
+    Args:
+        name: docstring text for name
+        loud: shout
+    """
+
+greet()
+#     ^
+
+class App:
+    def get(self, path: Annotated[str, Doc("The URL path")]) -> None: ...
+
+class Item:
+    def __init__(self, price: Annotated[float, Doc("The price")]) -> None: ...
+
+App().get()
+#         ^
+Item()
+#    ^
+"#;
+    let report = get_batched_lsp_operations_report_allow_error(
+        &[("annotated_doc", ANNOTATED_DOC), ("main", code)],
+        get_parameter_documentation_report,
+    );
+    assert_eq!(
+        r#"
+# annotated_doc.py
+
+# main.py
+22 | greet()
+           ^
+- name: str: Who to greet
+- times: int: How many times
+to greet.
+- loud: bool: shout
+
+31 | App().get()
+               ^
+- path: str: The URL path
+
+33 | Item()
+          ^
+- price: float: The price
+"#
+        .trim(),
+        report.trim(),
+    );
+}
+
+#[test]
+fn annotated_doc_parameter_documentation_from_other_module_test() {
+    let lib = r#"
+from typing import Annotated
+from annotated_doc import Doc
+
+def greet(name: Annotated[str, Doc("Who to greet")]) -> None: ...
+
+class App:
+    def get(self, path: Annotated[str, Doc("The URL path")]) -> None: ...
+
+class Item:
+    def __init__(self, price: Annotated[float, Doc("The price")]) -> None: ...
+"#;
+    let code = r#"
+from lib import App, Item, greet
+
+greet()
+#     ^
+App().get()
+#         ^
+Item()
+#    ^
+"#;
+    let report = get_batched_lsp_operations_report_allow_error(
+        &[
+            ("annotated_doc", ANNOTATED_DOC),
+            ("lib", lib),
+            ("main", code),
+        ],
+        get_parameter_documentation_report,
+    );
+    assert_eq!(
+        r#"
+# annotated_doc.py
+
+# lib.py
+
+# main.py
+4 | greet()
+          ^
+- name: str: Who to greet
+
+6 | App().get()
+              ^
+- path: str: The URL path
+
+8 | Item()
+         ^
+- price: float: The price
 "#
         .trim(),
         report.trim(),

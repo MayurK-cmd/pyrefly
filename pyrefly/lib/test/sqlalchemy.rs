@@ -238,7 +238,7 @@ class User(Base):
     "#,
 );
 
-// Regression test for https://github.com/facebook/pyrefly/issues/1610
+// Regression test for https://github.com/pyrefly-org/pyrefly/issues/1610
 testcase!(
     test_sqlalchemy_mapped_dataclass_mutable_default,
     sqlalchemy_env(),
@@ -277,7 +277,7 @@ def sql_expr() -> sa.ColumnElement[int]: ...
 sa.update(User).values(name=sql_expr())
 
 class CustomUpdate:
-    def values(self, **kwargs: object) -> CustomUpdate: ...
+    def values(self, **kwargs: object) -> "CustomUpdate": ...
 
 def update(table: object) -> CustomUpdate: ...
 
@@ -313,7 +313,7 @@ sa.update(AdminUser).where(AdminUser.id == 1).values(deleted=False)  # E: Unexpe
     "#,
 );
 
-// Regression test for https://github.com/facebook/pyrefly/issues/1072
+// Regression test for https://github.com/pyrefly-org/pyrefly/issues/1072
 testcase!(
     test_sqlalchemy_select_filter_by_checks_mapped_fields,
     sqlalchemy_env(),
@@ -345,7 +345,7 @@ class Address(Base):
 select(User).join(Address).filter_by(email="alice@example.com")
 
 class CustomSelect:
-    def filter_by(self, **kwargs: object) -> CustomSelect: ...
+    def filter_by(self, **kwargs: object) -> "CustomSelect": ...
 
 def select_custom(entity: object) -> CustomSelect: ...
 

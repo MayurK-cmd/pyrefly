@@ -166,7 +166,7 @@ assert_type(Contact.address.field.max_length, int | None)
 "#,
 );
 
-// https://github.com/facebook/pyrefly/issues/5322
+// https://github.com/pyrefly-org/pyrefly/issues/5322
 django_testcase!(
     test_field_expression_assignment,
     r#"
@@ -299,7 +299,7 @@ class Counter(models.Model):
         self.optional_count = Value(1)
         assert_type(self.optional_count, int | None)
 
-    def bump_explicit(self: Counter) -> None:
+    def bump_explicit(self: "Counter") -> None:
         self.count = F("count") + 1
 
 class SpecialCounter(Counter):

@@ -1160,6 +1160,20 @@ def test2(x: str | tuple[int, str] | tuple[int, str, str]) -> str:
 );
 
 testcase!(
+    test_isinstance_protocol_keeps_only_matching_union_members,
+    r#"
+from os import PathLike
+from pathlib import Path
+from typing import IO, assert_type
+def f(path: Path | IO[bytes], name: str | IO[bytes]) -> None:
+    if isinstance(path, PathLike):
+        assert_type(path, Path)
+    if isinstance(name, (str, PathLike)):
+        assert_type(name, str)
+"#,
+);
+
+testcase!(
     test_isinstance_iterable_union_multiple,
     r#"
 from typing import assert_type, Iterable
@@ -1305,7 +1319,7 @@ from typing import Any, Iterable, assert_type
 # `Iterable[Any]` overlaps with both `str` and `bytes` (both are iterable).
 # In the negative branch of `isinstance(a, (str, bytes))` we should still
 # remove the `str` and `bytes` alternatives from the remaining union.
-# Regression test for facebook/pyrefly#3412.
+# Regression test for pyrefly-org/pyrefly#3412.
 def f(a: float | str | bytes | Iterable[Any]) -> None:
     if isinstance(a, (str, bytes)):
         pass
@@ -1384,6 +1398,20 @@ def f(cls: type[int], x: int | str) -> None:
     if not isinstance(x, cls):
         # cls might be a subclass of int, so x can still be an int here
         assert_type(x, int | str)
+    "#,
+);
+
+testcase!(
+    test_is_not_instance_gradual_intersection,
+    r#"
+from typing import Any, reveal_type
+
+def f(found: list[Any]) -> None:
+    value = min(found, key=len)
+    reveal_type(value)  # E: revealed type: Sized & Any
+    if isinstance(value, str):
+        return
+    reveal_type(value)  # E: revealed type: Sized & Any
     "#,
 );
 
@@ -2479,7 +2507,7 @@ def test_literal_string(x: str | None, values: set[LiteralString]) -> None:
 "#,
 );
 
-// https://github.com/facebook/pyrefly/issues/5178
+// https://github.com/pyrefly-org/pyrefly/issues/5178
 testcase!(
     test_positive_equality_non_literal,
     r#"
@@ -3048,7 +3076,7 @@ def test(x: tuple[int, int], y: tuple[int, *tuple[int, ...], int], z: tuple[int,
 "#,
 );
 
-// Regression test for https://github.com/facebook/pyrefly/issues/1616
+// Regression test for https://github.com/pyrefly-org/pyrefly/issues/1616
 testcase!(
     test_dict_literal_key_isinstance_narrowing,
     r#"
@@ -3588,7 +3616,7 @@ class C:
     key: bytes
 
 def test(c: C, d: dict[str, int]) -> None:
-    if c.key in d:
+    if c.key in d:  # E: Membership test `in` is always False
         assert_type(c, C)
         assert_type(c.key, Never)
     "#,
@@ -3736,7 +3764,7 @@ def f(x: int):
     "#,
 );
 
-// https://github.com/facebook/pyrefly/issues/1592
+// https://github.com/pyrefly-org/pyrefly/issues/1592
 testcase!(
     test_disjoint_bases_subclasses,
     r#"
@@ -4148,11 +4176,11 @@ def f(x: A):
     "#,
 );
 
-// Regression test for https://github.com/facebook/pyrefly/issues/1642
+// Regression test for https://github.com/pyrefly-org/pyrefly/issues/1642
 testcase!(
     test_typed_dict_truthiness_narrowing,
     r#"
-from typing import TypedDict, assert_type, NotRequired
+from typing import TypedDict, assert_type, NotRequired, reveal_type
 class RequiredDict(TypedDict):
     val: int
 class EmptyDict(TypedDict):
@@ -4161,7 +4189,7 @@ def test_narrowing(x: RequiredDict | None, y: EmptyDict | None):
     xval = x and x['val']
     assert_type(xval, int | None)
     yval = y and y.get('val')
-    assert_type(yval, int | None | EmptyDict)
+    reveal_type(yval)  # E: revealed type: (EmptyDict & Falsy) | int | None
 "#,
 );
 
@@ -4298,7 +4326,7 @@ def f[T: str](x: T) -> TypeGuard[T]:
     return True
 
 def g(x: int | str):
-    if f(x):  # E: `int | str` is not assignable to upper bound `str` of type variable `T`
+    if f(x):  # E: While checking parameter `x`: `int | str` is not assignable to upper bound `str` of type variable `T`
         pass
     "#,
 );
@@ -4369,7 +4397,7 @@ def f(inputs: Sequence[int]):
     "#,
 );
 
-// Regression test for https://github.com/facebook/pyrefly/issues/1570
+// Regression test for https://github.com/pyrefly-org/pyrefly/issues/1570
 testcase!(
     test_narrow_not_in_dict,
     r#"
@@ -4383,7 +4411,7 @@ def example(variable: str | None) -> str:
 "#,
 );
 
-// https://github.com/facebook/pyrefly/issues/1575
+// https://github.com/pyrefly-org/pyrefly/issues/1575
 testcase!(
     test_typevar_isinstance_narrow_else,
     r#"
@@ -4424,7 +4452,7 @@ def test3(x: V) -> V:
 "#,
 );
 
-// Regression test for https://github.com/facebook/pyrefly/issues/2607
+// Regression test for https://github.com/pyrefly-org/pyrefly/issues/2607
 testcase!(
     test_narrow_sequence_to_tuple_return,
     r#"
@@ -4437,7 +4465,7 @@ def f(x: Sequence[int]) -> tuple[int, ...]:
 "#,
 );
 
-// Regression test for https://github.com/facebook/pyrefly/issues/2607
+// Regression test for https://github.com/pyrefly-org/pyrefly/issues/2607
 testcase!(
     test_narrow_sequence_to_tuple_assert_type,
     r#"
@@ -5029,7 +5057,7 @@ def test_dict(x: dict[str, object] | dict[Never, object]):
     "#,
 );
 
-// https://github.com/facebook/pyrefly/issues/5159
+// https://github.com/pyrefly-org/pyrefly/issues/5159
 testcase!(
     test_truthiness_narrow_typevar,
     r#"
@@ -5121,7 +5149,7 @@ def custom[T: Falsy](value: T) -> T:
 "#,
 );
 
-// https://github.com/meta/pyrefly/issues/5544
+// https://github.com/pyrefly-org/pyrefly/issues/5544
 testcase!(
     test_narrow_error_any_join,
     r#"
@@ -5208,7 +5236,7 @@ def terminated() -> None:
 "#,
 );
 
-// https://github.com/facebook/pyrefly/issues/5255
+// https://github.com/pyrefly-org/pyrefly/issues/5255
 testcase!(
     test_narrow_or_placeholder_gradual,
     r#"
@@ -5272,7 +5300,78 @@ def preserve_facets_and_subtypes(x: A, flag: bool) -> None:
     "#,
 );
 
-// https://github.com/facebook/pyrefly/issues/5147
+// https://github.com/pyrefly-org/pyrefly/issues/5546
+testcase!(
+    test_narrow_or_to_class_extending_any,
+    r#"
+from typing import Any, TypeGuard, reveal_type
+
+class C(Any):
+    pass
+
+def has(cls: type) -> TypeGuard[type[C]]:
+    return hasattr(cls, "tag")
+
+def has2(cls: type) -> TypeGuard[type[C]]:
+    return hasattr(cls, "tag")
+
+def is_c(x: object) -> TypeGuard[C]:
+    return True
+
+def repeated_guard(t: type[object]) -> None:
+    if has(t) or has(t):
+        reveal_type(t)  # E: revealed type: type[C]
+        t.tag
+
+def different_guards(t: type[object]) -> None:
+    if has(t) or has2(t):
+        reveal_type(t)  # E: revealed type: type[C]
+
+def instance_guard(x: object) -> None:
+    if is_c(x) or is_c(x):
+        reveal_type(x)  # E: revealed type: C
+
+def one_branch_does_not_narrow(t: type[object]) -> None:
+    if has(t) or isinstance(t, type):
+        reveal_type(t)  # E: revealed type: type[object]
+
+def gradual_base(x) -> None:
+    if isinstance(x, int) or isinstance(x, str):
+        reveal_type(x)  # E: revealed type: int | str
+
+class Holder:
+    t: type[object]
+
+def attribute(o: Holder) -> None:
+    if has(o.t) or has(o.t):
+        reveal_type(o.t)  # E: revealed type: type[C]
+
+def control_flow_merge(t: type[object], flag: bool) -> None:
+    if flag:
+        if not has(t):
+            return
+    else:
+        if not has2(t):
+            return
+    reveal_type(t)  # E: revealed type: type[C]
+
+def covering_branches(x: bool) -> None:
+    # The branches are `Literal[True]` and `Literal[False]`, which together cover `bool`.
+    if x or not x:
+        reveal_type(x)  # E: revealed type: bool
+
+blocked: list[str] = []
+
+def takes_int(x: int) -> None: ...
+
+def base_contains_any(x: int | Any | None) -> None:
+    if x is None or x in blocked:
+        return
+    takes_int(x)
+    "#,
+);
+
+// https://github.com/pyrefly-org/pyrefly/issues/5147
 testcase!(
     test_isinstance_union_with_typevar_classinfo,
     r#"

@@ -111,6 +111,9 @@ pub enum ErrorKind {
     AbstractMethodCall,
     /// An `@abstractmethod` has a non-placeholder implementation.
     AbstractMethodWithImplementation,
+    /// A function decorator whose type or result contains a top-level explicit `Any`,
+    /// obscuring the decorated function's type.
+    AnyFunctionDecorator,
     /// Raised when an assert_type() call fails.
     AssertType,
     /// Raised when an assert_type() call fails because the actual type is a subtype of the
@@ -134,6 +137,8 @@ pub enum ErrorKind {
     /// A dataclass field is typed as a descriptor whose read-back type does not match
     /// what the synthesized `__init__` writes.
     BadDataclassDescriptor,
+    /// A descriptor's getter returns a type incompatible with a non-descriptor base.
+    BadDescriptorInheritance,
     /// An entry in user-defined `__all__` does not exist in the module.
     BadDunderAll,
     /// A function definition has some typing-related error.
@@ -152,6 +157,12 @@ pub enum ErrorKind {
     BadMatch,
     /// A subclass field or method incorrectly overrides a field/method of a parent class.
     BadOverride,
+    /// A descriptor override has an incompatible type when accessed through the class.
+    /// This is a sub-kind of [BadOverride]: suppressing `bad-override` also suppresses this error.
+    BadOverrideDescriptor,
+    /// An incompatible override checked only because the member is decorated with `@override`.
+    /// This is a sub-kind of [BadOverride].
+    BadOverrideExplicit,
     /// A subclass field overrides a mutable attribute of a parent class with an incompatible type.
     /// Mutable (read-write) attributes require invariant types, unlike read-only attributes or
     /// methods which allow covariant overrides.
@@ -212,6 +223,11 @@ pub enum ErrorKind {
     /// An unqualified import that resolves only through the fallback search path heuristic, so it
     /// may fail at runtime.
     FallbackSearchPathRelativeImport,
+    /// A `# pyrefly: ignore` comment suppresses errors without naming a specific
+    /// error code. Off by default; enable it to require every Pyrefly
+    /// suppression to list the code(s) it silences, e.g.
+    /// `# pyrefly: ignore[bad-return]`.
+    IgnoreWithoutCode,
     /// Raised when a class that inherits from an abstract class but is not itself explicitly
     /// abstract (for example, it does not directly inherit from abc.ABC or use abc.ABCMeta) has
     /// unimplemented abstract members.
@@ -256,6 +272,8 @@ pub enum ErrorKind {
     /// do not recognize as always executing (we recognize constructors and some test setup
     /// methods).
     ImplicitlyDefinedAttribute,
+    /// A module imports itself through a chain of other first-party modules.
+    ImportCycle,
     /// A block of code that is unreachable in the current type-checking configuration - for
     /// example, the `else` block following an `if TYPE_CHECKING: ...` block.
     InactiveCode,
@@ -268,6 +286,8 @@ pub enum ErrorKind {
     /// Kept so that existing `# pyrefly: ignore[incompatible-overload-residual]` comments and
     /// config entries continue to work. This variant is never emitted by the type checker.
     IncompatibleOverloadResidual,
+    /// Constructor methods have no common argument list.
+    InconsistentConstructor,
     /// An inconsistency between inherited fields or methods from multiple base classes.
     InconsistentInheritance,
     /// An inconsistency between the signature of a function overload and the implementation.
@@ -275,6 +295,9 @@ pub enum ErrorKind {
     /// An inconsistency between a function parameter's type in an overload signature and its
     /// default value in the implementation.
     InconsistentOverloadDefault,
+    /// `final` was called directly on a class, which has no effect.
+    /// Only `@final` used as a decorator marks a class as final.
+    IneffectiveFinal,
     /// Cannot assign to a class-body-declared instance variable via the class (e.g. `C.instance_var = ...`).
     InstanceVarAssign,
     /// Internal Pyrefly error.
@@ -298,6 +321,11 @@ pub enum ErrorKind {
     /// An f-string format specification is incompatible with the value's static type
     /// or the known builtin formatting rules.
     InvalidFormatSpec,
+    /// A comment looks like a type checker ignore directive but is malformed, so
+    /// it silently suppresses nothing (or not what was intended). For example
+    /// `# pyrefly: ignoree` (typo), `# pyrefly: ignore[bad-code` (unterminated
+    /// bracket), or `# pyrefly: ignore[]` (empty code list).
+    InvalidIgnoreComment,
     /// An error caused by incorrect inheritance in a class or type definition.
     /// e.g. a metaclass that is not a subclass of `type`.
     InvalidInheritance,
@@ -409,11 +437,16 @@ pub enum ErrorKind {
     PartiallyUnknownType,
     /// An attribute may be uninitialized on some control-flow paths.
     PossiblyUninitializedAttribute,
+    /// A type variable in a function's return type that only parameters without a known default
+    /// value mention, so a call that omits those arguments leaves it unsolved.
+    PossiblyUnsolvedTypeVar,
     /// A potential conflict between an explicit keyword argument and a NotRequired
     /// TypedDict field. The field may be absent at runtime, so the conflict is not
     /// guaranteed. This is a separate error code from BadKeywordArgument to allow
     /// users to opt-in to this stricter check.
     PotentialBadKeywordArgument,
+    /// A property setter accepts a value type that cannot overlap the getter's return type.
+    PropertyTypeMismatch,
     /// Accessing a protected class member from outside its defining class or a subclass.
     ProtectedAccess,
     /// A protocol attribute was first defined inside a method instead of the class body.
@@ -448,6 +481,8 @@ pub enum ErrorKind {
     RedundantCast,
     /// Attempting to use value that is equivalent to True or always False in boolean context.
     RedundantCondition,
+    /// An `isinstance` or `issubclass` condition whose result is determined by its types.
+    RedundantTypeCheck,
     /// An invalid regex pattern or regex group access.
     Regex,
     /// Raised by a call to reveal_type().
@@ -466,6 +501,9 @@ pub enum ErrorKind {
     UnannotatedParameter,
     /// A protocol member is assigned a value in the class body without an explicit type annotation.
     UnannotatedProtocolMember,
+    /// A public function is missing a return type annotation.
+    /// This is a sub-kind of [UnannotatedReturn].
+    UnannotatedPublicReturn,
     /// A function is missing a return type annotation.
     UnannotatedReturn,
     /// Attempting to use a name that may be unbound or uninitialized
@@ -476,6 +514,8 @@ pub enum ErrorKind {
     UnexpectedNever,
     /// An error caused by passing a positional argument for a keyword-only parameter.
     UnexpectedPositionalArgument,
+    /// A set element or dict key whose type is not hashable, which raises `TypeError` at runtime.
+    Unhashable,
     /// Attempting to use a type checker directive without importing it from `typing`.
     UnimportedDirective,
     /// An instance attribute is declared with a type annotation in the class body but is
@@ -510,6 +550,9 @@ pub enum ErrorKind {
     UnnecessaryComparison,
     /// Warning when calling a builtin type constructor (str, int, float, bool, bytes) on a value that is already of that type.
     UnnecessaryTypeConversion,
+    /// A function-scoped type variable that appears only once in the function's signature, so it
+    /// relates no types and can be replaced by its bound.
+    UnnecessaryTypeVar,
     /// A return or yield that can never be reached.
     /// This occurs when a return/yield follows a statement that always exits,
     /// such as return, raise, break, or continue.
@@ -521,8 +564,9 @@ pub enum ErrorKind {
     UnreachableMatchCase,
     /// `__all__` is defined but cannot be statically analyzed.
     UnresolvableDunderAll,
-    /// Calling a signature whose types depend on unresolved imports.
-    UnresolvedImportSignature,
+    /// A class inherits from more than one base class that defines `__init__`, so some of those
+    /// `__init__` methods may not get called.
+    UnsafeMultipleInheritance,
     /// Protocols decorated with `@runtime_checkable` can be used in `isinstance` checks
     /// The runtime only checks that an attribute with that name is present, so the
     /// type checker must warn if the types are not compatible.
@@ -537,10 +581,13 @@ pub enum ErrorKind {
     UnsupportedOperation,
     /// A class decorator whose own type is `Any`, obscuring the decorated class type.
     UntypedClassDecorator,
-    /// A function decorator whose own type is `Any`, obscuring the decorated function type.
+    /// A function decorator whose type or result contains a top-level implicit `Any`,
+    /// obscuring the decorated function's type.
     UntypedFunctionDecorator,
     /// Import is missing an expected stubs package
     UntypedImport,
+    /// An installed library has no type stubs or `py.typed` marker, and no known stubs package.
+    UntypedImportNoStubs,
     /// A `collections.namedtuple` declares no field types, so every field has an unknown type.
     UntypedNamedtuple,
     /// Result of a call expression is not used.
@@ -602,9 +649,10 @@ impl ErrorKind {
         match self {
             ErrorKind::AssertTypeUnspellableSubtype => Some(ErrorKind::AssertType),
             ErrorKind::DirectAbstractBaseInstantiation => Some(ErrorKind::BadInstantiation),
-            ErrorKind::BadOverrideMutableAttribute | ErrorKind::BadOverrideParamName => {
-                Some(ErrorKind::BadOverride)
-            }
+            ErrorKind::BadOverrideDescriptor
+            | ErrorKind::BadOverrideExplicit
+            | ErrorKind::BadOverrideMutableAttribute
+            | ErrorKind::BadOverrideParamName => Some(ErrorKind::BadOverride),
             ErrorKind::ImplicitAnyAttribute
             | ErrorKind::ImplicitAnyEmptyContainer
             | ErrorKind::ImplicitAnyLambda
@@ -621,6 +669,10 @@ impl ErrorKind {
             | ErrorKind::PytorchEfficiencyLintPrintTensor
             | ErrorKind::PytorchEfficiencyLintRedundantToCall => {
                 Some(ErrorKind::PytorchEfficiencyLints)
+            }
+            ErrorKind::UnannotatedPublicReturn => Some(ErrorKind::UnannotatedReturn),
+            ErrorKind::PossiblyUnsolvedTypeVar | ErrorKind::UnnecessaryTypeVar => {
+                Some(ErrorKind::InvalidTypeVar)
             }
             _ => None,
         }
@@ -652,7 +704,10 @@ impl ErrorKind {
         // IMPORTANT: When updating these, also update error-kinds.mdx in the docs
         match self {
             ErrorKind::AbstractMethodWithImplementation => Severity::Ignore,
+            ErrorKind::AnyFunctionDecorator => Severity::Ignore,
             ErrorKind::AttributeAssignOnNever => Severity::Warn,
+            ErrorKind::BadDescriptorInheritance => Severity::Warn,
+            ErrorKind::BadOverrideDescriptor => Severity::Ignore,
             ErrorKind::CoverageMissing => Severity::Warn,
             ErrorKind::CoveragePartial => Severity::Warn,
             ErrorKind::Deprecated => Severity::Warn,
@@ -662,6 +717,7 @@ impl ErrorKind {
             ErrorKind::ExplicitAny => Severity::Ignore,
             ErrorKind::ExplicitAnyUse => Severity::Ignore,
             ErrorKind::FallbackSearchPathRelativeImport => Severity::Warn,
+            ErrorKind::IgnoreWithoutCode => Severity::Ignore,
             ErrorKind::ImplicitAbstractClass => Severity::Ignore,
             ErrorKind::ImplicitAny => Severity::Ignore,
             ErrorKind::ImplicitAnyAttribute => Severity::Ignore,
@@ -672,13 +728,16 @@ impl ErrorKind {
             ErrorKind::ImplicitImport => Severity::Warn,
             ErrorKind::ImplicitReexport => Severity::Ignore,
             ErrorKind::ImplicitlyDefinedAttribute => Severity::Ignore,
+            ErrorKind::ImportCycle => Severity::Ignore,
             ErrorKind::InactiveCode => Severity::Hint,
             ErrorKind::IncompatibleComparison => Severity::Ignore,
+            ErrorKind::IneffectiveFinal => Severity::Warn,
             ErrorKind::InstanceVarAssign => Severity::Ignore,
             ErrorKind::InvalidAbstractMethod => Severity::Ignore,
             ErrorKind::InvalidCast => Severity::Ignore,
             ErrorKind::InvalidDecorator => Severity::Warn,
             ErrorKind::InvalidFormatSpec => Severity::Ignore,
+            ErrorKind::InvalidIgnoreComment => Severity::Warn,
             ErrorKind::MethodAssign => Severity::Ignore,
             ErrorKind::MisplacedIgnore => Severity::Warn,
             ErrorKind::MissingAttributePatchTarget => Severity::Warn,
@@ -696,7 +755,9 @@ impl ErrorKind {
             ErrorKind::OpenUnpacking => Severity::Ignore,
             ErrorKind::OrderedDataclassInheritance => Severity::Warn,
             ErrorKind::PossiblyUninitializedAttribute => Severity::Ignore,
+            ErrorKind::PossiblyUnsolvedTypeVar => Severity::Warn,
             ErrorKind::PotentialBadKeywordArgument => Severity::Ignore,
+            ErrorKind::PropertyTypeMismatch => Severity::Ignore,
             ErrorKind::ProtectedAccess => Severity::Ignore,
             ErrorKind::PytorchEfficiencyLintCudaCall => Severity::Ignore,
             ErrorKind::PytorchEfficiencyLintItemCall => Severity::Ignore,
@@ -705,12 +766,15 @@ impl ErrorKind {
             ErrorKind::PytorchEfficiencyLints => Severity::Ignore,
             ErrorKind::RedundantCast => Severity::Warn,
             ErrorKind::RedundantCondition => Severity::Warn,
+            ErrorKind::RedundantTypeCheck => Severity::Ignore,
             ErrorKind::RevealType => Severity::Info,
             ErrorKind::StringAsIterable => Severity::Ignore,
             ErrorKind::UnannotatedAttribute => Severity::Ignore,
             ErrorKind::UnannotatedParameter => Severity::Ignore,
+            ErrorKind::UnannotatedPublicReturn => Severity::Ignore,
             ErrorKind::UnannotatedReturn => Severity::Ignore,
             ErrorKind::UnexpectedNever => Severity::Warn,
+            ErrorKind::Unhashable => Severity::Warn,
             ErrorKind::UninitializedInstanceVariable => Severity::Ignore,
             ErrorKind::UnknownArgumentType => Severity::Ignore,
             ErrorKind::ImplicitAnyLambda => Severity::Ignore,
@@ -723,15 +787,17 @@ impl ErrorKind {
             ErrorKind::PartiallyUnknownType => Severity::Ignore,
             ErrorKind::UnnecessaryComparison => Severity::Warn,
             ErrorKind::UnnecessaryTypeConversion => Severity::Warn,
+            ErrorKind::UnnecessaryTypeVar => Severity::Ignore,
             ErrorKind::Unreachable => Severity::Hint,
             ErrorKind::UnreachableExceptClause => Severity::Warn,
             ErrorKind::UnreachableMatchCase => Severity::Warn,
             ErrorKind::UnresolvableDunderAll => Severity::Warn,
-            ErrorKind::UnresolvedImportSignature => Severity::Warn,
+            ErrorKind::UnsafeMultipleInheritance => Severity::Ignore,
             ErrorKind::UnsupportedDynamicBase => Severity::Ignore,
             ErrorKind::UntypedClassDecorator => Severity::Ignore,
             ErrorKind::UntypedFunctionDecorator => Severity::Ignore,
             ErrorKind::UntypedImport => Severity::Warn,
+            ErrorKind::UntypedImportNoStubs => Severity::Ignore,
             ErrorKind::UntypedNamedtuple => Severity::Ignore,
             ErrorKind::UnusedCallResult => Severity::Ignore,
             ErrorKind::UnusedIgnore => Severity::Ignore,
@@ -761,21 +827,34 @@ impl ErrorKind {
         matches!(self, ErrorKind::UnusedIgnore | ErrorKind::UnusedTypeIgnore)
     }
 
-    /// Returns whether `--suppress-errors` may write a suppression comment for
-    /// this kind. Directives are not errors, and suppressing an unused-ignore
-    /// diagnostic would only leave behind another unused ignore.
-    pub fn is_suppressable(self) -> bool {
-        !self.is_directive() && !self.is_unused_ignore()
+    /// Diagnostics about ignore comments themselves. They cannot be silenced by
+    /// an ignore comment (only by their configured severity), so they must also
+    /// be excluded from automatic suppression-comment insertion — writing a
+    /// `# pyrefly: ignore[...]` for one would produce a comment that can never
+    /// take effect.
+    pub fn is_unsuppressable(self) -> bool {
+        self.is_unused_ignore()
+            || matches!(
+                self,
+                ErrorKind::InvalidIgnoreComment | ErrorKind::IgnoreWithoutCode
+            )
     }
 
-    /// A soft error is a diagnostic that should not influence overload selection
-    /// or other type-inference decisions. The type check itself passed, but the
-    /// code pattern is suspicious.
+    /// Returns whether `--suppress-errors` may write a suppression comment for
+    /// this kind. Directives are not errors, and suppressing an unsuppressable
+    /// diagnostic would only leave behind another unused ignore.
+    pub fn is_suppressable(self) -> bool {
+        !self.is_directive() && !self.is_unsuppressable()
+    }
+
+    /// A soft diagnostic or directive does not influence overload selection or inference.
     pub fn is_soft(self) -> bool {
-        self.default_severity() == Severity::Ignore
+        self.is_directive()
+            || self.default_severity() == Severity::Ignore
             || matches!(
                 self,
                 ErrorKind::Deprecated
+                    | ErrorKind::InvalidIgnoreComment
                     | ErrorKind::RedundantCast
                     | ErrorKind::UnnecessaryTypeConversion
                     | ErrorKind::UnusedImport
@@ -843,10 +922,21 @@ mod tests {
     }
 
     #[test]
+    fn test_directive_inference_classification() {
+        assert!(ErrorKind::RevealType.is_directive());
+        assert_eq!(ErrorKind::RevealType.default_severity(), Severity::Info);
+        assert!(ErrorKind::RevealType.is_soft());
+        assert!(!ErrorKind::BadArgumentType.is_soft());
+        assert!(ErrorKind::InvalidIgnoreComment.is_soft());
+    }
+
+    #[test]
     fn test_suppressable_excludes_directives_and_unused_ignores() {
         assert!(!ErrorKind::RevealType.is_suppressable());
         assert!(!ErrorKind::UnusedIgnore.is_suppressable());
         assert!(!ErrorKind::UnusedTypeIgnore.is_suppressable());
+        assert!(!ErrorKind::InvalidIgnoreComment.is_suppressable());
+        assert!(!ErrorKind::IgnoreWithoutCode.is_suppressable());
         assert!(ErrorKind::BadAssignment.is_suppressable());
     }
 

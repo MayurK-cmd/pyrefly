@@ -36,14 +36,13 @@ use pyrefly_util::gas::Gas;
 use pyrefly_util::suggest::Candidate;
 use pyrefly_util::suggest::Search;
 use pyrefly_util::visit::Visit;
-use ruff_python_ast::AtomicNodeIndex;
 use ruff_python_ast::Expr;
 use ruff_python_ast::ExprAttribute;
-use ruff_python_ast::ExprBooleanLiteral;
 use ruff_python_ast::ExprName;
 use ruff_python_ast::Identifier;
 use ruff_python_ast::ModModule;
 use ruff_python_ast::Parameter;
+use ruff_python_ast::PythonVersion;
 use ruff_python_ast::Stmt;
 use ruff_python_ast::StmtClassDef;
 use ruff_python_ast::StmtFunctionDef;
@@ -99,6 +98,7 @@ use crate::binding::binding::LambdaParamId;
 use crate::binding::binding::LastPath;
 use crate::binding::binding::LastStmt;
 use crate::binding::binding::LegacyTypeParamModule;
+use crate::binding::binding::LegacyTypeParamSource;
 use crate::binding::binding::NarrowUseLocation;
 use crate::binding::binding::SuiteGate;
 use crate::binding::binding::TypeAliasParams;
@@ -151,6 +151,7 @@ use crate::table_for_each;
 use crate::table_try_for_each;
 use crate::types::globals::ImplicitGlobal;
 use crate::types::quantified::AnchorIndex;
+use crate::types::quantified::QuantifiedAnchor;
 use crate::types::quantified::QuantifiedIdentity;
 use crate::types::quantified::QuantifiedKind;
 use crate::types::quantified::QuantifiedOrigin;
@@ -180,6 +181,9 @@ pub enum NameLookupResult {
         is_module_scope: bool,
         /// Does this name resolve to a type parameter outside the current class's scope?
         is_outer_class_type_parameter: bool,
+        /// When this name resolves to a member of an enclosing class, the binding that an eager
+        /// read finds instead. See `Bindings::class_scope_fallback`.
+        class_scope_fallback: Option<Idx<Key>>,
     },
     /// This name is not defined in the current scope stack.
     NotFound,
@@ -417,6 +421,13 @@ table! {
     pub struct BindingTable(pub BindingEntry)
 }
 
+/// A literal slot occurrence and the class whose field binding declares it.
+#[derive(Debug)]
+pub struct SlotEntry {
+    pub name: Identifier,
+    pub class_idx: Idx<KeyClass>,
+}
+
 #[derive(Debug)]
 pub struct Bindings {
     module_info: ModuleInfo,
@@ -433,6 +444,9 @@ pub struct Bindings {
     annotated_metadata_ranges: Vec<TextRange>,
     /// Ranges of the types that were read from docstrings, sorted and non-overlapping.
     docstring_type_ranges: Vec<TextRange>,
+    /// Each entry records an `__all__` name and its range without string delimiters.
+    dunder_all_entries: Vec<Identifier>,
+    dunder_slots_entries: Vec<SlotEntry>,
     scope_trace: Option<ScopeTrace>,
     /// Names `del`eted at module scope; retained outside the LSP `scope_trace`.
     module_deletes: SmallSet<Name>,
@@ -481,6 +495,8 @@ pub struct Bindings {
     /// these declarations, since the following assignment counts as the
     /// initializer.
     subsequently_initialized: SmallSet<Idx<KeyAnnotation>>,
+    /// See `Bindings::class_scope_fallback`.
+    class_scope_fallbacks: SmallMap<TextRange, Idx<Key>>,
 }
 
 impl Display for Bindings {
@@ -586,6 +602,8 @@ pub struct BindingsBuilder<'a> {
     pub(super) shape_string_annotation: Option<TextRange>,
     /// See `Bindings::subsequently_initialized`.
     subsequently_initialized: SmallSet<Idx<KeyAnnotation>>,
+    /// See `Bindings::class_scope_fallback`.
+    pub(super) class_scope_fallbacks: SmallMap<TextRange, Idx<Key>>,
     /// Defaults extracted from an adjacent `__new__.__defaults__` assignment,
     /// set by `stmts()` and consumed by namedtuple synthesis in `stmt()`.
     pub adjacent_namedtuple_defaults: Option<Vec<Expr>>,
@@ -638,82 +656,12 @@ fn ranges_contain(ranges: &[TextRange], range: TextRange) -> bool {
     idx > 0 && ranges[idx - 1].contains_range(range)
 }
 
-/// Bind a constant summary so adding or removing a mutator invalidates dependent unwrap answers.
-fn bind_functools_wrapper_mutation(
-    table: &mut BindingTable,
-    range: TextRange,
-    has_mutation: bool,
-) -> Idx<Key> {
-    table.insert(
-        Key::FunctoolsWrapperMutation(range),
-        Binding::Expr(
-            None,
-            Box::new(Expr::BooleanLiteral(ExprBooleanLiteral {
-                node_index: AtomicNodeIndex::default(),
-                range,
-                value: has_mutation,
-            })),
-        ),
-    )
-}
-
 impl Bindings {
     #[expect(dead_code)] // Useful API
     fn len(&self) -> usize {
         let mut res = 0;
         table_for_each!(&self.table, |x: &BindingEntry<_>| res += x.1.len());
         res
-    }
-
-    /// Create a minimal Bindings for testing purposes.
-    ///
-    /// This creates a fake module with the given name and a mutation-free wrapper summary,
-    /// which is useful for creating distinguishable CalcIds in tests.
-    #[cfg(test)]
-    pub fn for_test(name: &str) -> Self {
-        use std::path::PathBuf;
-
-        use pyrefly_python::module::Module;
-        use pyrefly_python::module_path::ModulePath;
-
-        let module_name = ModuleName::from_str(name);
-        let module_path = ModulePath::filesystem(PathBuf::from(format!("/test/{}.py", name)));
-        let contents = Arc::new(String::new());
-        let module_info = Module::new(module_name, module_path, contents);
-        let mut table = BindingTable::default();
-        let functools_wrapper_mutation =
-            bind_functools_wrapper_mutation(&mut table, TextRange::default(), false);
-        Self {
-            module_info,
-            parse_errors: ModuleDiagnostics::default(),
-            binding_errors: ModuleDiagnostics::default(),
-            sys_info: SysInfo::default(),
-            table,
-            metadata: Arc::new(BindingsMetadata::new()),
-            module_ranges: None,
-            annotated_metadata_ranges: Vec::new(),
-            docstring_type_ranges: Vec::new(),
-            scope_trace: None,
-            module_deletes: SmallSet::new(),
-            unset_nodes: UnsetNodes::default(),
-            global_declarations: SmallSet::new(),
-            environment_definitions: SmallMap::new(),
-            environment_names: SmallSet::new(),
-            unused_imports: Vec::new(),
-            unused_variables: Vec::new(),
-            pytest_info: None,
-            setattr_name_literals: Vec::new(),
-            lambda_yield_keys: Vec::new(),
-            owned_lambda_params: SmallMap::new(),
-            lambda_parameter_derived: OnceLock::new(),
-            class_scopes: Vec::new(),
-            call_base_classes: Vec::new(),
-            class_field_definitions: SmallMap::new(),
-            shape_declarations: ShapeDeclarations::default(),
-            subsequently_initialized: SmallSet::new(),
-            promote_ranges: SmallSet::new(),
-            functools_wrapper_mutation,
-        }
     }
 
     pub fn display<K: Keyed>(&self, idx: Idx<K>) -> impl Display + '_
@@ -769,8 +717,8 @@ impl Bindings {
     }
 
     /// Look up pre-computed class fields by `ClassDefIndex`. O(1) Vec index.
-    /// Returns `None` if the index is out of bounds (e.g., stale cross-module
-    /// index after incremental rebuild).
+    /// Returns `None` if the index is out of bounds (e.g., a stale index after
+    /// an incremental rebuild).
     pub fn get_class_fields(&self, idx: ClassDefIndex) -> Option<&ClassFields> {
         Some(&self.metadata.get_class_checked(idx)?.fields)
     }
@@ -907,6 +855,14 @@ impl Bindings {
         self.subsequently_initialized.contains(&ann)
     }
 
+    /// For a name read at `range` that resolves to a member of an enclosing class, returns the
+    /// binding that an eager read finds instead. A postponed annotation runs after the class body,
+    /// so it sees class members that shadow names in enclosing scopes. When such a member is not a
+    /// type, the solver reports it and uses this binding, which is usually the intended type.
+    pub fn class_scope_fallback(&self, range: TextRange) -> Option<Idx<Key>> {
+        self.class_scope_fallbacks.get(&range).copied()
+    }
+
     /// Names `del`eted at module scope.
     pub fn module_deletes(&self) -> &SmallSet<Name> {
         &self.module_deletes
@@ -949,6 +905,26 @@ impl Bindings {
         } else {
             None
         }
+    }
+
+    pub fn dunder_slots_entries(&self) -> &[SlotEntry] {
+        &self.dunder_slots_entries
+    }
+
+    pub fn dunder_slots_entry_at(&self, position: TextSize) -> Option<&SlotEntry> {
+        self.dunder_slots_entries
+            .iter()
+            .find(|entry| entry.name.range.contains_inclusive(position))
+    }
+
+    pub fn dunder_all_entries(&self) -> &[Identifier] {
+        &self.dunder_all_entries
+    }
+
+    /// Return the final local binding for an export, preserving local import aliases.
+    pub fn dunder_all_binding(&self, name: &Name) -> Option<&Key> {
+        let export = self.key_to_idx_hashed_opt(Hashed::new(&KeyExport(name.clone())))?;
+        Some(self.idx_to_key(self.get(export).key_idx()))
     }
 
     /// Within the LSP, check if a key exists.
@@ -1034,11 +1010,14 @@ impl Bindings {
     }
 
     /// Whether `name` is bound as an experimental `MapIntTuples` mapper parameter.
-    pub fn is_type_level_lambda_parameter(&self, name: &Identifier) -> bool {
-        matches!(
-            self.get(self.key_to_idx(&Key::Definition(ShortIdentifier::new(name)))),
-            Binding::TypeLevelLambdaParameter(_)
-        )
+    pub fn type_level_lambda_parameter(
+        &self,
+        name: &Identifier,
+    ) -> Option<&TypeLevelLambdaParameter> {
+        match self.get(self.key_to_idx(&Key::Definition(ShortIdentifier::new(name)))) {
+            Binding::TypeLevelLambdaParameter(parameter) => Some(parameter),
+            _ => None,
+        }
     }
 
     pub fn get_function_param(&self, name: &Identifier) -> &FunctionParameter {
@@ -1106,11 +1085,21 @@ impl Bindings {
         infer_return_types: InferReturnTypes,
         treat_all_caps_as_final: bool,
         infer_param_types_from_docstring: bool,
+        use_shape_comments_and_stubs: bool,
     ) -> Self {
-        let module_range = x.range;
+        let dunder_all_entries = exports
+            .dunder_all_names()
+            .filter_map(|(_, name, content_range)| {
+                Some(Identifier::new(name.clone(), content_range?))
+            })
+            .collect();
         let pytest_info = PytestBindingInfo::from_module(&x);
         let errors = ErrorCollector::new(module_info.dupe(), error_style);
-        let shape_comments = ShapeComments::new(&x, &module_info, &errors);
+        let shape_comments = if use_shape_comments_and_stubs {
+            ShapeComments::new(&x, &module_info, &errors)
+        } else {
+            ShapeComments::default()
+        };
         let mut builder = BindingsBuilder {
             module_info: module_info.dupe(),
             annotated_metadata_ranges: Vec::new(),
@@ -1119,7 +1108,7 @@ impl Bindings {
             sys_info,
             errors,
             solver,
-            metadata: BindingsMetadata::new(),
+            metadata: BindingsMetadata::new(&module_info),
             func_count: 0,
             type_alias_count: 0,
             await_context: AwaitContext::General,
@@ -1153,6 +1142,7 @@ impl Bindings {
             shape_comments,
             shape_string_annotation: None,
             subsequently_initialized: SmallSet::new(),
+            class_scope_fallbacks: SmallMap::new(),
             adjacent_namedtuple_defaults: None,
             promote_ranges: SmallSet::new(),
             has_functools_wrapper_mutation: false,
@@ -1215,8 +1205,23 @@ impl Bindings {
         let (scope_trace, unset_nodes) = builder.scopes.finish();
 
         let semantic_errors = builder.semantic_syntax_errors.into_inner();
+        // Ruff also reports `NonModuleImportStar` for a `lazy from x import *` outside module
+        // scope, which always gets `LazyImportNotAllowed` for the same statement. CPython reports
+        // only the `lazy` error.
+        let invalid_lazy_imports: SmallSet<TextRange> = semantic_errors
+            .iter()
+            .filter(|error| {
+                matches!(
+                    error.kind,
+                    SemanticSyntaxErrorKind::LazyImportNotAllowed { .. }
+                )
+            })
+            .map(|error| error.range)
+            .collect();
         for error in semantic_errors {
-            if Self::should_emit_semantic_syntax_error(&error) {
+            let duplicate = matches!(error.kind, SemanticSyntaxErrorKind::NonModuleImportStar(_))
+                && invalid_lazy_imports.contains(&error.range);
+            if !duplicate && Self::should_emit_semantic_syntax_error(&error) {
                 builder
                     .errors
                     .error_builder(error.range, ErrorKind::InvalidSyntax, error.to_string())
@@ -1271,10 +1276,9 @@ impl Bindings {
             }
         }
         let module_deletes = scope_trace.module_deletes().clone();
-        let functools_wrapper_mutation = bind_functools_wrapper_mutation(
-            &mut builder.table,
-            module_range,
-            builder.has_functools_wrapper_mutation,
+        let functools_wrapper_mutation = builder.table.insert(
+            Key::FunctoolsWrapperMutation(x.range),
+            Binding::FunctoolsWrapperMutation(builder.has_functools_wrapper_mutation),
         );
         builder.table.insert(
             KeyDjangoRelations,
@@ -1282,7 +1286,7 @@ impl Bindings {
                 classes: builder.django_relation_classes.into_boxed_slice(),
             },
         );
-        Self {
+        let mut bindings = Self {
             module_info,
             parse_errors,
             binding_errors: builder.errors.finish(),
@@ -1292,6 +1296,8 @@ impl Bindings {
             module_ranges,
             annotated_metadata_ranges: merge_ranges(builder.annotated_metadata_ranges),
             docstring_type_ranges: merge_ranges(builder.docstring_type_ranges),
+            dunder_all_entries,
+            dunder_slots_entries: Vec::new(),
             scope_trace: if enable_trace {
                 Some(scope_trace)
             } else {
@@ -1314,9 +1320,31 @@ impl Bindings {
             class_field_definitions: builder.class_field_definitions,
             shape_declarations: builder.shape_declarations.finish(),
             subsequently_initialized: builder.subsequently_initialized,
+            class_scope_fallbacks: builder.class_scope_fallbacks,
             promote_ranges: builder.promote_ranges,
             functools_wrapper_mutation,
-        }
+        };
+        bindings.dunder_slots_entries = bindings
+            .keys::<KeyClassField>()
+            .flat_map(|idx| {
+                let field = bindings.get(idx);
+                if field.name != *dunder::SLOTS {
+                    return Vec::new();
+                }
+                field
+                    .explicit_slots()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|(name, range)| {
+                        Some(SlotEntry {
+                            name: Identifier::new(name, range?),
+                            class_idx: field.class_idx,
+                        })
+                    })
+                    .collect()
+            })
+            .collect();
+        bindings
     }
 
     fn should_emit_semantic_syntax_error(error: &SemanticSyntaxError) -> bool {
@@ -1336,6 +1364,11 @@ impl Bindings {
             | SemanticSyntaxErrorKind::DuplicateMatchClassAttribute(_)
             | SemanticSyntaxErrorKind::DuplicateTypeParameter
             | SemanticSyntaxErrorKind::NonModuleImportStar(_) => true,
+            // Before Python 3.15, the parser already reports every `lazy` import as unsupported
+            // syntax.
+            SemanticSyntaxErrorKind::LazyImportNotAllowed { .. }
+            | SemanticSyntaxErrorKind::LazyImportStar
+            | SemanticSyntaxErrorKind::LazyFutureImport => error.python_version >= PythonVersion::PY315,
             // TODO: the following errors aren't being emitted even when enabled
             // we should investigate that
             SemanticSyntaxErrorKind::WriteToDebug(_)
@@ -1358,10 +1391,7 @@ impl Bindings {
             | SemanticSyntaxErrorKind::AnnotatedNonlocal(_)
             | SemanticSyntaxErrorKind::NonlocalWithoutBinding(_)
             // Newly added by the ruff upgrade; left disabled to preserve existing behavior.
-            // pyrefly does not model `lazy` imports, and the others need triage before enabling.
-            | SemanticSyntaxErrorKind::LazyImportNotAllowed { .. }
-            | SemanticSyntaxErrorKind::LazyImportStar
-            | SemanticSyntaxErrorKind::LazyFutureImport
+            // These need triage before enabling.
             | SemanticSyntaxErrorKind::NamedExpressionInComprehensionIterable
             | SemanticSyntaxErrorKind::NamedExpressionInClassBodyComprehension
             | SemanticSyntaxErrorKind::TypeParameterDefaultOrder(_)
@@ -2121,9 +2151,7 @@ impl<'a> BindingsBuilder<'a> {
             return false;
         };
         match self.idx_to_binding(*class_idx) {
-            Some(BindingClass::ClassDef(class)) => {
-                class.def.type_params.is_some() || class.tparams_require_binding
-            }
+            Some(BindingClass::ClassDef(class)) => class.has_tparams,
             Some(BindingClass::FunctionalClassDef(..)) | None => false,
         }
     }
@@ -2505,12 +2533,14 @@ impl<'a> BindingsBuilder<'a> {
                     initialized,
                     is_module_scope: false,
                     is_outer_class_type_parameter: false,
+                    class_scope_fallback: None,
                 }
             }
             NameReadInfo::Anywhere {
                 key,
                 initialized,
                 is_module_scope,
+                is_class_scope,
                 implicit_builtin_module,
             } => {
                 self.scopes.mark_parameter_used(name.key());
@@ -2530,12 +2560,32 @@ impl<'a> BindingsBuilder<'a> {
                     self.scopes
                         .define_in_current_flow(name, idx, FlowStyle::Other);
                 }
+                // An eager read does not see class members, so it finds the name in an enclosing
+                // scope. An outer class's type parameter is never a fallback, because it needs the
+                // check that `ensure_name` wraps around it.
+                let class_scope_fallback = if is_class_scope {
+                    match self.lookup_name(name, &mut usage.as_eager()) {
+                        NameLookupResult::Found {
+                            idx,
+                            is_outer_class_type_parameter: false,
+                            ..
+                        } => Some(idx),
+                        NameLookupResult::Found {
+                            is_outer_class_type_parameter: true,
+                            ..
+                        }
+                        | NameLookupResult::NotFound => None,
+                    }
+                } else {
+                    None
+                };
                 NameLookupResult::Found {
                     idx,
                     value_idx: None,
                     initialized,
                     is_module_scope,
                     is_outer_class_type_parameter: false,
+                    class_scope_fallback,
                 }
             }
             NameReadInfo::ImplicitBuiltin { module } => {
@@ -2546,6 +2596,7 @@ impl<'a> BindingsBuilder<'a> {
                     initialized: InitializationStatus::Initialized,
                     is_module_scope: true,
                     is_outer_class_type_parameter: false,
+                    class_scope_fallback: None,
                 }
             }
             NameReadInfo::OuterClassTypeParameter { key } => NameLookupResult::Found {
@@ -2554,6 +2605,7 @@ impl<'a> BindingsBuilder<'a> {
                 initialized: InitializationStatus::Initialized,
                 is_module_scope: false,
                 is_outer_class_type_parameter: true,
+                class_scope_fallback: None,
             },
             NameReadInfo::NotFound => NameLookupResult::NotFound,
         }
@@ -2698,6 +2750,16 @@ impl<'a> BindingsBuilder<'a> {
 
         let binding = if forward_to_first_use {
             Binding::ForwardToFirstUse(target_idx)
+        } else if deferred.usage.is_static()
+            && let Some(Binding::ClassDef(class_idx, decorators)) = self.idx_to_binding(target_idx)
+            && decorators.iter().any(|decorator| {
+                self.idx_to_key(*decorator)
+                    .range()
+                    .contains_range(self.idx_to_key(deferred.bound_name_idx).range())
+            })
+        {
+            // Self-references in decorator expressions use the undecorated class to avoid cycles.
+            Binding::ClassDef(*class_idx, Box::new([]))
         } else if let Some(b) = self.idx_to_binding(target_idx)
             && matches!(
                 b,
@@ -3140,17 +3202,16 @@ impl<'a> BindingsBuilder<'a> {
         );
     }
 
-    pub fn type_params(&mut self, x: &mut TypeParams) -> SmallSet<Name> {
-        self.type_params_with_owner(x, None)
-    }
-
-    pub fn type_params_with_owner(
+    /// Bind the PEP 695 type parameters of the definition that `anchor` names. `owner` is the
+    /// qualified name that displays of the parameters show, if any.
+    pub fn type_params(
         &mut self,
         x: &mut TypeParams,
+        anchor: QuantifiedAnchor,
         owner: Option<Name>,
     ) -> SmallSet<Name> {
         let mut names = SmallSet::new();
-        for x in x.type_params.iter_mut() {
+        for (index, x) in x.type_params.iter_mut().enumerate() {
             let name = x.name().clone();
             names.insert(name.id.clone());
 
@@ -3242,11 +3303,9 @@ impl<'a> BindingsBuilder<'a> {
             };
             self.scopes
                 .add_scoped_type_parameter_to_current_static(&name);
-            // PEP 695 type parameters use the parameter's own definition range as anchor,
-            // which is unique within the module by construction (no two syntax nodes share a range).
             let identity = QuantifiedIdentity::new(
                 self.module_info.name(),
-                AnchorIndex::first(name.range),
+                AnchorIndex::new(anchor, index as u32),
                 QuantifiedOrigin::Pep695,
             );
             self.bind_definition(
@@ -3420,6 +3479,7 @@ struct PossibleTParam {
     idx: Idx<Key>,
     tparam_idx: Idx<KeyLegacyTypeParam>,
     initialized: InitializationStatus,
+    class_scope_fallback: Option<Idx<Key>>,
 }
 
 enum TParamLookupResult {
@@ -3428,6 +3488,7 @@ enum TParamLookupResult {
         idx: Idx<Key>,
         initialized: InitializationStatus,
         is_outer_class_type_parameter: bool,
+        class_scope_fallback: Option<Idx<Key>>,
     },
     NotFound,
 }
@@ -3441,17 +3502,20 @@ impl TParamLookupResult {
                 initialized: possible_tparam.initialized.clone(),
                 is_module_scope: false,
                 is_outer_class_type_parameter: false,
+                class_scope_fallback: possible_tparam.class_scope_fallback,
             },
             Self::NotTParam {
                 idx,
                 initialized,
                 is_outer_class_type_parameter,
+                class_scope_fallback,
             } => NameLookupResult::Found {
                 idx: *idx,
                 value_idx: None,
                 initialized: initialized.clone(),
                 is_module_scope: false,
                 is_outer_class_type_parameter: *is_outer_class_type_parameter,
+                class_scope_fallback: *class_scope_fallback,
             },
             Self::NotFound => NameLookupResult::NotFound,
         }
@@ -3468,13 +3532,16 @@ pub struct LegacyTParamCollector {
     legacy_tparams: SmallMap<String, TParamLookupResult>,
     /// Are there scoped type parameters? Used to control downstream errors.
     has_scoped_tparams: bool,
+    /// The definition whose signature or bases use the names.
+    anchor: QuantifiedAnchor,
 }
 
 impl LegacyTParamCollector {
-    pub fn new(has_scoped_tparams: bool) -> Self {
+    pub fn new(has_scoped_tparams: bool, anchor: QuantifiedAnchor) -> Self {
         Self {
             legacy_tparams: SmallMap::new(),
             has_scoped_tparams,
+            anchor,
         }
     }
 
@@ -3512,11 +3579,15 @@ impl<'a> BindingsBuilder<'a> {
         id: LegacyTParamId,
         usage: &mut Usage,
     ) -> NameLookupResult {
+        let anchor = AnchorIndex::new(
+            legacy_tparams.anchor,
+            legacy_tparams.legacy_tparams.len() as u32,
+        );
         let result = legacy_tparams
             .legacy_tparams
             .entry(id.tvar_name())
             .or_insert_with(|| {
-                self.lookup_legacy_tparam(id, usage, legacy_tparams.has_scoped_tparams)
+                self.lookup_legacy_tparam(id, usage, legacy_tparams.has_scoped_tparams, anchor)
             });
         result.as_name_lookup_result()
     }
@@ -3555,6 +3626,7 @@ impl<'a> BindingsBuilder<'a> {
         id: LegacyTParamId,
         usage: &mut Usage,
         has_scoped_type_params: bool,
+        anchor: AnchorIndex,
     ) -> TParamLookupResult {
         let name = id.as_identifier();
         match self.lookup_name(Hashed::new(&name.id), usage) {
@@ -3562,6 +3634,7 @@ impl<'a> BindingsBuilder<'a> {
                 idx: original_idx,
                 initialized,
                 is_outer_class_type_parameter,
+                class_scope_fallback,
                 ..
             } => {
                 self.mark_does_not_pin_if_first_use(original_idx);
@@ -3575,6 +3648,7 @@ impl<'a> BindingsBuilder<'a> {
                         idx: original_idx,
                         initialized,
                         is_outer_class_type_parameter,
+                        class_scope_fallback,
                     };
                 }
                 let shadows_enclosing_annotation_scope = self
@@ -3583,14 +3657,18 @@ impl<'a> BindingsBuilder<'a> {
                 match self.lookup_legacy_tparam_from_idx(
                     id,
                     original_idx,
+                    initialized.clone(),
                     has_scoped_type_params,
                     shadows_enclosing_annotation_scope,
+                    class_scope_fallback,
+                    anchor,
                 ) {
                     Some(possible_tparam) => TParamLookupResult::MaybeTParam(possible_tparam),
                     None => TParamLookupResult::NotTParam {
                         idx: original_idx,
                         initialized,
                         is_outer_class_type_parameter,
+                        class_scope_fallback,
                     },
                 }
             }
@@ -3632,8 +3710,11 @@ impl<'a> BindingsBuilder<'a> {
         &mut self,
         id: LegacyTParamId,
         original_idx: Idx<Key>,
+        initialized: InitializationStatus,
         has_scoped_type_params: bool,
         shadows_enclosing_annotation_scope: bool,
+        class_scope_fallback: Option<Idx<Key>>,
+        anchor: AnchorIndex,
     ) -> Option<PossibleTParam> {
         let (mut original_idx, mut original_binding) = self.get_original_binding(original_idx)?;
         if shadows_enclosing_annotation_scope {
@@ -3649,7 +3730,7 @@ impl<'a> BindingsBuilder<'a> {
         // for the raw lookup, then insert another key / binding pair for the
         // `CheckLegacyTypeParam`, and return the `Idx<Key>`.
         let tparam_idx = Self::make_legacy_tparam(&id, original_binding, original_idx)
-            .map(|(k, v)| self.insert_binding(k, v))?;
+            .map(|(k, source)| self.insert_binding(k, BindingLegacyTypeParam { anchor, source }))?;
         let idx = self.insert_binding(
             id.as_possible_legacy_tparam_key(),
             Binding::PossibleLegacyTParam(
@@ -3662,7 +3743,8 @@ impl<'a> BindingsBuilder<'a> {
             id,
             idx,
             tparam_idx,
-            initialized: InitializationStatus::Initialized,
+            initialized,
+            class_scope_fallback,
         })
     }
 
@@ -3684,7 +3766,7 @@ impl<'a> BindingsBuilder<'a> {
         id: &LegacyTParamId,
         binding: Option<&Binding>,
         original_idx: Idx<Key>,
-    ) -> Option<(KeyLegacyTypeParam, BindingLegacyTypeParam)> {
+    ) -> Option<(KeyLegacyTypeParam, LegacyTypeParamSource)> {
         match id {
             LegacyTParamId::Name(name) => match binding {
                 Some(
@@ -3695,7 +3777,7 @@ impl<'a> BindingsBuilder<'a> {
                 )
                 | None => Some((
                     KeyLegacyTypeParam(ShortIdentifier::new(name)),
-                    BindingLegacyTypeParam::ParamKeyed(original_idx),
+                    LegacyTypeParamSource::ParamKeyed(original_idx),
                 )),
                 Some(_) => None,
             },
@@ -3708,7 +3790,7 @@ impl<'a> BindingsBuilder<'a> {
                 )
                 | None => Some((
                     KeyLegacyTypeParam(ShortIdentifier::new(attrs.last())),
-                    BindingLegacyTypeParam::ModuleKeyed(Box::new(LegacyTypeParamModule {
+                    LegacyTypeParamSource::ModuleKeyed(Box::new(LegacyTypeParamModule {
                         base: original_idx,
                         attrs: attrs.mapped_ref(|a| a.id.clone()),
                     })),
@@ -3730,9 +3812,10 @@ impl<'a> BindingsBuilder<'a> {
         let mut module_heads: SmallMap<Name, Idx<Key>> = SmallMap::new();
         for entry in legacy_tparams.legacy_tparams.values() {
             if let TParamLookupResult::MaybeTParam(possible_tparam) = entry {
-                if let BindingLegacyTypeParam::ModuleKeyed(module) = self
+                if let LegacyTypeParamSource::ModuleKeyed(module) = &mut self
                     .idx_to_binding_mut(possible_tparam.tparam_idx)
                     .expect("a possible legacy type parameter should have a binding")
+                    .source
                 {
                     let base = possible_tparam.id.as_identifier().id.clone();
                     if let Some(prior) = module_heads.insert(base, possible_tparam.idx) {
@@ -3832,8 +3915,16 @@ impl<'a> SemanticSyntaxContext for BindingsBuilder<'a> {
     }
 
     fn lazy_import_context(&self) -> Option<LazyImportContext> {
-        // pyrefly does not model `lazy` imports, so there is never a lazy-import context.
-        None
+        // CPython checks for a `try` statement in the current scope first.
+        if self.scopes.in_try() {
+            Some(LazyImportContext::TryExceptBlocks)
+        } else if self.scopes.in_class_body() {
+            Some(LazyImportContext::Class)
+        } else if self.scopes.in_function_scope() {
+            Some(LazyImportContext::Function)
+        } else {
+            None
+        }
     }
 
     fn in_notebook(&self) -> bool {

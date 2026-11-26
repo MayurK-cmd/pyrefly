@@ -239,7 +239,10 @@ fn code_to_kind(errors: HashMap<String, Severity>) -> HashMap<ErrorKind, Severit
             "return" | "return-value" => add(severity, ErrorKind::BadReturn),
             "type-var" => add(severity, ErrorKind::BadSpecialization),
             "import" | "import-not-found" => add(severity, ErrorKind::MissingImport),
-            "import-untyped" => add(severity, ErrorKind::UntypedImport),
+            "import-untyped" => {
+                add(severity, ErrorKind::UntypedImport);
+                add(severity, ErrorKind::UntypedImportNoStubs);
+            }
             "abstract" => add(severity, ErrorKind::BadInstantiation),
             "no-overload-impl" => add(severity, ErrorKind::InvalidOverload),
             "unused-coroutine" | "unused-awaitable" => add(severity, ErrorKind::UnusedCoroutine),
@@ -268,6 +271,20 @@ fn code_to_kind(errors: HashMap<String, Severity>) -> HashMap<ErrorKind, Severit
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_import_untyped_mapping() {
+        for severity in [Severity::Ignore, Severity::Warn, Severity::Error] {
+            let mapped = code_to_kind(HashMap::from([("import-untyped".to_owned(), severity)]));
+            assert_eq!(
+                mapped,
+                HashMap::from([
+                    (ErrorKind::UntypedImport, severity),
+                    (ErrorKind::UntypedImportNoStubs, severity),
+                ])
+            );
+        }
+    }
 
     #[test]
     fn test_error_flags_are_applied_as_typed_overrides() {

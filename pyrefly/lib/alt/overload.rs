@@ -20,6 +20,7 @@ use pyrefly_types::tuple::Tuple;
 use pyrefly_types::type_output::DisplayOutput;
 use pyrefly_types::type_output::TypeOutput;
 use pyrefly_types::types::TArgs;
+use pyrefly_util::display::DisplayWithCtx;
 use pyrefly_util::display::Fmt;
 use pyrefly_util::display::count;
 use pyrefly_util::gas::Gas;
@@ -33,6 +34,7 @@ use vec1::Vec1;
 
 use crate::alt::answers::LookupAnswer;
 use crate::alt::answers::OverloadTrace;
+use crate::alt::answers::TraceReceiver;
 use crate::alt::answers_solver::AnswersSolver;
 use crate::alt::call::TargetWithTParams;
 use crate::alt::callable::ArgMap;
@@ -41,6 +43,7 @@ use crate::alt::callable::CallKeyword;
 use crate::alt::callable::CallValue;
 use crate::alt::callable::CallWithTypes;
 use crate::alt::callable::ReturnTypeResolutionError;
+use crate::alt::callable::contains_argument_bindings;
 use crate::alt::expr::TypeOrExpr;
 use crate::alt::unwrap::HintRef;
 use crate::config::error_kind::ErrorKind;
@@ -56,11 +59,20 @@ use crate::types::callable::Params;
 use crate::types::function::FuncMetadata;
 use crate::types::function::Function;
 use crate::types::function::FunctionKind;
+use crate::types::function::UnresolvedImports;
 use crate::types::literal::Lit;
 use crate::types::quantified::Quantified;
 use crate::types::type_var::Restriction;
 use crate::types::types::Type;
 use crate::types::types::Var;
+
+/// Receiver handling at the overload-matching boundary.
+pub(crate) enum OverloadReceiver {
+    None,
+    Bound(Type),
+    /// Receiver recovery has already removed it from every candidate signature.
+    Stripped,
+}
 
 struct CalledOverload<'f> {
     func: &'f TargetWithTParams<Function>,
@@ -150,24 +162,21 @@ impl<'a, Ans: LookupAnswer> ArgsExpander<'a, Ans> {
                 return None;
             }
         };
-        // These expressions need parameter context and cannot produce an expandable type.
+        // Expressions with bindings retain their syntax for contextual checks, including
+        // lambdas nested in conditional expressions or calls.
+        let inference_errors = self.solver.error_collector();
         let expanded_types = match value.as_type_or_expr() {
-            TypeOrExpr::Expr(
-                Expr::Lambda(_)
-                | Expr::List(_)
-                | Expr::Dict(_)
-                | Expr::Set(_)
-                | Expr::ListComp(_)
-                | Expr::DictComp(_)
-                | Expr::SetComp(_)
-                | Expr::Generator(_),
-            ) => Vec::new(),
-            _ => self.expand_type(value.infer(self.solver, errors)),
+            TypeOrExpr::Expr(expr) if contains_argument_bindings(expr) => Vec::new(),
+            TypeOrExpr::Expr(Expr::List(_) | Expr::Dict(_) | Expr::Set(_)) => Vec::new(),
+            _ => self.expand_type(value.infer(self.solver, &inference_errors)),
         };
         if expanded_types.is_empty() {
-            // Nothing to expand here, try the next argument.
+            // Unchanged expressions are checked with each candidate's context. Their probe
+            // diagnostics are not authoritative, particularly for nested lambdas.
             self.expand(errors, owner)
         } else {
+            // Expanded expressions become types and will not be checked again.
+            errors.extend(inference_errors);
             let expanded_types = expanded_types.into_map(|t| owner.push(t));
             let mut new_arg_lists = Vec::new();
             for (posargs, keywords) in self.arg_lists.iter() {
@@ -279,7 +288,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         t: Type,
     ) -> (Type, Vec<ShapeError>) {
         let per_row = self.solver().per_row(overload_table, || {
-            self.solver().for_return_boundary(t.clone())
+            self.solver().for_return_boundary(t.clone(), self)
         });
         let type_level_dsl_errors = if per_row.len() == 1 {
             per_row.first().1.clone()
@@ -309,17 +318,17 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 None => self.heap.mk_any_implicit(),
             };
         }
-        Type::combine_overload_results(per_row.into_vec(), self.heap)
+        Type::combine_overload_results(per_row.into_vec(), self.heap, self)
             .expect("a nonempty collection of results can always be combined")
     }
 
     /// Calls an overloaded function, returning the return type, the closest matching overload
     /// signature, and the solutions that signature settled on.
-    pub fn call_overloads(
+    pub(crate) fn call_overloads(
         &self,
         overloads: Vec1<TargetWithTParams<Function>>,
         metadata: &FuncMetadata,
-        self_obj: Option<Type>,
+        receiver: OverloadReceiver,
         args: &[CallArg],
         keywords: &[CallKeyword],
         arguments_range: TextRange,
@@ -330,7 +339,12 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         hint: Option<HintRef>,
         // If we're constructing a class, its type arguments. A successful call will fill these in.
         ctor_targs: Option<&mut TArgs>,
-    ) -> (Type, Callable, OverloadTable) {
+    ) -> (Type, Callable, OverloadTable, ArgMap) {
+        let (self_obj, trace_receiver) = match receiver {
+            OverloadReceiver::None => (None, TraceReceiver::Unknown),
+            OverloadReceiver::Bound(obj) => (Some(obj), TraceReceiver::Present),
+            OverloadReceiver::Stripped => (None, TraceReceiver::Stripped),
+        };
         // There may be Expr values in args and keywords.
         // If we infer them for each overload, we may end up inferring them multiple times.
         // If those overloads contain nested overloads, then we can easily end up with O(2^n) perf.
@@ -443,7 +457,27 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         // Several signatures matched and their results are unioned, so no single
                         // table of solutions describes the call any more.
                         let table = OverloadTable::default();
-                        let argmap = first_overload.argmap.clone();
+                        let mut argmap = first_overload.argmap.clone();
+                        // Expansion checks individual union members; retain the original inputs.
+                        for (key, param) in &mut argmap.arg_to_param {
+                            let value = match key {
+                                ArgumentKey::Positional(index) => index
+                                    .checked_sub(usize::from(self_obj.is_some()))
+                                    .and_then(|index| args.get(index))
+                                    .and_then(|arg| match arg {
+                                        CallArg::Arg(value) => Some(*value),
+                                        CallArg::Star(..) => None,
+                                    }),
+                                ArgumentKey::Keyword(index) => {
+                                    keywords.get(*index).map(|keyword| keyword.value)
+                                }
+                            };
+                            if let Some(value) = value
+                                && let TypeOrExpr::Type(ty, _) = value.as_type_or_expr()
+                            {
+                                param.arg_ty = Some(ty.clone());
+                            }
+                        }
                         let arg_errors = self.error_collector();
                         let specialization_errors = first_overload.specialization_errors.clone();
                         let return_type_errors = matched_overloads
@@ -488,61 +522,20 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         {
             *targs = chosen_targs;
         }
-        // Record the closest overload to power IDE services. Guard on the trace
-        // sink before building the (per-signature cloned) traces, which would
-        // otherwise be wasted work in a normal non-tracing check.
-        if self.current().tracing_enabled() {
-            let mut overload_trace = |target: &TargetWithTParams<Function>| {
-                let tparams = target
-                    .0
-                    .as_ref()
-                    .filter(|tparams| !tparams.is_empty())
-                    .cloned();
-                OverloadTrace::new(target.1.signature.clone(), tparams)
-            };
-            let all_overload_traces = overloads.iter().map(&mut overload_trace).collect();
-            let closest_overload_trace = overload_trace(closest_overload.func);
-            self.record_overload_trace(
-                arguments_range,
-                all_overload_traces,
-                closest_overload_trace,
-                matched,
-            );
-        }
+        self.trace_overload_call(
+            &overloads,
+            closest_overload.func,
+            arguments_range,
+            matched,
+            trace_receiver,
+        );
         if matched {
-            // If the selected overload is deprecated, we log a deprecation error.
-            if let Some(deprecation) = &closest_overload.func.1.metadata.flags.deprecation {
-                let header = format!(
-                    "Call to deprecated overload `{}`",
-                    closest_overload
-                        .func
-                        .1
-                        .metadata
-                        .kind
-                        .format(self.module().name())
-                );
-                let detail = deprecation.as_error_detail();
-                let mut error_builder =
-                    errors.error_builder(arguments_range, ErrorKind::Deprecated, header);
-                if let Some(detail) = detail {
-                    error_builder = error_builder.with_detail(detail);
-                }
-                if let FunctionKind::Def(id) = &closest_overload.func.1.metadata.kind {
-                    let replacement = if id.has_toplevel_qname("contextlib", "contextmanager") {
-                        Some(ContextManagerKind::Sync)
-                    } else if id.has_toplevel_qname("contextlib", "asynccontextmanager") {
-                        Some(ContextManagerKind::Async)
-                    } else {
-                        None
-                    };
-                    if let Some(kind) = replacement {
-                        error_builder = error_builder.with_quick_fix(
-                            ErrorQuickFix::ReplaceDeprecatedContextManagerReturn(kind),
-                        );
-                    }
-                }
-                error_builder.with_context(context).emit();
-            }
+            self.report_deprecated_overload(
+                &closest_overload.func.1,
+                arguments_range,
+                errors,
+                context,
+            );
             errors.extend(closest_overload.arg_errors);
             call_errors.extend(closest_overload.call_errors);
             if let Ok(specialization_errors) =
@@ -550,6 +543,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             {
                 self.add_specialization_errors(
                     specialization_errors,
+                    Some(&closest_overload.argmap),
                     arguments_range,
                     call_errors,
                     None,
@@ -565,6 +559,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 closest_overload.res,
                 closest_overload.func.1.signature.clone(),
                 closest_overload.table,
+                closest_overload.argmap,
             )
         } else {
             if let Ok(specialization_errors) =
@@ -572,6 +567,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             {
                 self.add_specialization_errors(
                     specialization_errors,
+                    Some(&closest_overload.argmap),
                     arguments_range,
                     &closest_overload.call_errors,
                     None,
@@ -588,14 +584,85 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 context,
                 &closest_overload.func.1.signature,
                 closest_overload.call_errors,
-                closest_overload.argmap,
+                &closest_overload.argmap,
             );
             (
                 self.heap.mk_any_error(),
                 closest_overload.func.1.signature.clone(),
                 OverloadTable::default(),
+                closest_overload.argmap,
             )
         }
+    }
+
+    /// Record the overloads considered for a call and the closest one, for IDE services.
+    /// `chosen` says whether the call resolved to the closest overload.
+    pub(crate) fn trace_overload_call(
+        &self,
+        overloads: &[TargetWithTParams<Function>],
+        closest: &TargetWithTParams<Function>,
+        range: TextRange,
+        chosen: bool,
+        receiver: TraceReceiver,
+    ) {
+        // Guard on the trace sink before building the (per-signature cloned) traces, which
+        // would otherwise be wasted work in a normal non-tracing check.
+        if !self.current().tracing_enabled() {
+            return;
+        }
+        let overload_trace = |target: &TargetWithTParams<Function>| {
+            let tparams = target
+                .0
+                .as_ref()
+                .filter(|tparams| !tparams.is_empty())
+                .cloned();
+            OverloadTrace::new(target.1.signature.clone(), tparams, receiver)
+        };
+        let all_overload_traces = overloads.iter().map(overload_trace).collect();
+        self.record_overload_trace(range, all_overload_traces, overload_trace(closest), chosen);
+    }
+
+    /// Report a call to `func` if it is a deprecated overload signature.
+    pub(crate) fn report_deprecated_overload(
+        &self,
+        func: &Function,
+        range: TextRange,
+        errors: &ErrorCollector,
+        context: Option<&dyn Fn() -> ErrorContext>,
+    ) {
+        let Some(deprecation) = &func.metadata.flags.deprecation else {
+            return;
+        };
+        let header = format!(
+            "Call to deprecated overload `{}`",
+            func.metadata.kind.format(self, self.module().name())
+        );
+        // The call's context supplies the header, as in `report_call_deprecation`, so that it
+        // doesn't replace the `deprecated` kind.
+        let mut error_builder = match context {
+            Some(ctx) => errors
+                .error_builder(range, ErrorKind::Deprecated, ctx().format(self))
+                .with_detail(header)
+                .without_deprecated_tag(),
+            None => errors.error_builder(range, ErrorKind::Deprecated, header),
+        };
+        if let Some(detail) = deprecation.as_error_detail() {
+            error_builder = error_builder.with_detail(detail);
+        }
+        if let FunctionKind::Def(id) = &func.metadata.kind {
+            let replacement = if id.has_toplevel_qname("contextlib", "contextmanager") {
+                Some(ContextManagerKind::Sync)
+            } else if id.has_toplevel_qname("contextlib", "asynccontextmanager") {
+                Some(ContextManagerKind::Async)
+            } else {
+                None
+            };
+            if let Some(kind) = replacement {
+                error_builder = error_builder
+                    .with_quick_fix(ErrorQuickFix::ReplaceDeprecatedContextManagerReturn(kind));
+            }
+        }
+        error_builder.emit();
     }
 
     /// Read and combine the branches of an overloaded value, dropping branches that don't apply.
@@ -620,7 +687,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         }
         // `combine_overload_results` answers `None` only for no results at all, which here means
         // no branch accepted the read.
-        match Type::combine_overload_results(accepted, self.heap) {
+        match Type::combine_overload_results(accepted, self.heap, self) {
             Some(combined) => combined,
             None => {
                 let (result, attempt) = first_failure.expect("an overloaded type is never empty");
@@ -683,21 +750,42 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         context: Option<&dyn Fn() -> ErrorContext>,
         closest_overload_signature: &Callable,
         closest_overload_call_errors: ErrorCollector,
-        mut closest_overload_argmap: ArgMap,
+        closest_overload_argmap: &ArgMap,
     ) {
-        // Build a string showing the argument types for error messages
+        // Build a string showing the argument types for error messages. Inferring each argument
+        // reports any errors in it. Without the parameter type as context, a lambda's parameters
+        // are `Unknown`, so a lambda is shown with the type the closest overload inferred for it
+        // instead, which is the type the detail lines describe.
+        let self_offset = usize::from(self_obj.is_some());
+        let arg_type = |value: &CallValue, key: ArgumentKey| {
+            let ty = value.infer(self, errors);
+            if matches!(value.as_type_or_expr(), TypeOrExpr::Expr(Expr::Lambda(_))) {
+                closest_overload_argmap
+                    .arg_to_param
+                    .get(&key)
+                    .and_then(|param| param.arg_ty.clone())
+                    .unwrap_or(ty)
+            } else {
+                // Container displays can acquire a parameter type during contextual checking.
+                // Only lambdas use the saved contextual input in the error header.
+                ty
+            }
+        };
         let mut arg_type_strs = Vec::new();
-        for arg in args {
+        for (i, arg) in args.iter().enumerate() {
             let (ty, prefix) = match arg {
-                CallArg::Arg(value) => (value.infer(self, errors), ""),
+                CallArg::Arg(value) => (
+                    arg_type(value, ArgumentKey::Positional(self_offset + i)),
+                    "",
+                ),
                 CallArg::Star(value, _) => (value.infer(self, errors), "*"),
             };
-            let ty_display = self.for_display(ty);
+            let ty_display = self.display(ty);
             arg_type_strs.push(format!("{}{}", prefix, ty_display));
         }
-        for kw in keywords {
-            let ty = kw.value.infer(self, errors);
-            let ty_display = self.for_display(ty);
+        for (i, kw) in keywords.iter().enumerate() {
+            let ty = arg_type(&kw.value, ArgumentKey::Keyword(i));
+            let ty_display = self.display(ty);
             if let Some(arg_name) = kw.arg {
                 arg_type_strs.push(format!("{}={}", arg_name.as_str(), ty_display));
             } else {
@@ -708,18 +796,11 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
 
         let header = format!(
             "No matching overload found for function `{}` called with arguments: {}",
-            metadata.kind.format(self.module().name()),
+            metadata.kind.format(self, self.module().name()),
             args_display
         );
         let mut details = vec!["Possible overloads:".to_owned()];
         // Build an overlay of relevant parameters. We'll show only these parameters when printing overloads.
-        let self_offset = usize::from(self_obj.is_some());
-        if self_obj.is_some() {
-            // We strip `self` from the displayed signatures, so drop it from the overlay as well.
-            closest_overload_argmap
-                .arg_to_param
-                .remove(&ArgumentKey::Positional(0));
-        }
         let signature_overlay = {
             // If call errors is empty, the call failed due to an arity mismatch. Show all
             // parameters so the user can see the number of parameters in each signature.
@@ -738,9 +819,11 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 // parameters that were not matched.
                 let names = closest_overload_argmap
                     .arg_to_param
-                    .into_values()
-                    .map(|p| p.name)
-                    .chain(closest_overload_argmap.unmatched_params)
+                    .iter()
+                    // The implicit receiver is omitted from displayed signatures.
+                    .filter(|(key, _)| self_obj.is_none() || **key != ArgumentKey::Positional(0))
+                    .map(|(_, param)| param.name.clone())
+                    .chain(closest_overload_argmap.unmatched_params.iter().cloned())
                     .collect::<Option<SmallSet<_>>>();
                 match names {
                     Some(names) => ParamOverlay::Subset(names),
@@ -764,8 +847,8 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             };
             let type_for_display = self
                 .solver()
-                .for_display(self.heap.mk_callable_from(signature));
-            let display_context = TypeDisplayContext::new(&[&type_for_display]);
+                .for_display(self.heap.mk_callable_from(signature), self);
+            let display_context = TypeDisplayContext::new(self, &[&type_for_display]);
             let signature_for_display = match &type_for_display {
                 Type::Callable(callable) => callable,
                 _ => unreachable!("Expected a callable"),
@@ -782,7 +865,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     {
                         // If any of the parameters we want to show don't exist in the current
                         // signature, be conservative and show everything.
-                        format!("{type_for_display}")
+                        type_for_display.display_with(self).to_string()
                     } else {
                         format!(
                             "{}",
@@ -803,13 +886,13 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         )
                     }
                 }
-                _ => format!("{type_for_display}"),
+                _ => type_for_display.display_with(self).to_string(),
             };
             details.push(format!("  {signature_for_display}{suffix}"));
         }
         let mut builder = errors
             .error_builder(arguments_range, ErrorKind::NoMatchingOverload, header)
-            .with_context(context)
+            .with_context(self, context)
             .with_details(details);
         if closest_overload_call_errors.is_empty() {
             // If there were no call errors, the failure must have been an arity mismatch.
@@ -897,10 +980,10 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             );
             // Each overload's argmap should use its own var solutions.
             for var in placeholder_vars.iter() {
-                self.solver().force_var(*var);
+                self.solver().force_var(*var, self);
             }
             for param in called_overload.argmap.arg_to_param.values_mut() {
-                self.solver().expand_mut(&mut param.ty);
+                self.solver().expand_mut(&mut param.ty, self);
             }
             self.solver().restore_vars(snapshot);
             let n_errors = called_overload.num_match_errors();
@@ -943,7 +1026,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     }
                 }
                 let nkeywords_unknown = keywords.iter().any(|kw| {
-                    kw.arg.is_none() && !matches!(kw.value.infer(self, errors), Type::TypedDict(_))
+                    kw.arg.is_none() && !self.is_typed_dict(&kw.value.infer(self, errors))
                 });
                 if nkeywords_unknown {
                     let has_kwargs = |o: &CalledOverload<'_>| {
@@ -1020,8 +1103,29 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     })
                     .collect::<Vec<_>>();
                 let split_point = if !changed {
-                    // Shortcut: if the arguments haven't changed, we know that the first overload
-                    // matches and we can eliminate all the rest.
+                    // Only prefer resolved input contracts when there is no relevant argument
+                    // ambiguity. If every match has unresolved inputs, retain normal fallback.
+                    let has_unresolved_import_inputs = |overload: &CalledOverload<'_>| {
+                        let function = &overload.func.1;
+                        function
+                            .metadata
+                            .flags
+                            .unresolved_imports
+                            .unwrap_or_else(|| {
+                                function
+                                    .signature
+                                    .classify_unresolved_imports(overload.func.0.as_deref())
+                            })
+                            == UnresolvedImports::Inputs
+                    };
+                    if matched_overloads
+                        .iter()
+                        .any(|overload| !has_unresolved_import_inputs(overload))
+                    {
+                        matched_overloads
+                            .retain(|overload| !has_unresolved_import_inputs(overload));
+                    }
+                    // The first remaining overload matches without gradual ambiguity.
                     Some(1)
                 } else {
                     matched_overloads
@@ -1124,7 +1228,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
     }
 
     /// Collect placeholder vars from self_obj and Type-valued arguments.
-    pub(crate) fn collect_placeholder_vars(
+    fn collect_placeholder_vars(
         &self,
         self_obj: Option<&Type>,
         args: &[CallArg],
@@ -1195,26 +1299,6 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 contextually_opaque_defaults,
                 overload_ctor_targs.as_mut(),
             );
-        if !call_errors.has_hard()
-            && specialization_errors.is_empty()
-            && callable
-                .1
-                .metadata
-                .flags
-                .unresolved_imports
-                .unwrap_or_else(|| callable.1.signature.contains_unresolved_imports(tparams))
-            && let Some(input_errors) = self.unresolved_import_input_errors(
-                &callable.1.signature,
-                tparams,
-                self_obj,
-                args,
-                keywords,
-                arguments_range,
-                &argmap,
-            )
-        {
-            self.warn_unresolved_import_signature(&call_errors, arguments_range, input_errors);
-        }
         CalledOverload {
             func: callable,
             res,

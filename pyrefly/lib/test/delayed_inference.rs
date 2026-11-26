@@ -621,7 +621,7 @@ testcase!(
 from typing import assert_type
 
 class A[T]:
-    def __new__[T2](cls, x: T2 | None) -> A[T2]: ...
+    def __new__[T2](cls, x: T2 | None) -> "A[T2]": ...
     def add(self, x: T): ...
 
 a = A(None)
@@ -651,7 +651,7 @@ def h(x: ThisIsANameError):  # E: Could not find name
     "#,
 );
 
-// Regression test for https://github.com/facebook/pyrefly/issues/3088
+// Regression test for https://github.com/pyrefly-org/pyrefly/issues/3088
 testcase!(
     test_dict_with_initial_none_values,
     r#"

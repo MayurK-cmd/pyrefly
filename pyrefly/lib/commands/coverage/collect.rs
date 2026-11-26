@@ -76,6 +76,7 @@ use crate::state::require::Require;
 use crate::state::state::State;
 use crate::state::state::Transaction;
 use crate::state::state::TransactionHandle;
+use crate::types::env::TypeEnv;
 
 /// All parameters with merge keys: positional-only → index, keyword-capable → name,
 /// variadic → singleton, implicit receiver → `None`.
@@ -308,6 +309,10 @@ const EXCLUDED_MODULE_DUNDERS: &[&str] = &[
     "__spec__",
 ];
 
+/// Class members that are always excluded from the report, because requiring annotations on them
+/// does more harm than good. Stubtest's `IGNORABLE_CLASS_DUNDERS` likewise lets stubs omit them.
+const EXCLUDED_CLASS_DUNDERS: &[&str] = &["__getattr__", "__setattr__"];
+
 /// Walk re-exports to the defining module's handle and name, `None` on cycle/miss.
 fn trace_export_origin(
     handle: &Handle,
@@ -461,6 +466,7 @@ const IMPLICIT_GENERIC_BUILTINS: &[KnownClass] = &[
 const IMPLICIT_STDLIB_CLASSES: &[KnownClass] = &[KnownClass::LoggingLogger, KnownClass::RePattern];
 
 fn parse_variables(
+    env: &dyn TypeEnv,
     module: &Module,
     answers: &Answers,
     exports: &SmallMap<Name, ExportLocation>,
@@ -475,7 +481,12 @@ fn parse_variables(
     /// `list()`, or an explicitly specialized class like `Spam[int]()`. Other generic classes are
     /// left out because their type arguments are inferred. Instances of `IMPLICIT_STDLIB_CLASSES`
     /// are exempt whatever the call.
-    fn untyped_if_call(answers: &Answers, idx: Idx<Key>, expr: &Expr) -> SlotCounts {
+    fn untyped_if_call(
+        env: &dyn TypeEnv,
+        answers: &Answers,
+        idx: Idx<Key>,
+        expr: &Expr,
+    ) -> SlotCounts {
         let Expr::Call(call) = expr else {
             return SlotCounts::default();
         };
@@ -502,7 +513,7 @@ fn parse_variables(
             // doesn't match. Nested modules like `a.b.Spam()` are left out too.
             Expr::Attribute(attr) => {
                 cls.targs().is_empty()
-                    && *cls.name() == attr.attr.id
+                    && *cls.name(env) == attr.attr.id
                     && attr
                         .value
                         .as_name_expr()
@@ -510,8 +521,8 @@ fn parse_variables(
                         .is_some_and(|t| matches!(t.ty(), Type::Module(_)))
             }
             Expr::Subscript(sub) => match sub.value.as_ref() {
-                Expr::Name(n) => *cls.name() == n.id,
-                Expr::Attribute(attr) => *cls.name() == attr.attr.id,
+                Expr::Name(n) => *cls.name(env) == n.id,
+                Expr::Attribute(attr) => *cls.name(env) == attr.attr.id,
                 _ => false,
             },
             _ => false,
@@ -638,10 +649,14 @@ fn parse_variables(
                     // flow (e.g. a later `while True: ... break`). Skip optional imports
                     // (`try: import x; except _: x = None`) like plain imports.
                     _ if involves_import_or_def(bindings, *idx, &mut SmallSet::new()) => continue,
-                    Binding::NameAssign(na) => untyped_if_call(answers, *idx, na.expr.as_ref()),
+                    Binding::NameAssign(na) => {
+                        untyped_if_call(env, answers, *idx, na.expr.as_ref())
+                    }
                     Binding::MultiTargetAssign(_, rhs_idx, _, _) => match bindings.get(*rhs_idx) {
                         Binding::Function { .. } | Binding::ClassDef(..) => continue,
-                        Binding::Expr(_, expr) => untyped_if_call(answers, *idx, expr.as_ref()),
+                        Binding::Expr(_, expr) => {
+                            untyped_if_call(env, answers, *idx, expr.as_ref())
+                        }
                         _ => {
                             unreachable!(
                                 "MultiTargetAssign RHS should be Expr, Function, or ClassDef"
@@ -765,7 +780,7 @@ fn inherited_annotation_slots(
     class_idx: Idx<KeyClass>,
     field_name: &Name,
 ) -> Option<SlotCounts> {
-    let class = answers.get_idx(class_idx).and_then(|r| r.0.clone())?;
+    let class = answers.get_idx(class_idx).and_then(|r| r.0)?;
     class_mro(answers, &class)
         .ancestors_no_object()
         .iter()
@@ -829,7 +844,7 @@ fn parse_instance_attrs(
         .iter()
         .map(|&class_idx| {
             let mut names = SmallSet::new();
-            if let Some(cls) = answers.get_idx(class_idx).and_then(|r| r.0.clone()) {
+            if let Some(cls) = answers.get_idx(class_idx).and_then(|r| r.0) {
                 let ancestors = class_mro(answers, &cls).ancestors_no_object();
                 let mro =
                     std::iter::once(&cls).chain(ancestors.iter().map(ClassType::class_object));
@@ -1223,7 +1238,6 @@ fn is_implicit_dunder_return(name: &str) -> bool {
             | "__bytes__"
             | "__sizeof__"
             | "__contains__"
-            | "__setattr__"
             | "__delattr__"
             | "__setitem__"
             | "__delitem__"
@@ -1241,15 +1255,16 @@ fn is_implicit_dunder_return(name: &str) -> bool {
 }
 
 /// Dunder method parameters whose types are fully determined by the
-/// protocol (e.g. `__exit__`'s exception triple, `__getattr__`'s `name: str`).
+/// protocol (e.g. `__exit__`'s exception triple, `__getattribute__`'s `name: str`).
 /// Positions are 0-indexed after excluding self/cls.
 fn is_implicit_dunder_param(name: &str, non_self_param_pos: usize) -> bool {
     match name {
         // __exit__/__aexit__(self, exc_type, exc_val, exc_tb)
         "__exit__" | "__aexit__" => non_self_param_pos <= 2,
         // First non-self param is protocol-fixed (str, int, or memoryview)
-        "__getattr__" | "__getattribute__" | "__delattr__" | "__setattr__" | "__format__"
-        | "__buffer__" | "__release_buffer__" => non_self_param_pos == 0,
+        "__getattribute__" | "__delattr__" | "__format__" | "__buffer__" | "__release_buffer__" => {
+            non_self_param_pos == 0
+        }
         // __set_name__(self, owner, name: str) — name at position 1
         "__set_name__" => non_self_param_pos == 1,
         _ => false,
@@ -1543,7 +1558,7 @@ fn collect_class_members(
         if binding.parent.has_function_ancestor() {
             continue;
         }
-        let Some(cls) = answers.get_idx(idx).and_then(|r| r.0.clone()) else {
+        let Some(cls) = answers.get_idx(idx).and_then(|r| r.0) else {
             continue;
         };
 
@@ -1637,6 +1652,7 @@ impl ModuleSymbols {
         merge_overloads(&mut functions);
         let mut classes = parse_classes(&module, &answers, &hidden_classes);
         let mut variables = parse_variables(
+            &transaction.type_env(handle),
             &module,
             &answers,
             &exports,
@@ -1655,6 +1671,8 @@ impl ModuleSymbols {
         ));
 
         // A private name hides its whole subtree, unless exported via `__all__` (issue #3578).
+        // Filtering after alias resolution also drops excluded class dunders defined as aliases or
+        // attributes, while keeping public aliases of them.
         let prefix = module_prefix(&module);
         let is_visible = |name: &str| {
             let relative = name
@@ -1665,7 +1683,7 @@ impl ModuleSymbols {
                 .next()
                 .expect("split yields at least one component");
             (is_public_name(top) || dunder_all.iter().any(|n| n == top))
-                && components.all(is_public_name)
+                && components.all(|c| is_public_name(c) && !EXCLUDED_CLASS_DUNDERS.contains(&c))
         };
         functions.retain(|f| is_visible(&f.name));
         classes.retain(|c| is_visible(&c.name));
@@ -2800,7 +2818,7 @@ mod tests {
 
     /// @overload merging with a fallback returning `Any`.
     /// Best-wins semantics mean the merged return is `Typed`, not `Any`.
-    /// Regression test for https://github.com/facebook/pyrefly/issues/3257.
+    /// Regression test for https://github.com/pyrefly-org/pyrefly/issues/3257.
     #[test]
     fn test_report_overloads_any_fallback() {
         let report = build_module_report_for_test("overloads_any_fallback.py");
@@ -2834,8 +2852,8 @@ mod tests {
     }
 
     /// Dunder methods with implicit parameter types (__exit__ exception triple,
-    /// __getattr__ name, __setattr__ name). Unannotated implicit params get 0 slots;
-    /// explicit annotations on implicit params count normally.
+    /// __getattribute__ name) get 0 slots for those params, even when annotated.
+    /// Class-level __getattr__ and __setattr__ are excluded, including as aliases.
     #[test]
     fn test_report_dunder_params() {
         let report = build_module_report_for_test("dunder_params.py");
@@ -3328,7 +3346,7 @@ def g(x: int) -> int:
         assert!(!fqns.contains("pkg.baz"));
 
         // A re-export of a name its origin module doesn't define keeps the
-        // local FQN but traces to no origin (github.com/facebook/pyrefly/issues/4025)
+        // local FQN but traces to no origin (github.com/pyrefly-org/pyrefly/issues/4025)
         let (fqns, origins) = compute(
             &[
                 (

@@ -68,6 +68,48 @@ $ cd $TMPDIR/workspace && $PYREFLY check packages/b/vendor --python-version 3.13
 [0]
 ```
 
+## A directory that the config excludes is checked
+
+The root config excludes `vendor`, but an exclude that matches a given
+directory does not apply to it.
+
+```scrut
+$ cd $TMPDIR/workspace && $PYREFLY check packages/a/vendor --python-version 3.13.0 --output-format=min-text
+ERROR packages/a/vendor/m.py:1:* (glob)
+[1]
+```
+
+## `--force-exclude` skips a given path that its config excludes
+
+The root config excludes `vendor`, so `--force-exclude` skips
+`packages/a/vendor` without an error.
+
+```scrut
+$ cd $TMPDIR/workspace && $PYREFLY check --force-exclude packages/a/vendor --python-version 3.13.0 --output-format=min-text
+[0]
+```
+
+Each file gets the excludes of its own config. The config of `packages/b`
+does not exclude `vendor`.
+
+```scrut
+$ cd $TMPDIR/workspace && $PYREFLY check --force-exclude packages/a/vendor/m.py packages/b/vendor/m.py --python-version 3.13.0 --output-format=min-text
+ WARN packages/b/vendor/m.py:1:* (glob)
+[0]
+```
+
+`--force-exclude` skips a given file that the includes of its config do not
+match, as `pyrefly check` with no paths does.
+
+```scrut
+$ mkdir -p $TMPDIR/includes/src $TMPDIR/includes/tests && cd $TMPDIR/includes && \
+> printf 'project-includes = ["src"]\n' > pyrefly.toml && \
+> for d in src tests; do echo "x: int = ''" > $d/m.py; done && \
+> $PYREFLY check --force-exclude src/m.py tests/m.py --python-version 3.13.0 --output-format=min-text
+ERROR src/m.py:1:* (glob)
+[1]
+```
+
 ## `pyrefly check .` checks the same files as `pyrefly check`
 
 `packages/b` is below `.`, so the root config governs it, the same as in
@@ -110,6 +152,31 @@ ERROR m.py:1:* (glob)
  WARN packages/b/m.py:1:* (glob)
 ERROR packages/a/m.py:1:* (glob)
  WARN packages/b/vendor/m.py:1:* (glob)
+[1]
+```
+
+`app` imports `mylib` from `lib`, and each directory has its own copy of
+`dep`. `lib` is checked with its own environment, and `mylib` is also checked
+with the environment of `app` when `app` imports it, so `app` sees one copy of
+`Frame`.
+
+```scrut
+$ mkdir -p $TMPDIR/envs/app/env $TMPDIR/envs/lib/env && cd $TMPDIR/envs && \
+> printf 'site-package-path = ["env", "../lib"]\nskip-interpreter-query = true\n' > app/pyrefly.toml && \
+> printf 'site-package-path = ["env"]\nskip-interpreter-query = true\n' > lib/pyrefly.toml && \
+> echo 'class Frame: ...' > app/env/dep.py && \
+> echo 'class Frame: ...' > lib/env/dep.py && \
+> printf 'from dep import Frame\ndef width(frame: Frame) -> int:\n    return 0\n' > lib/mylib.py && \
+> printf 'from dep import Frame\nfrom mylib import width\nwidth(Frame())\n' > app/main.py && \
+> $PYREFLY check app lib --output-format=min-text
+[0]
+```
+
+A path that matches no files is not an error when another path has files:
+
+```scrut
+$ cd $TMPDIR/workspace && $PYREFLY check packages/a missing --python-version 3.13.0 --output-format=min-text
+ERROR packages/a/m.py:1:* (glob)
 [1]
 ```
 
@@ -218,6 +285,7 @@ A glob matches no files that are not Python files, but a shell passes them:
 ```scrut
 $ cd $TMPDIR/workspace && $PYREFLY check 'packages/a/*' --python-version 3.13.0 --output-format=min-text
 ERROR packages/a/m.py:1:* (glob)
+ERROR packages/a/vendor/m.py:1:* (glob)
 [1]
 ```
 
@@ -225,6 +293,7 @@ ERROR packages/a/m.py:1:* (glob)
 $ cd $TMPDIR/workspace && $PYREFLY check packages/a/* --python-version 3.13.0 --output-format=min-text
 ERROR packages/a/m.py:1:* (glob)
 ERROR packages/a/pyproject.toml:1:* (glob)
+ERROR packages/a/vendor/m.py:1:* (glob)
 [1]
 ```
 
@@ -241,6 +310,14 @@ No Python files matched pattern `*/workspace/missing/*.py` (glob)
 ```scrut
 $ mkdir -p $TMPDIR/loose/sub && echo 'x =' > $TMPDIR/loose/sub/m.py && \
 > cd $TMPDIR/loose && $PYREFLY check sub --python-version 3.13.0 --output-format=min-text
+ERROR sub/m.py:1:* (glob)
+[1]
+```
+
+With no config, `--force-exclude` skips no file.
+
+```scrut
+$ cd $TMPDIR/loose && $PYREFLY check --force-exclude sub/m.py --python-version 3.13.0 --output-format=min-text
 ERROR sub/m.py:1:* (glob)
 [1]
 ```

@@ -11,6 +11,7 @@ functions are defined in `torch/_shapes.pyi`.
 """
 
 import builtins
+import math as math
 from collections.abc import Iterator, Sequence
 from math import e as e, nan as nan
 from types import EllipsisType
@@ -706,6 +707,8 @@ type _DType = dtype
 
 # Dtype and memory-format constants
 qint8: Any
+qint32: dtype
+per_tensor_symmetric: qscheme
 quint8: Any
 float16: Any
 half: Any
@@ -733,6 +736,12 @@ channels_last: memory_format
 channels_last_3d: memory_format
 preserve_format: memory_format
 strided: layout
+sparse_coo: layout
+sparse_csr: layout
+sparse_csc: layout
+sparse_bsr: layout
+sparse_bsc: layout
+jagged: layout
 ops: Any
 
 # ============================================================================
@@ -2240,6 +2249,9 @@ class Tensor[Shape: _Shape = _Shape](_TensorBase):
         """Linear interpolation. Shape inference via generic fixture signature."""
         ...
 
+    @overload
+    def fmod(self, other: _RealScalar) -> Tensor[Shape]: ...
+    @overload
     def fmod[OtherShape: _Shape](
         self, other: Tensor[OtherShape]
     ) -> Tensor[broadcast(Shape, OtherShape)]:
@@ -3697,6 +3709,20 @@ def var_mean[
     ...
 
 @overload
+def var_mean[
+    Shape: IntTuple,
+    Dim: Flag[builtins.int | tuple[builtins.int, ...] | None],
+    Keepdim: Flag[builtins.bool],
+](
+    input: Tensor[Shape],
+    dim: Dim = None,
+    *,
+    correction: builtins.float | None,
+    keepdim: Keepdim = False,
+) -> tuple[
+    Tensor[reduce_shape(Shape, Dim, Keepdim)], Tensor[reduce_shape(Shape, Dim, Keepdim)]
+]: ...
+@overload
 def std_mean[Shape: IntTuple](
     input: Tensor[Shape], unbiased: builtins.bool = True
 ) -> tuple[Tensor[[]], Tensor[[]]]:
@@ -4092,6 +4118,11 @@ def lerp[Shape: IntTuple, OtherShape: IntTuple](
     """Linear interpolation. Shape inference via generic fixture signature."""
     ...
 
+@overload
+def fmod[Shape: IntTuple](
+    input: Tensor[Shape], other: _RealScalar
+) -> Tensor[Shape]: ...
+@overload
 def fmod[Shape: IntTuple, OtherShape: IntTuple](
     input: Tensor[Shape], other: Tensor[OtherShape]
 ) -> Tensor[broadcast(Shape, OtherShape)]:
@@ -4260,7 +4291,10 @@ def allclose(
     equal_nan: builtins.bool = False,
 ) -> builtins.bool: ...
 def maximum[Shape: IntTuple, OtherShape: IntTuple = []](
-    input: Tensor[Shape], other: Tensor[OtherShape]
+    input: Tensor[Shape],
+    other: Tensor[OtherShape],
+    *,
+    out: Tensor | None = None,
 ) -> Tensor[broadcast(Shape, OtherShape)]:
     """Element-wise maximum. Shape inference via generic fixture signature."""
     ...
@@ -4414,6 +4448,14 @@ def matrix_rank[Batch: IntTuple, M: IntVar, N: IntVar](
 # TODO(stroxler): Infer the broadcast result shape.
 @overload
 def where(condition: Tensor[Any]) -> tuple[Tensor, ...]: ...
+@overload
+def where[Shape: IntTuple](
+    condition: Tensor[Shape],
+    input: Tensor[Shape],
+    other: Tensor[Shape],
+    *,
+    out: Tensor | None = None,
+) -> Tensor[Shape]: ...
 @overload
 def where[
     ConditionShape: IntTuple,
@@ -4875,6 +4917,7 @@ def _foreach_copy_(
     src: tuple[Tensor, ...] | list[Tensor],
     non_blocking: builtins.bool = False,
 ) -> tuple[Tensor, ...]: ...
+def _assert(condition: object, message: object) -> None: ...
 @overload
 def _assert_async(input: Tensor) -> None: ...
 @overload

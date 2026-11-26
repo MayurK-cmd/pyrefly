@@ -17,7 +17,7 @@ $ mkdir $TMPDIR/typing_extensions_project && \
 ## A runtime typing_extensions on the search path still exports special forms
 
 <!-- The runtime package defines `Self` depending on the Python version, so its definition is not
-     itself a valid type form. See https://github.com/facebook/pyrefly/issues/698.
+     itself a valid type form. See https://github.com/pyrefly-org/pyrefly/issues/698.
 -->
 
 ```scrut {output_stream: stdout}
@@ -120,6 +120,48 @@ $ touch $TMPDIR/pyrefly.toml && \
 > printf 'try:\n    import django\nexcept ImportError:\n    django = None\n' > $TMPDIR/optional_import.py && \
 > $PYREFLY check $TMPDIR/optional_import.py --error untyped-import --site-packages-path $TMPDIR/optional_import_site --output-format=min-text
 ERROR * Cannot find type stubs for module `django` * (glob)
+[1]
+```
+
+## Untyped imports without a recommended stubs package
+
+```scrut {output_stream: stdout}
+$ mkdir -p $TMPDIR/unknown_stubs/site_packages/pymsteams && \
+> printf 'class TeamsWebhookException(Exception): ...\n' > $TMPDIR/unknown_stubs/site_packages/pymsteams/__init__.py && \
+> printf 'from pymsteams import TeamsWebhookException\ntry:\n    import pymsteams\nexcept ImportError:\n    pass\n' > $TMPDIR/unknown_stubs/main.py && \
+> printf 'site-packages-path = ["site_packages"]\nskip-interpreter-query = true\n' > $TMPDIR/unknown_stubs/pyrefly.toml && \
+> $PYREFLY check -c $TMPDIR/unknown_stubs/pyrefly.toml $TMPDIR/unknown_stubs/main.py --preset all --ignore unused-import --output-format=min-text
+ERROR * Module `pymsteams` has no type stubs or `py.typed` marker [untyped-import-no-stubs] (glob)
+ERROR * Module `pymsteams` has no type stubs or `py.typed` marker [untyped-import-no-stubs] (glob)
+[1]
+```
+
+The default preset remains quiet, and replacing the import with `Any` can still report missing type information.
+
+```scrut {output_stream: stdout}
+$ $PYREFLY check -c $TMPDIR/unknown_stubs/pyrefly.toml $TMPDIR/unknown_stubs/main.py --preset default --ignore unused-import --output-format=min-text
+[0]
+```
+
+```scrut {output_stream: stdout}
+$ $PYREFLY check -c $TMPDIR/unknown_stubs/pyrefly.toml $TMPDIR/unknown_stubs/main.py --preset all --ignore unused-import --replace-untyped-imports-with-any pymsteams --output-format=min-text
+ERROR * Module `pymsteams` has no type stubs or `py.typed` marker [untyped-import-no-stubs] (glob)
+ERROR * Module `pymsteams` has no type stubs or `py.typed` marker [untyped-import-no-stubs] (glob)
+[1]
+```
+
+## Suppressions for an untyped import with the rule disabled
+
+```scrut {output_stream: stdout}
+$ printf 'import pymsteams  # pyrefly: ignore[untyped-import-no-stubs]\n' > $TMPDIR/unknown_stubs/ignored.py && \
+> $PYREFLY check -c $TMPDIR/unknown_stubs/pyrefly.toml $TMPDIR/unknown_stubs/ignored.py --preset default --error unused-ignore --output-format=min-text
+ERROR * Unused `# pyrefly: ignore` comment for code(s): untyped-import-no-stubs [unused-ignore] (glob)
+[1]
+```
+
+```scrut {output_stream: stdout}
+$ $PYREFLY check -c $TMPDIR/unknown_stubs/pyrefly.toml $TMPDIR/unknown_stubs/ignored.py --preset strict --error unused-ignore --output-format=min-text
+ERROR * Unused `# pyrefly: ignore` comment for code(s): untyped-import-no-stubs [unused-ignore] (glob)
 [1]
 ```
 

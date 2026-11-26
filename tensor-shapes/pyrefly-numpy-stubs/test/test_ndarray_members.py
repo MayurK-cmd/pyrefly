@@ -344,7 +344,7 @@ def test_ndarray_searchsorted() -> None:
     assert sorted_array.searchsorted(3, side="right") == 2
 
     if TYPE_CHECKING:
-        np.ones((2, 3)).searchsorted(2)  # E: No matching overload
+        np.ones((2, 3)).searchsorted(2)  # E: is not assignable to parameter `self`
         sorted_array.searchsorted(3, side="middle")  # E: No matching overload
 
 

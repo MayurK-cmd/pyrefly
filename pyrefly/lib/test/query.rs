@@ -11,6 +11,7 @@ use pretty_assertions::assert_eq;
 use pyrefly_python::module_name::ModuleName;
 use pyrefly_python::module_path::ModulePath;
 use pyrefly_types::literal::Lit;
+use pyrefly_types::test_type_env::TestTypeEnv;
 use pyrefly_util::arc_id::ArcId;
 use pyrefly_util::fs_anyhow;
 use pyrefly_util::thread_pool::TEST_THREAD_COUNT;
@@ -145,7 +146,8 @@ def check() -> None:
         .unwrap()
         .0;
     let table = indexed_shape_values(&response.type_table);
-    let metadata_name = crate::query::literal_value_shape_name(&Lit::Str("3".into()));
+    let metadata_name =
+        crate::query::literal_value_shape_name(&TestTypeEnv::new(), &Lit::Str("3".into()));
     let metadata = table
         .iter()
         .position(|shape| is_named_shape(shape, &metadata_name))
@@ -617,6 +619,79 @@ def construct[K: Flag[int]](source: K, cls: type[K]) -> K:
 }
 
 #[test]
+fn test_callees_optional_class_type() {
+    let tdir = TempDir::new().unwrap();
+    let file_path = tdir.path().join("main.py");
+    let code = r#"
+class Foo: ...
+
+def f(cls: type[Foo] | None) -> None:
+    cls()
+"#;
+    fs_anyhow::write(&file_path, code).unwrap();
+
+    let query = create_query();
+    let module_name = ModuleName::from_str("main");
+    let path = ModulePath::filesystem(file_path.clone());
+    query.add_files(vec![(module_name, path.clone())]);
+
+    // get_callees_with_location must not panic on the `None` member of the union.
+    let callees = query
+        .get_callees_with_location(module_name, path, None)
+        .unwrap();
+    assert!(
+        callees
+            .iter()
+            .any(|(_, c)| c.target == "builtins.object.__init__"),
+        "{callees:?}"
+    );
+}
+
+#[test]
+fn test_callees_non_class_and_type_variable_types() {
+    let tdir = TempDir::new().unwrap();
+    let file_path = tdir.path().join("main.py");
+    // Each call's callee type is either not a class, or is a type variable whose
+    // restriction must be resolved to find the callee.
+    let code = r#"
+from typing import Callable, LiteralString, TypedDict
+
+class TD(TypedDict):
+    x: int
+
+def f[T, C: (int, str), U: int | str, K: Callable[[], int]](
+    tup: tuple[int, str], td: TD, s: LiteralString, none_t: type[None], td_t: type[TD],
+    t: T, c: C, t_t: type[T], u_t: type[U], k_t: type[K],
+) -> None:
+    tup()
+    td()
+    s()
+    none_t()
+    td_t(x=1)
+    t()
+    c()
+    t_t()
+    u_t()
+    k_t()
+"#;
+    fs_anyhow::write(&file_path, code).unwrap();
+
+    let query = create_query();
+    let module_name = ModuleName::from_str("main");
+    let path = ModulePath::filesystem(file_path.clone());
+    query.add_files(vec![(module_name, path.clone())]);
+
+    let callees = query
+        .get_callees_with_location(module_name, path, None)
+        .unwrap();
+    // `type[TD]` resolves to the TypedDict's constructor, as a direct `TD(...)` call does.
+    assert!(
+        callees.iter().any(|(_, c)| c.target == "main.TD.__init__"),
+        "{callees:?}"
+    );
+}
+
+#[test]
 fn test_callees_flag_union_class_names() {
     let tdir = TempDir::new().unwrap();
     let file_path = tdir.path().join("main.py");
@@ -665,6 +740,43 @@ def stringify[K: Flag[int | str | tuple[int, ...] | None]](value: K) -> str:
             "builtins.tuple",
             "types.NoneType",
         ]
+    );
+}
+
+#[test]
+fn test_callees_typed_dict_method_reports_typed_dict_target() {
+    let tdir = TempDir::new().unwrap();
+    let file_path = tdir.path().join("main.py");
+    // Methods called on a declared TypedDict are reported under the `TypedDictionary`
+    // pseudo-module rather than the class the method is defined on, so that Pysa can
+    // model every TypedDict's methods with a single target.
+    let code = r#"
+from typing import TypedDict
+
+class Movie(TypedDict):
+    name: str
+
+def f(m: Movie) -> None:
+    m.get("name")
+"#;
+    fs_anyhow::write(&file_path, code).unwrap();
+
+    let query = create_query();
+    let module_name = ModuleName::from_str("main");
+    let path = ModulePath::filesystem(file_path.clone());
+
+    let errors = query.add_files(vec![(module_name, path.clone())]);
+    assert!(errors.is_empty(), "Unexpected errors: {errors:?}");
+
+    let targets = query
+        .get_callees_with_location(module_name, path, None)
+        .unwrap()
+        .into_iter()
+        .map(|(_, callee)| callee.target)
+        .collect::<Vec<_>>();
+    assert!(
+        targets.iter().any(|t| t == "TypedDictionary.get"),
+        "expected a `TypedDictionary.get` callee, got: {targets:?}",
     );
 }
 
@@ -859,4 +971,43 @@ class C:
     };
     assert!(is_final("PLAIN"), "`PLAIN` is declared `Final`");
     assert!(is_final("MARKER"), "`MARKER` is declared `Final`");
+}
+
+#[test]
+fn test_is_subtype_answers_are_stable_without_loaded_files() {
+    let tdir = TempDir::new().unwrap();
+    fs_anyhow::write(
+        &tdir.path().join("model.py"),
+        "from typing import TypedDict\nclass Base: ...\nclass C(Base): ...\nclass TD(TypedDict):\n    x: int\n",
+    )
+    .unwrap();
+    init_test();
+    let mut config = ConfigFile::default();
+    config.search_path_from_args.push(tdir.path().to_path_buf());
+    config.python_environment.set_empty_to_default();
+    config.configure();
+    let query = Query::new(
+        ConfigFinder::new_constant(ArcId::new(config)),
+        TEST_THREAD_COUNT,
+    );
+
+    // No file is loaded, so the requests name a module that is not loaded.
+    let module = ModuleName::from_str("scratch");
+    let scratch_path = tdir.path().join("scratch.py");
+    let is_subtype = |lt: &str, gt: &str| query.is_subtype(module, scratch_path.clone(), lt, gt);
+    for (lt, gt, expected) in [
+        ("model.C", "model.Base", true),
+        ("model.Base", "model.C", false),
+        ("model.TD", "TypedDictionary", true),
+        ("model.TD", "NonTotalTypedDictionary", true),
+        ("model.C", "TypedDictionary", false),
+    ] {
+        // The second request finds both types in the cache that earlier requests filled.
+        assert_eq!(is_subtype(lt, gt), Ok(expected), "`{lt}` against `{gt}`");
+        assert_eq!(
+            is_subtype(lt, gt),
+            Ok(expected),
+            "`{lt}` against `{gt}`, cached"
+        );
+    }
 }

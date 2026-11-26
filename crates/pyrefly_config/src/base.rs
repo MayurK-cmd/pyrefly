@@ -51,6 +51,27 @@ pub enum InferReturnTypes {
     Checked,
 }
 
+/// Controls how class decorators affect the type bound to the class name.
+#[derive(
+    Debug,
+    PartialEq,
+    Eq,
+    Deserialize,
+    Serialize,
+    Clone,
+    Copy,
+    Default,
+    ValueEnum
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum ClassDecoratorBehavior {
+    /// Ignore inferred decorator results, but honor explicit `type[Any]` return annotations.
+    Ignore,
+    /// Apply typed decorators and preserve the class for untyped decorators.
+    #[default]
+    TypedOnly,
+}
+
 /// How to handle when recursion depth limit is exceeded.
 #[derive(Debug, PartialEq, Eq, Deserialize, Serialize, Clone, Copy, Default)]
 #[derive(ValueEnum)]
@@ -176,6 +197,7 @@ impl Preset {
                     infer_return_types: Some(InferReturnTypes::Never),
                     infer_with_first_use: Some(false),
                     enabled_ignores: Some(Tool::all()),
+                    class_decorator_behavior: Some(ClassDecoratorBehavior::Ignore),
                     ..Default::default()
                 }
             }
@@ -194,6 +216,7 @@ impl Preset {
                     check_unannotated_defs: Some(false),
                     infer_return_types: Some(InferReturnTypes::Never),
                     legacy_overload_expansion: Some(true),
+                    class_decorator_behavior: Some(ClassDecoratorBehavior::Ignore),
                     type_ignore_unknown_tag_behavior: Some(TypeIgnoreUnknownTagBehavior::Suppress),
                     ..Default::default()
                 }
@@ -201,6 +224,8 @@ impl Preset {
             Preset::Default => ConfigBase::default(),
             Preset::Strict => {
                 let errors = HashMap::from([
+                    (ErrorKind::BadDescriptorInheritance, Severity::Error),
+                    (ErrorKind::BadOverrideDescriptor, Severity::Error),
                     (ErrorKind::DirectAbstractBaseInstantiation, Severity::Error),
                     (ErrorKind::ImplicitAny, Severity::Error),
                     (ErrorKind::InstanceVarAssign, Severity::Error),
@@ -209,6 +234,7 @@ impl Preset {
                     (ErrorKind::OpenUnpacking, Severity::Error),
                     (ErrorKind::PossiblyUninitializedAttribute, Severity::Error),
                     (ErrorKind::PotentialBadKeywordArgument, Severity::Error),
+                    (ErrorKind::PropertyTypeMismatch, Severity::Error),
                     (ErrorKind::UnusedIgnore, Severity::Error),
                 ]);
                 ConfigBase {
@@ -336,6 +362,10 @@ pub struct ConfigBase {
     ///   are only eligible when `check-unannotated-defs` is true.
     pub infer_return_types: Option<InferReturnTypes>,
 
+    /// How class decorators affect the class type. Defaults to `ignore` under the `basic` and
+    /// `legacy` presets, and to `typed-only` otherwise.
+    pub class_decorator_behavior: Option<ClassDecoratorBehavior>,
+
     /// Whether to disable type errors in language server. By default errors will be shown in IDEs.
     pub disable_type_errors_in_ide: Option<bool>,
 
@@ -432,6 +462,7 @@ impl ConfigBase {
             replace_untyped_imports_with_any: Some(Vec::new()),
             check_unannotated_defs: Some(true),
             infer_return_types: Some(InferReturnTypes::Checked),
+            class_decorator_behavior: Some(ClassDecoratorBehavior::TypedOnly),
             disable_type_errors_in_ide: Some(false),
             ignore_errors_in_generated_code: Some(false),
             infer_with_first_use: Some(true),
@@ -462,6 +493,7 @@ impl ConfigBase {
             untyped_def_behavior,
             check_unannotated_defs,
             infer_return_types,
+            class_decorator_behavior,
             disable_type_errors_in_ide,
             ignore_errors_in_generated_code,
             infer_with_first_use,
@@ -496,6 +528,7 @@ impl ConfigBase {
             untyped_def_behavior,
             check_unannotated_defs,
             infer_return_types,
+            class_decorator_behavior,
             disable_type_errors_in_ide,
             ignore_errors_in_generated_code,
             infer_with_first_use,
@@ -610,6 +643,77 @@ mod tests {
     use pulldown_cmark::TagEnd;
 
     use super::*;
+
+    #[test]
+    fn test_descriptor_inheritance_configuration() {
+        let kind = ErrorKind::BadDescriptorInheritance;
+        for (preset, expected) in [
+            (Preset::Off, Severity::Ignore),
+            (Preset::Basic, Severity::Ignore),
+            (Preset::Legacy, Severity::Warn),
+            (Preset::Default, Severity::Warn),
+            (Preset::Strict, Severity::Error),
+            (Preset::All, Severity::Error),
+        ] {
+            let defaults = preset.apply().errors.unwrap_or_default();
+            assert_eq!(defaults.severity(kind), expected, "{preset}");
+            for parent_severity in [Severity::Ignore, Severity::Error] {
+                let mut errors = defaults.clone();
+                errors.merge_user_overrides(&ErrorDisplayConfig::new(HashMap::from([(
+                    ErrorKind::BadOverride,
+                    parent_severity,
+                )])));
+                assert_eq!(
+                    errors.severity(kind),
+                    expected,
+                    "{preset}: independent kind"
+                );
+                for severity in [Severity::Ignore, Severity::Warn, Severity::Error] {
+                    let mut explicitly_set = errors.clone();
+                    explicitly_set.merge_user_overrides(&ErrorDisplayConfig::new(HashMap::from([
+                        (kind, severity),
+                    ])));
+                    assert_eq!(explicitly_set.severity(kind), severity, "{preset}");
+                    assert_eq!(
+                        explicitly_set.severity(ErrorKind::BadOverride),
+                        parent_severity
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_redundant_type_check_configuration() {
+        for (preset, expected) in [
+            (Preset::Off, Severity::Ignore),
+            (Preset::Basic, Severity::Ignore),
+            (Preset::Legacy, Severity::Ignore),
+            (Preset::Default, Severity::Ignore),
+            (Preset::Strict, Severity::Ignore),
+            (Preset::All, Severity::Error),
+        ] {
+            let defaults = preset.apply().errors.unwrap_or_default();
+            assert_eq!(defaults.severity(ErrorKind::RedundantTypeCheck), expected);
+            for (label, severity) in [
+                ("ignore", Severity::Ignore),
+                ("warn", Severity::Warn),
+                ("error", Severity::Error),
+            ] {
+                let raw = format!(r#"{{"redundant-type-check": "{label}"}}"#);
+                let user = serde_json::from_str::<ErrorDisplayConfig>(&raw).unwrap();
+                let mut errors = defaults.clone();
+                errors.merge_user_overrides(&user);
+                assert_eq!(errors.severity(ErrorKind::RedundantTypeCheck), severity);
+                for kind in [
+                    ErrorKind::RedundantCondition,
+                    ErrorKind::UnnecessaryComparison,
+                ] {
+                    assert_eq!(errors.severity(kind), defaults.severity(kind));
+                }
+            }
+        }
+    }
 
     /// Canonical kebab-case name for a preset, matching the serde/clap form
     /// (e.g., `StrictPlus` → `"strict-plus"`).
@@ -849,7 +953,7 @@ mod tests {
         }
     }
 
-    // https://github.com/facebook/pyrefly/issues/5113
+    // https://github.com/pyrefly-org/pyrefly/issues/5113
     #[test]
     fn test_deprecated_and_unreachable_severity() {
         let severity = |preset: Preset, kind| match preset.apply().errors {

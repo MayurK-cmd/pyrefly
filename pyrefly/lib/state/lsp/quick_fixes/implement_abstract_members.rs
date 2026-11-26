@@ -25,11 +25,11 @@ use pyrefly_types::callable::PrefixParam;
 use pyrefly_types::callable::Required;
 use pyrefly_types::literal::Lit;
 use pyrefly_types::quantified::QuantifiedOrigin;
-use pyrefly_types::stdlib::Stdlib;
 use pyrefly_types::type_output::AnnotationPart;
 use pyrefly_types::type_var::Restriction;
 use pyrefly_types::types::TParams;
 use pyrefly_types::types::Type;
+use pyrefly_util::display::DisplayWithCtx;
 use ruff_python_ast::Stmt;
 use ruff_python_ast::StmtClassDef;
 use ruff_python_ast::name::Name;
@@ -49,6 +49,7 @@ use crate::state::annotation_renderer::AnnotationRenderer;
 use crate::state::lsp::ImportFormat;
 use crate::state::lsp::LocalRefactorCodeAction;
 use crate::state::lsp::Transaction;
+use crate::types::env::TypeEnv;
 
 struct AbstractMemberInfo {
     name: Name,
@@ -94,7 +95,7 @@ pub(crate) fn implement_abstract_members_code_actions(
             |solver| -> Option<Vec<AbstractMemberInfo>> {
                 let key = KeyClass(ShortIdentifier::new(&class_def.name));
                 let class_idx = solver.bindings().key_to_idx_hashed_opt(Hashed::new(&key))?;
-                let class = solver.get_idx(class_idx).0.clone()?;
+                let class = solver.get_idx(class_idx).0?;
                 // A protocol's members are its interface, so they stay unimplemented.
                 if solver.get_metadata_for_class(&class).is_protocol() {
                     return None;
@@ -127,10 +128,10 @@ pub(crate) fn implement_abstract_members_code_actions(
                         ty,
                         is_coroutine,
                         is_class_var: member.value.is_class_var(),
-                        defining_module: member.defining_class.module().dupe(),
+                        defining_module: member.defining_class.module(&solver).dupe(),
                         docstring_range: solver
                             .get_class_fields(&member.defining_class)
-                            .and_then(|fields| fields.field_docstring_range(name)),
+                            .and_then(|fields| fields.field_doc_ranges(name)?.docstring()),
                     });
                 }
                 Some(infos)
@@ -143,12 +144,8 @@ pub(crate) fn implement_abstract_members_code_actions(
     }
 
     members.sort_by(|left, right| left.name.cmp(&right.name));
-    let stdlib = transaction.get_stdlib(handle);
-    let mut renderer = MemberRenderer {
-        stdlib: &stdlib,
-        python_version: handle.sys_info().version(),
-        parts: Vec::new(),
-    };
+    let type_env = transaction.type_env(handle);
+    let mut renderer = MemberRenderer::new(&type_env, handle.sys_info().version(), false);
     if !replaces_pass {
         // A blank line separates the stubs from the existing body.
         renderer.text(&prepare_insertion_text(source, insert_range.start(), "\n"));
@@ -160,7 +157,7 @@ pub(crate) fn implement_abstract_members_code_actions(
         renderer.member(member, &indent, indent_unit)?;
     }
     renderer.text("\n");
-    let annotations = AnnotationRenderer::new(transaction, handle, ast, &stdlib, import_format);
+    let annotations = AnnotationRenderer::new(transaction, handle, ast, import_format);
     let rendered = annotations.render_parts(&renderer.parts)?;
     let imports = annotations.import_edits(&rendered);
     let edits = once((module_info.dupe(), insert_range, rendered.text))
@@ -202,14 +199,32 @@ fn find_class_header(body: &[Stmt], position: TextSize) -> Option<&StmtClassDef>
 }
 
 /// Builds source text while retaining the module references used by annotations.
-struct MemberRenderer<'a> {
-    stdlib: &'a Stdlib,
+pub(crate) struct MemberRenderer<'a> {
+    env: &'a dyn TypeEnv,
     python_version: PythonVersion,
     parts: Vec<AnnotationPart>,
+    quote_annotations: bool,
 }
 
-impl MemberRenderer<'_> {
-    fn text(&mut self, text: &str) {
+impl<'a> MemberRenderer<'a> {
+    pub(crate) fn new(
+        env: &'a dyn TypeEnv,
+        python_version: PythonVersion,
+        quote_annotations: bool,
+    ) -> Self {
+        Self {
+            env,
+            python_version,
+            parts: Vec::new(),
+            quote_annotations,
+        }
+    }
+
+    pub(crate) fn into_parts(self) -> Vec<AnnotationPart> {
+        self.parts
+    }
+
+    pub(crate) fn text(&mut self, text: &str) {
         if let Some(AnnotationPart::Text(previous)) = self.parts.last_mut() {
             previous.push_str(text);
         } else {
@@ -224,9 +239,22 @@ impl MemberRenderer<'_> {
         });
     }
 
-    fn annotation(&mut self, ty: &Type) {
-        self.parts
-            .extend(ty.get_annotation_parts(Some(self.stdlib)));
+    pub(crate) fn annotation(&mut self, ty: &Type) {
+        let mut parts = ty.get_annotation_parts(self.env);
+        if self.quote_annotations {
+            // String annotations preserve forward references on Python versions
+            // that evaluate annotations when the class body runs.
+            self.text("'");
+            for part in &mut parts {
+                if let AnnotationPart::Text(text) = part {
+                    *text = text.replace('\\', "\\\\").replace('\'', "\\'");
+                }
+            }
+        }
+        self.parts.extend(parts);
+        if self.quote_annotations {
+            self.text("'");
+        }
     }
 
     fn member(
@@ -371,7 +399,9 @@ impl MemberRenderer<'_> {
                 param.default().is_none()
                     && matches!(
                         param.identity().origin,
-                        QuantifiedOrigin::Pep695 | QuantifiedOrigin::ScopedLegacy
+                        QuantifiedOrigin::Pep695
+                            | QuantifiedOrigin::ScopedLegacy
+                            | QuantifiedOrigin::InferredLegacy
                     )
             });
         let erased;
@@ -438,7 +468,7 @@ impl MemberRenderer<'_> {
         Some(())
     }
 
-    fn params(&mut self, params: &ParamList, strip_receiver: bool) {
+    pub(crate) fn params(&mut self, params: &ParamList, strip_receiver: bool) {
         let mut names = params
             .items()
             .iter()
@@ -492,12 +522,15 @@ impl MemberRenderer<'_> {
                         display: Some(text),
                         ..
                     }) => self.text(text),
-                    Some(DefaultValue { ty: Type::None, .. }) => self.text("None"),
                     Some(DefaultValue {
-                        ty: Type::Literal(literal),
+                        ty: Some(Type::None),
+                        ..
+                    }) => self.text("None"),
+                    Some(DefaultValue {
+                        ty: Some(Type::Literal(literal)),
                         ..
                     }) if !matches!(literal.value, Lit::Enum(_)) => {
-                        self.text(&literal.value.to_string());
+                        self.text(&literal.value.display_with(self.env).to_string());
                     }
                     _ => {
                         // Arbitrary default expressions can depend on names in the defining module.

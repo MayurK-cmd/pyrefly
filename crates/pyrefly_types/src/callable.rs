@@ -8,12 +8,14 @@
 use std::borrow::Cow;
 use std::cmp::Ord;
 use std::fmt;
-use std::fmt::Display;
 use std::hash::Hash;
 
 use pyrefly_derive::TypeEq;
+use pyrefly_derive::TypeOrd;
 use pyrefly_derive::Visit;
 use pyrefly_derive::VisitMut;
+use pyrefly_util::display::DisplayWith;
+use pyrefly_util::display::DisplayWithCtx;
 use pyrefly_util::display::Fmt;
 use pyrefly_util::owner::Owner;
 use pyrefly_util::prelude::VecExt;
@@ -24,8 +26,8 @@ use ruff_python_ast::name::Name;
 use starlark_map::small_set::SmallSet;
 
 use crate::display::TypeDisplayContext;
-use crate::equality::TypeEq;
-use crate::equality::TypeEqCtx;
+use crate::env::TypeEnv;
+use crate::function::UnresolvedImports;
 use crate::quantified::Quantified;
 use crate::type_output::DisplayOutput;
 use crate::type_output::TypeOutput;
@@ -34,23 +36,28 @@ use crate::types::TParams;
 use crate::types::Type;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(Visit, VisitMut, TypeEq)]
+#[derive(Visit, VisitMut, TypeEq, TypeOrd)]
 pub struct Callable {
     pub params: Params,
     pub ret: Type,
 }
 
 impl Callable {
-    /// Whether a signature's parameter, return, or type-parameter types contain unresolved
-    /// import recovery. Check before substituting types inferred from call arguments.
-    pub fn contains_unresolved_imports(&self, tparams: Option<&TParams>) -> bool {
-        let mut found = false;
-        let mut check_type = |ty: &Type| found = found || ty.contains_missing_import();
-        self.visit(&mut check_type);
+    /// Classify declared import recovery before substituting receiver or argument types.
+    pub fn classify_unresolved_imports(&self, tparams: Option<&TParams>) -> UnresolvedImports {
+        let mut inputs = false;
+        let mut check_type = |ty: &Type| inputs = inputs || ty.contains_missing_import();
+        self.params.visit(&mut check_type);
         if let Some(tparams) = tparams {
             tparams.visit(&mut check_type);
         }
-        found
+        if inputs {
+            UnresolvedImports::Inputs
+        } else if self.ret.contains_missing_import() {
+            UnresolvedImports::ReturnOnly
+        } else {
+            UnresolvedImports::Resolved
+        }
     }
 
     /// Returns true if this callable has the `*args: Any, **kwargs: Any -> Any`
@@ -95,10 +102,10 @@ impl Callable {
     }
 }
 
-impl Display for Callable {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl<'e> DisplayWith<dyn TypeEnv + 'e> for Callable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>, env: &(dyn TypeEnv + 'e)) -> fmt::Result {
         let ty = Type::Callable(Box::new(self.clone()));
-        let ctx = TypeDisplayContext::new(&[&ty]);
+        let ctx = TypeDisplayContext::new(env, &[&ty]);
         let mut output = DisplayOutput::new(&ctx, f);
         self.fmt_with_type(&mut output, &|t, o| ctx.fmt_helper_generic(t, false, o))
     }
@@ -111,6 +118,11 @@ pub struct ArgCount {
 }
 
 impl ArgCount {
+    /// Whether the ranges contain a common argument count.
+    fn overlaps(&self, other: &Self) -> bool {
+        self.max.is_none_or(|max| other.min <= max) && other.max.is_none_or(|max| self.min <= max)
+    }
+
     fn none_allowed() -> Self {
         Self {
             min: 0,
@@ -149,7 +161,7 @@ pub enum ParamOverlay {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(Visit, VisitMut, TypeEq)]
+#[derive(Visit, VisitMut, TypeEq, TypeOrd)]
 pub struct ParamList(Vec<Param>);
 
 impl ParamList {
@@ -318,7 +330,7 @@ fn write_indent<O: TypeOutput>(output: &mut O, indent: usize) -> fmt::Result {
 /// Represents a prefix parameter in `Concatenate`.
 /// Prefix params can be either positional-only or positional (named).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(Visit, VisitMut, TypeEq)]
+#[derive(Visit, VisitMut, TypeEq, TypeOrd)]
 pub enum PrefixParam {
     PosOnly(Option<Name>, Type, Required),
     Pos(Name, Type, Required),
@@ -360,7 +372,7 @@ impl PrefixParam {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(Visit, VisitMut, TypeEq)]
+#[derive(Visit, VisitMut, TypeEq, TypeOrd)]
 pub enum Params {
     List(ParamList),
     /// The remaining parameter list of a `functools.partial(...)`: behaves like `List` for
@@ -436,7 +448,7 @@ impl Params {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(Visit, VisitMut, TypeEq)]
+#[derive(Visit, VisitMut, TypeEq, TypeOrd)]
 pub enum Param {
     PosOnly(Option<Name>, Type, Required),
     Pos(Name, Type, Required),
@@ -445,17 +457,17 @@ pub enum Param {
     Kwargs(Option<Name>, Type),
 }
 
-/// The default value of an optional parameter, containing its type and an optional
-/// display string for values whose types don't preserve the literal value (e.g. floats).
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// This stores type and display information for an optional parameter's default.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, TypeEq, TypeOrd)]
 pub struct DefaultValue {
-    pub ty: Type,
+    /// Call solving uses this type. `None` means that the default provides display information only.
+    pub ty: Option<Type>,
     /// Display string for defaults that can't be recovered from the type alone,
     /// e.g. `"3.14"` for float literals whose type is just `float`.
     pub display: Option<String>,
 }
 
-/// Visit/VisitMut/TypeEq delegate to `ty` only; `display` is display-only metadata.
+/// Type traversal excludes display metadata, but incremental equality includes it.
 impl<To> Visit<To> for DefaultValue
 where
     Type: Visit<To>,
@@ -476,28 +488,35 @@ where
     }
 }
 
-impl TypeEq for DefaultValue {
-    fn type_eq(&self, other: &Self, ctx: &mut TypeEqCtx) -> bool {
-        self.ty.type_eq(&other.ty, ctx)
-    }
-}
-
 impl DefaultValue {
     pub fn new(ty: Type) -> Self {
-        Self { ty, display: None }
+        Self {
+            ty: Some(ty),
+            display: None,
+        }
     }
 
     pub fn with_display(ty: Type, display: String) -> Self {
         Self {
-            ty,
+            ty: Some(ty),
             display: Some(display),
+        }
+    }
+
+    /// This formats the default from its display text or recorded type.
+    pub fn fmt_default(&self, env: &dyn TypeEnv) -> String {
+        match (&self.display, &self.ty) {
+            (Some(text), _) => text.clone(),
+            (_, Some(Type::Literal(lit))) => lit.value.display_with(env).to_string(),
+            (_, Some(Type::None)) => "None".to_owned(),
+            _ => "...".to_owned(),
         }
     }
 }
 
 /// Requiredness for a function parameter.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[derive(Visit, VisitMut, TypeEq)]
+#[derive(Visit, VisitMut, TypeEq, TypeOrd)]
 pub enum Required {
     Required,
     /// The parameter is optional, with the default value info if available.
@@ -753,6 +772,19 @@ impl Callable {
         }
     }
 
+    /// The number of leading parameters that `split_first_param` removes.
+    pub fn bound_receiver_count(&self) -> usize {
+        match &self.params {
+            Params::List(params) | Params::Partial(params) => match params.0.first() {
+                // A receiver passed through `*args` leaves the parameters unchanged.
+                Some(Param::Varargs(..)) | None => 0,
+                Some(_) => 1,
+            },
+            Params::ParamSpec(prefix, _) => usize::from(!prefix.is_empty()),
+            Params::Ellipsis | Params::Materialization => 0,
+        }
+    }
+
     pub fn get_first_param(&self) -> Option<&Type> {
         match &self.params {
             Params::List(params) | Params::Partial(params) => {
@@ -828,22 +860,41 @@ impl Callable {
     pub fn arg_counts(&self) -> ArgCounts {
         self.params.arg_counts()
     }
+
+    /// A false result proves that no argument list satisfies both signatures.
+    /// Matching counts and required keyword names are only necessary conditions;
+    /// parameter types and interactions between positional and keyword arguments are ignored.
+    pub fn may_have_common_call_shape(&self, other: &Self) -> bool {
+        let (Params::List(left) | Params::Partial(left)) = &self.params else {
+            return true;
+        };
+        let (Params::List(right) | Params::Partial(right)) = &other.params else {
+            return true;
+        };
+        let left_counts = self.arg_counts();
+        let right_counts = other.arg_counts();
+        let accepts_required_keywords = |params: &ParamList, other: &ParamList| {
+            params.items().iter().all(|param| match param {
+                Param::KwOnly(name, _, Required::Required) => other.items().iter().any(|p| {
+                    matches!(p, Param::Pos(n, ..) | Param::KwOnly(n, ..) if n == name)
+                        || matches!(p, Param::Kwargs(..))
+                }),
+                _ => true,
+            })
+        };
+        left_counts.positional.overlaps(&right_counts.positional)
+            && left_counts.keyword.overlaps(&right_counts.keyword)
+            && left_counts.overall.overlaps(&right_counts.overall)
+            && accepts_required_keywords(left, right)
+            && accepts_required_keywords(right, left)
+    }
 }
 
 impl Param {
-    pub(crate) fn fmt_default(&self, default: &Option<DefaultValue>) -> String {
-        match default {
-            Some(DefaultValue {
-                display: Some(text),
-                ..
-            }) => text.clone(),
-            Some(DefaultValue {
-                ty: Type::Literal(lit),
-                ..
-            }) => format!("{}", lit.value),
-            Some(DefaultValue { ty: Type::None, .. }) => "None".to_owned(),
-            _ => "...".to_owned(),
-        }
+    pub(crate) fn fmt_default(&self, default: &Option<DefaultValue>, env: &dyn TypeEnv) -> String {
+        default
+            .as_ref()
+            .map_or_else(|| "...".to_owned(), |default| default.fmt_default(env))
     }
 
     pub fn fmt_with_type<O: TypeOutput>(
@@ -857,7 +908,7 @@ impl Param {
                 output.write_str("_: ")?;
                 write_type(ty, output)?;
                 output.write_str(" = ")?;
-                output.write_str(&self.fmt_default(default))
+                output.write_str(&self.fmt_default(default, output.env()))
             }
             Param::PosOnly(Some(name), ty, Required::Required)
             | Param::Pos(name, ty, Required::Required)
@@ -873,7 +924,7 @@ impl Param {
                 output.write_str(": ")?;
                 write_type(ty, output)?;
                 output.write_str(" = ")?;
-                output.write_str(&self.fmt_default(default))
+                output.write_str(&self.fmt_default(default, output.env()))
             }
             Param::Varargs(Some(name), ty) => {
                 output.write_str("*")?;
@@ -954,9 +1005,9 @@ impl Param {
     }
 }
 
-impl Display for Param {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let ctx = TypeDisplayContext::new(&[self.as_type()]);
+impl<'e> DisplayWith<dyn TypeEnv + 'e> for Param {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>, env: &(dyn TypeEnv + 'e)) -> fmt::Result {
+        let ctx = TypeDisplayContext::new(env, &[self.as_type()]);
         let mut output = DisplayOutput::new(&ctx, f);
         self.fmt_with_type(&mut output, &|t, o| ctx.fmt_helper_generic(t, false, o))
     }
@@ -978,7 +1029,6 @@ mod tests {
     use pyrefly_util::visit::Visit;
     use pyrefly_util::visit::VisitMut;
     use ruff_python_ast::name::Name;
-    use ruff_text_size::TextRange;
 
     use crate::callable::Callable;
     use crate::callable::DefaultValue;
@@ -987,8 +1037,11 @@ mod tests {
     use crate::callable::Params;
     use crate::callable::PrefixParam;
     use crate::callable::Required;
+    use crate::equality::TypeEq;
+    use crate::equality::TypeEqCtx;
     use crate::quantified::AnchorIndex;
     use crate::quantified::Quantified;
+    use crate::quantified::QuantifiedAnchor;
     use crate::quantified::QuantifiedIdentity;
     use crate::quantified::QuantifiedKind;
     use crate::quantified::QuantifiedOrigin;
@@ -1159,11 +1212,25 @@ mod tests {
     }
 
     #[test]
+    fn test_display_only_default_equality_after_edit() {
+        let default = DefaultValue {
+            ty: None,
+            display: Some("1".to_owned()),
+        };
+        let changed = DefaultValue {
+            ty: None,
+            display: Some("2".to_owned()),
+        };
+        assert!(default.type_eq(&default.clone(), &mut TypeEqCtx::default()));
+        assert!(!default.type_eq(&changed, &mut TypeEqCtx::default()));
+    }
+
+    #[test]
     fn test_default_value_visit_delegates_to_ty() {
         let q = Quantified::new(
             QuantifiedIdentity::new(
                 ModuleName::from_str("__test__"),
-                AnchorIndex::first(TextRange::default()),
+                AnchorIndex::first(QuantifiedAnchor::None),
                 QuantifiedOrigin::Pep695,
             ),
             Name::new("T"),
@@ -1182,11 +1249,24 @@ mod tests {
     }
 
     #[test]
+    fn test_display_only_default_has_no_visited_type() {
+        let mut default = DefaultValue {
+            ty: None,
+            display: Some("0".to_owned()),
+        };
+        let mut visited = Vec::new();
+        default.visit(&mut |ty: &Type| visited.push(ty.clone()));
+        assert!(visited.is_empty());
+        default.visit_mut(&mut |_: &mut Type| panic!("Display text has no type to mutate"));
+        assert_eq!(default.display.as_deref(), Some("0"));
+    }
+
+    #[test]
     fn test_default_value_visit_mut_delegates_to_ty() {
         let q = Quantified::new(
             QuantifiedIdentity::new(
                 ModuleName::from_str("__test__"),
-                AnchorIndex::new(TextRange::default(), 1),
+                AnchorIndex::new(QuantifiedAnchor::None, 1),
                 QuantifiedOrigin::Pep695,
             ),
             Name::new("T"),
@@ -1202,7 +1282,7 @@ mod tests {
         default.visit_mut(&mut |ty: &mut Type| {
             *ty = Type::None;
         });
-        assert_eq!(default.ty, Type::None);
+        assert_eq!(default.ty, Some(Type::None));
         // Display metadata should be unaffected.
         assert_eq!(default.display, Some("default".to_owned()));
     }

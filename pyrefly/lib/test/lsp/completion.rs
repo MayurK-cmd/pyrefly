@@ -19,6 +19,7 @@ use pyrefly_build::handle::Handle;
 use pyrefly_python::sys_info::PythonVersion;
 use ruff_text_size::TextSize;
 
+use crate::lsp::wasm::completion::CompletionOptions;
 use crate::state::lsp::ImportFormat;
 use crate::state::require::Require;
 use crate::state::state::State;
@@ -29,6 +30,8 @@ use crate::test::util::extract_cursors_for_test;
 use crate::test::util::get_batched_lsp_operations_report;
 use crate::test::util::get_batched_lsp_operations_report_allow_error;
 use crate::test::util::mk_multi_file_state;
+
+mod method_override;
 
 // Some assertions compare literal completion dumps. pretty_assertions decorates
 // diffs with ANSI escapes, so we strip them to keep the expected strings stable.
@@ -178,7 +181,7 @@ fn completion_sort_text(code: &str, label: &str) -> Option<String> {
     item.sort_text
 }
 
-// https://github.com/facebook/pyrefly/issues/1211
+// https://github.com/pyrefly-org/pyrefly/issues/1211
 #[test]
 fn completion_dunder_attribute_inherited_from_object() {
     let code = r#"
@@ -2716,6 +2719,157 @@ def f():
 }
 
 #[test]
+fn completion_after_keyword_prefix_in_function_body() {
+    for (prefix, local, builtin) in [
+        ("as", "assertion", "classmethod"),
+        ("in", "initial", "int"),
+        ("is", "island", "isinstance"),
+    ] {
+        let code = format!("\ndef f({local}: int, unrelated: int):\n    {prefix}\n#     ^\n");
+        let items = completions_at_cursor(&code);
+        for keyword in ["assert", "async", "import", "is"] {
+            assert!(
+                items.iter().any(|item| {
+                    item.kind == Some(CompletionItemKind::Keyword) && item.label == keyword
+                }),
+                "expected keyword `{keyword}` after `{prefix}`, got {items:?}"
+            );
+        }
+        for name in [local, builtin] {
+            assert!(
+                items.iter().any(|item| item.label == name),
+                "expected `{name}` after `{prefix}`, got {items:?}"
+            );
+        }
+        for name in ["unrelated", "len"] {
+            assert!(
+                !items.iter().any(|item| item.label == name),
+                "unexpected `{name}` after `{prefix}`, got {items:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn completion_after_keyword_prefix_preserves_autoimport_behavior() {
+    for (prefix, local, auto_import, expected_incomplete, expected_autoimport) in [
+        ("as", "", true, true, false),
+        ("ass", "", true, false, true),
+        ("and", "", true, false, true),
+        ("and", "andromeda: int", true, true, false),
+        ("and_", "andromeda: int", true, false, true),
+        ("as", "", false, false, false),
+        ("and", "andromeda: int", false, false, false),
+    ] {
+        let code = format!("def f({local}):\n    {prefix}");
+        let (handles, state) = mk_multi_file_state(
+            &[
+                ("main", &code),
+                ("tools", "def and_tool(): pass\ndef assert_tool(): pass"),
+            ],
+            Require::Exports,
+            false,
+        );
+        let (items, is_incomplete) = state.transaction().completion_with_incomplete(
+            &handles["main"],
+            TextSize::of(code.as_str()),
+            ImportFormat::Absolute,
+            CompletionOptions {
+                auto_import,
+                ..Default::default()
+            },
+            None,
+        );
+        assert!(!items.is_empty(), "expected completions in {code:?}");
+        assert_eq!(is_incomplete, expected_incomplete, "code: {code:?}");
+        assert_eq!(
+            items
+                .iter()
+                .any(|item| matches!(item.label.as_str(), "and_tool" | "assert_tool")),
+            expected_autoimport,
+            "code: {code:?}"
+        );
+    }
+}
+
+#[test]
+fn completion_after_keyword_prefix_in_inline_suite() {
+    for header in [
+        "def f():\n    if True:",
+        "def f():\n    while True:",
+        "def f():\n    for item in ():",
+        "def f():\n    with open('file'):",
+        "def f():\n    try:",
+        "def f():\n    try: pass\n    except:",
+        "def f():\n    try: pass\n    finally:",
+        "def f():\n    if False: pass\n    elif True:",
+        "def f():\n    if False: pass\n    else:",
+        "class C:\n    def f(self):",
+        "def f():\n    class C:",
+        "def f():\n    match 1:\n        case 1:",
+    ] {
+        let code = format!("{header} as");
+        let (handles, state) = mk_multi_file_state(&[("main", &code)], Require::Exports, false);
+        let items = state.transaction().completion(
+            &handles["main"],
+            TextSize::of(code.as_str()),
+            ImportFormat::Absolute,
+            true,
+            None,
+        );
+        assert!(
+            items.iter().any(|item| {
+                item.kind == Some(CompletionItemKind::Keyword) && item.label == "assert"
+            }),
+            "expected `assert` in {code:?}, got {items:?}"
+        );
+    }
+}
+
+#[test]
+fn completion_after_keyword_prefix_in_other_statement_positions() {
+    for code in [
+        "as\n# ^\n",
+        "class C:\n    as\n#     ^\n",
+        "if True:\n    as\n#     ^\n",
+        "def f():\n    if True:\n        as\n#         ^\n",
+        "def f():\n    # comment\n\n    as\n#     ^\n",
+        "def f():\n    pass; as\n#           ^\n",
+        "def f():\r\n    as\r\n#     ^\r\n",
+    ] {
+        let items = completions_at_cursor(code);
+        assert!(
+            items.iter().any(|item| {
+                item.kind == Some(CompletionItemKind::Keyword) && item.label == "assert"
+            }),
+            "expected `assert` in {code:?}, got {items:?}"
+        );
+    }
+}
+
+#[test]
+fn no_statement_completions_after_keyword_in_expression() {
+    for code in [
+        "def f(item):\n    value = item is\n#                  ^\n",
+        "def f():\n    return as\n#            ^\n",
+        "def f():\n    print(\n        as\n#         ^\n    )\n",
+        "def f():\n    value = {1: as}\n#                 ^\n",
+        "def f(items):\n    value = items[:as]\n#                    ^\n",
+        "def f():\n    value: as\n#            ^\n",
+        "def f():\n    value = lambda: as\n#                     ^\n",
+        "def f():\n    def g(value: as): pass\n#                  ^\n",
+    ] {
+        let items = completions_at_cursor(code);
+        for name in ["assert", "def", "return"] {
+            assert!(
+                !items.iter().any(|item| item.label == name),
+                "unexpected `{name}` in {code:?}, got {items:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn kwargs_completion_with_existing_args() {
     let code = r#"
 def foo(a: int, b: str, c: bool): ...
@@ -3201,7 +3355,7 @@ fn subscript_rewrite_labels(code: &str) -> Vec<String> {
         .collect()
 }
 
-// https://github.com/meta/pyrefly/issues/5478
+// https://github.com/pyrefly-org/pyrefly/issues/5478
 #[test]
 fn typed_dict_attribute_completion_rewrites_to_subscript() {
     let code = r#"
@@ -4837,6 +4991,58 @@ T = Iterable
 }
 
 #[test]
+fn autoimport_dunder_all_reexport_suggests_public_package() {
+    let code = "FixtureReq\n#         ^\n";
+    for dunder_all in [
+        "__all__ = ['FixtureRequest']",
+        "__all__ = []\n__all__.append('FixtureRequest')",
+        "__all__ = ['FixtureRequest']\nfor name in []:\n    __all__.append(name)",
+    ] {
+        let mut env = TestEnv::new().with_default_require_level(Require::Exports);
+        env.add("main", code);
+        env.add_with_path(
+            "pytest",
+            "pytest/__init__.py",
+            &format!("from _pytest.fixtures import FixtureRequest\n{dunder_all}\n"),
+        );
+        env.add_with_path(
+            "_pytest.fixtures",
+            "_pytest/fixtures.py",
+            "class FixtureRequest: pass\n",
+        );
+        env.add("consumer", "from _pytest.fixtures import FixtureRequest\n");
+        env.add(
+            "excluded",
+            "from _pytest.fixtures import FixtureRequest\n__all__ = []\n",
+        );
+        let (state, handle_for) = env.to_state();
+        let handle = handle_for("main");
+        let position = extract_cursors_for_test(code)[0];
+        let completions =
+            state
+                .transaction()
+                .completion(&handle, position, ImportFormat::Absolute, true, None);
+        let imports = completions
+            .iter()
+            .filter(|item| item.label == "FixtureRequest")
+            .map(|item| {
+                let edits = item.additional_text_edits.as_ref().unwrap();
+                assert_eq!(edits.len(), 1);
+                edits[0].new_text.as_str()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            imports,
+            [
+                "from pytest import FixtureRequest\n",
+                "from _pytest.fixtures import FixtureRequest\n",
+            ],
+            "{dunder_all}",
+        );
+    }
+}
+
+#[test]
 fn autoimport_explicit_reexport_suggests_reexport_path() {
     let code = r#"
 T = Thing
@@ -4947,7 +5153,7 @@ Completion Results:
     );
 }
 
-// https://github.com/facebook/pyrefly/issues/5223
+// https://github.com/pyrefly-org/pyrefly/issues/5223
 #[test]
 fn autoimport_skips_module_name_with_non_identifier() {
     let code = r#"
@@ -5650,7 +5856,7 @@ This has documentation.
     );
 }
 
-// Regression test for https://github.com/facebook/pyrefly/issues/1257.
+// Regression test for https://github.com/pyrefly-org/pyrefly/issues/1257.
 // Completion takes its base type from the type trace, and hover rendering of a bound method
 // shows the `self` parameter that ordinary display strips. Both the detail string and the
 // property's type therefore expose whatever the trace holds, so this pins that no solver
@@ -5885,7 +6091,7 @@ needs_base(val)
 #[test]
 fn bound_method_completions_include_descriptor_attributes() {
     // Make sure completions work for bound methods from custom descriptors.
-    // See: https://github.com/facebook/pyrefly/issues/821
+    // See: https://github.com/pyrefly-org/pyrefly/issues/821
     let code = r#"
 from __future__ import annotations
 from typing import Callable

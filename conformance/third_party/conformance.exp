@@ -1484,6 +1484,17 @@
       "severity": "error",
       "stop_column": 59,
       "stop_line": 66
+    },
+    {
+      "code": -2,
+      "column": 47,
+      "concise_description": "`BadAlias21` is uninitialized",
+      "description": "`BadAlias21` is uninitialized",
+      "line": 66,
+      "name": "unbound-name",
+      "severity": "error",
+      "stop_column": 57,
+      "stop_line": 66
     }
   ],
   "aliases_variance.py": [
@@ -1534,6 +1545,17 @@
   ],
   "annotations_coroutines.py": [],
   "annotations_forward_refs.py": [
+    {
+      "code": -2,
+      "column": 7,
+      "concise_description": "`ClassA` is uninitialized",
+      "description": "`ClassA` is uninitialized",
+      "line": 22,
+      "name": "unbound-name",
+      "severity": "error",
+      "stop_column": 13,
+      "stop_line": 22
+    },
     {
       "code": -2,
       "column": 12,
@@ -1745,6 +1767,17 @@
     },
     {
       "code": -2,
+      "column": 26,
+      "concise_description": "`ClassB` is uninitialized",
+      "description": "`ClassB` is uninitialized",
+      "line": 65,
+      "name": "unbound-name",
+      "severity": "error",
+      "stop_column": 32,
+      "stop_line": 65
+    },
+    {
+      "code": -2,
       "column": 13,
       "concise_description": "Could not find name `ClassInner`",
       "description": "Could not find name `ClassInner`",
@@ -1779,8 +1812,8 @@
     {
       "code": -2,
       "column": 9,
-      "concise_description": "Expected a type form, got instance of `(self: Self@ClassD) -> None`",
-      "description": "Expected a type form, got instance of `(self: Self@ClassD) -> None`",
+      "concise_description": "Expected a type form, got class attribute `int` of type `(self: Self@ClassD) -> None`",
+      "description": "Expected a type form, got class attribute `int` of type `(self: Self@ClassD) -> None`\n  Note: falling back to `builtins.int` from an enclosing scope",
       "line": 96,
       "name": "not-a-type",
       "severity": "error",
@@ -1836,8 +1869,8 @@
     {
       "code": -2,
       "column": 8,
-      "concise_description": "Expected a type form, got instance of `(self: Self@ClassB) -> None`",
-      "description": "Expected a type form, got instance of `(self: Self@ClassB) -> None`",
+      "concise_description": "Expected a type form, got class attribute `int` of type `(self: Self@ClassB) -> None`",
+      "description": "Expected a type form, got class attribute `int` of type `(self: Self@ClassB) -> None`\n  Note: falling back to `builtins.int` from an enclosing scope",
       "line": 39,
       "name": "not-a-type",
       "severity": "error",
@@ -3416,10 +3449,10 @@
     {
       "code": -2,
       "column": 9,
-      "concise_description": "Class member `ChildC2.__init__` overrides parent class `ParentC` in an inconsistent manner",
-      "description": "Class member `ChildC2.__init__` overrides parent class `ParentC` in an inconsistent manner\n  `ChildC2.__init__` has type `(x: str) -> None`, which is not assignable to `(x: int) -> None`, the type of `ParentC.__init__`\n  Signature mismatch:\n  expected: def __init__(self: ChildC2, x: int) -> None: ...\n                                           ^^^ parameters\n  found:    def __init__(self: ChildC2, x: str) -> None: ...\n                                           ^^^ parameters",
+      "concise_description": "Class member `ChildC2.__init__` overrides parent class `ParentC` in an inconsistent manner; compatibility is checked because this member is decorated with `@override`",
+      "description": "Class member `ChildC2.__init__` overrides parent class `ParentC` in an inconsistent manner; compatibility is checked because this member is decorated with `@override`\n  `ChildC2.__init__` has type `(x: str) -> None`, which is not assignable to `(x: int) -> None`, the type of `ParentC.__init__`\n  Signature mismatch:\n  expected: def __init__(self: ChildC2, x: int) -> None: ...\n                                           ^^^ parameter\n  found:    def __init__(self: ChildC2, x: str) -> None: ...\n                                           ^^^ parameter",
       "line": 135,
-      "name": "bad-override",
+      "name": "bad-override-explicit",
       "severity": "error",
       "stop_column": 17,
       "stop_line": 135
@@ -3427,10 +3460,10 @@
     {
       "code": -2,
       "column": 9,
-      "concise_description": "Class member `ChildC2.__new__` overrides parent class `ParentC` in an inconsistent manner",
-      "description": "Class member `ChildC2.__new__` overrides parent class `ParentC` in an inconsistent manner\n  `ChildC2.__new__` has type `[Self@ChildC2: ChildC2](cls: type[Self@ChildC2], x: str) -> ChildC2`, which is not assignable to `(cls: type[ChildC2], x: int) -> ParentC`, the type of `ParentC.__new__`\n  Signature mismatch:\n  expected: def __new__(cls: type[ChildC2], x: int) -> ParentC: ...\n                                  ^^^^^^^^^^^^^^^^     ^^^^^^^ return type\n                                  |\n                                  parameters\n  found:    def __new__(cls: type[Self@ChildC2], x: str) -> ChildC2: ...\n                                  ^^^^^^^^^^^^^^^^^^^^^     ^^^^^^^ return type\n                                  |\n                                  parameters",
+      "concise_description": "Class member `ChildC2.__new__` overrides parent class `ParentC` in an inconsistent manner; compatibility is checked because this member is decorated with `@override`",
+      "description": "Class member `ChildC2.__new__` overrides parent class `ParentC` in an inconsistent manner; compatibility is checked because this member is decorated with `@override`\n  `ChildC2.__new__` has type `[Self@ChildC2: ChildC2](cls: type[Self@ChildC2], x: str) -> ChildC2`, which is not assignable to `(cls: type[ChildC2], x: int) -> ParentC`, the type of `ParentC.__new__`\n  Signature mismatch:\n  expected: def __new__(cls: type[ChildC2], x: int) -> ParentC: ...\n                                               ^^^ parameter\n  found:    def __new__(cls: type[Self@ChildC2], x: str) -> ChildC2: ...\n                                                    ^^^ parameter",
       "line": 138,
-      "name": "bad-override",
+      "name": "bad-override-explicit",
       "severity": "error",
       "stop_column": 16,
       "stop_line": 138
@@ -3844,8 +3877,8 @@
     {
       "code": -2,
       "column": 12,
-      "concise_description": "revealed type: (*args: Any, **kwargs: Any) -> NoReturn",
-      "description": "revealed type: (*args: Any, **kwargs: Any) -> NoReturn",
+      "concise_description": "revealed type: (...) -> NoReturn",
+      "description": "revealed type: (...) -> NoReturn",
       "line": 99,
       "name": "reveal-type",
       "severity": "info",
@@ -3974,20 +4007,20 @@
       "stop_line": 199
     }
   ],
-  "constructors_consistency.py": [],
-  "dataclasses_descriptors.py": [
+  "constructors_consistency.py": [
     {
       "code": -2,
-      "column": 5,
-      "concise_description": "Cannot set field `z` to non-data descriptor `Desc2`",
-      "description": "Cannot set field `z` to non-data descriptor `Desc2`\n  Hint: add a `__set__` method to make `Desc2` a data descriptor",
-      "line": 58,
-      "name": "bad-dataclass-descriptor",
+      "column": 9,
+      "concise_description": "`__new__` and `__init__` of class `Class1` accept no common argument list",
+      "description": "`__new__` and `__init__` of class `Class1` accept no common argument list\n  `__new__`: (cls: type[Class1]) -> Class1\n  `__init__`: (self: Class1, x: str) -> None",
+      "line": 25,
+      "name": "inconsistent-constructor",
       "severity": "error",
-      "stop_column": 6,
-      "stop_line": 58
+      "stop_column": 17,
+      "stop_line": 25
     }
   ],
+  "dataclasses_descriptors.py": [],
   "dataclasses_final.py": [
     {
       "code": -2,
@@ -5893,8 +5926,8 @@
     {
       "code": -2,
       "column": 20,
-      "concise_description": "`str` is not assignable to upper bound `int` of type variable `T_int`",
-      "description": "`str` is not assignable to upper bound `int` of type variable `T_int`",
+      "concise_description": "While checking parameter `y`: `str` is not assignable to upper bound `int` of type variable `T_int`",
+      "description": "While checking parameter `y`: `str` is not assignable to upper bound `int` of type variable `T_int`",
       "line": 241,
       "name": "bad-specialization",
       "severity": "error",
@@ -6772,7 +6805,7 @@
       "concise_description": "Contradictory variance specifications",
       "description": "Contradictory variance specifications",
       "line": 100,
-      "name": "invalid-type-var",
+      "name": "invalid-param-spec",
       "severity": "error",
       "stop_column": 62,
       "stop_line": 100
@@ -6783,7 +6816,7 @@
       "concise_description": "Contradictory variance specifications",
       "description": "Contradictory variance specifications",
       "line": 101,
-      "name": "invalid-type-var",
+      "name": "invalid-param-spec",
       "severity": "error",
       "stop_column": 63,
       "stop_line": 101
@@ -6794,7 +6827,7 @@
       "concise_description": "Contradictory variance specifications",
       "description": "Contradictory variance specifications",
       "line": 102,
-      "name": "invalid-type-var",
+      "name": "invalid-param-spec",
       "severity": "error",
       "stop_column": 67,
       "stop_line": 102
@@ -7981,6 +8014,17 @@
     },
     {
       "code": -2,
+      "column": 32,
+      "concise_description": "Unexpected positional argument to TypeVarTuple",
+      "description": "Unexpected positional argument to TypeVarTuple",
+      "line": 66,
+      "name": "invalid-type-var-tuple",
+      "severity": "error",
+      "stop_column": 37,
+      "stop_line": 66
+    },
+    {
+      "code": -2,
       "column": 27,
       "concise_description": "Unexpected keyword argument `bound` to TypeVarTuple",
       "description": "Unexpected keyword argument `bound` to TypeVarTuple",
@@ -8310,31 +8354,9 @@
     },
     {
       "code": -2,
-      "column": 35,
-      "concise_description": "Unexpected keyword argument `infer_variance` to TypeVarTuple",
-      "description": "Unexpected keyword argument `infer_variance` to TypeVarTuple",
-      "line": 55,
-      "name": "invalid-type-var-tuple",
-      "severity": "error",
-      "stop_column": 54,
-      "stop_line": 55
-    },
-    {
-      "code": -2,
-      "column": 33,
-      "concise_description": "Unexpected keyword argument `covariant` to TypeVarTuple",
-      "description": "Unexpected keyword argument `covariant` to TypeVarTuple",
-      "line": 56,
-      "name": "invalid-type-var-tuple",
-      "severity": "error",
-      "stop_column": 47,
-      "stop_line": 56
-    },
-    {
-      "code": -2,
       "column": 49,
-      "concise_description": "Unexpected keyword argument `contravariant` to TypeVarTuple",
-      "description": "Unexpected keyword argument `contravariant` to TypeVarTuple",
+      "concise_description": "Contradictory variance specifications",
+      "description": "Contradictory variance specifications",
       "line": 56,
       "name": "invalid-type-var-tuple",
       "severity": "error",
@@ -8343,20 +8365,9 @@
     },
     {
       "code": -2,
-      "column": 33,
-      "concise_description": "Unexpected keyword argument `covariant` to TypeVarTuple",
-      "description": "Unexpected keyword argument `covariant` to TypeVarTuple",
-      "line": 57,
-      "name": "invalid-type-var-tuple",
-      "severity": "error",
-      "stop_column": 47,
-      "stop_line": 57
-    },
-    {
-      "code": -2,
       "column": 49,
-      "concise_description": "Unexpected keyword argument `infer_variance` to TypeVarTuple",
-      "description": "Unexpected keyword argument `infer_variance` to TypeVarTuple",
+      "concise_description": "Contradictory variance specifications",
+      "description": "Contradictory variance specifications",
       "line": 57,
       "name": "invalid-type-var-tuple",
       "severity": "error",
@@ -8365,20 +8376,9 @@
     },
     {
       "code": -2,
-      "column": 33,
-      "concise_description": "Unexpected keyword argument `contravariant` to TypeVarTuple",
-      "description": "Unexpected keyword argument `contravariant` to TypeVarTuple",
-      "line": 58,
-      "name": "invalid-type-var-tuple",
-      "severity": "error",
-      "stop_column": 51,
-      "stop_line": 58
-    },
-    {
-      "code": -2,
       "column": 53,
-      "concise_description": "Unexpected keyword argument `infer_variance` to TypeVarTuple",
-      "description": "Unexpected keyword argument `infer_variance` to TypeVarTuple",
+      "concise_description": "Contradictory variance specifications",
+      "description": "Contradictory variance specifications",
       "line": 58,
       "name": "invalid-type-var-tuple",
       "severity": "error",
@@ -8409,14 +8409,14 @@
     },
     {
       "code": -2,
-      "column": 29,
-      "concise_description": "Unexpected keyword argument `contravariant` to TypeVarTuple",
-      "description": "Unexpected keyword argument `contravariant` to TypeVarTuple",
-      "line": 73,
-      "name": "invalid-type-var-tuple",
+      "column": 9,
+      "concise_description": "Type variable `InTs` is contravariant but is used in covariant position",
+      "description": "Type variable `InTs` is contravariant but is used in covariant position",
+      "line": 79,
+      "name": "invalid-variance",
       "severity": "error",
-      "stop_column": 47,
-      "stop_line": 73
+      "stop_column": 14,
+      "stop_line": 79
     },
     {
       "code": -2,
@@ -8431,25 +8431,14 @@
     },
     {
       "code": -2,
-      "column": 49,
-      "concise_description": "`ContravariantTypeVarTupleOld[object]` is not assignable to `ContravariantTypeVarTupleOld[int]`",
-      "description": "`ContravariantTypeVarTupleOld[object]` is not assignable to `ContravariantTypeVarTupleOld[int]`",
-      "line": 84,
-      "name": "bad-assignment",
+      "column": 9,
+      "concise_description": "Type variable `OutTs` is covariant but is used in contravariant position",
+      "description": "Type variable `OutTs` is covariant but is used in contravariant position",
+      "line": 90,
+      "name": "invalid-variance",
       "severity": "error",
-      "stop_column": 87,
-      "stop_line": 84
-    },
-    {
-      "code": -2,
-      "column": 31,
-      "concise_description": "Unexpected keyword argument `covariant` to TypeVarTuple",
-      "description": "Unexpected keyword argument `covariant` to TypeVarTuple",
-      "line": 87,
-      "name": "invalid-type-var-tuple",
-      "severity": "error",
-      "stop_column": 45,
-      "stop_line": 87
+      "stop_column": 13,
+      "stop_line": 90
     },
     {
       "code": -2,
@@ -8464,17 +8453,6 @@
     },
     {
       "code": -2,
-      "column": 49,
-      "concise_description": "`CovariantTypeVarTupleOld[int]` is not assignable to `CovariantTypeVarTupleOld[object]`",
-      "description": "`CovariantTypeVarTupleOld[int]` is not assignable to `CovariantTypeVarTupleOld[object]`",
-      "line": 98,
-      "name": "bad-assignment",
-      "severity": "error",
-      "stop_column": 80,
-      "stop_line": 98
-    },
-    {
-      "code": -2,
       "column": 66,
       "concise_description": "`InferredContravariantTypeVarTupleOld[int]` is not assignable to `InferredContravariantTypeVarTupleOld[object]`",
       "description": "`InferredContravariantTypeVarTupleOld[int]` is not assignable to `InferredContravariantTypeVarTupleOld[object]`",
@@ -8486,17 +8464,6 @@
     },
     {
       "code": -2,
-      "column": 63,
-      "concise_description": "`InferredContravariantTypeVarTupleOld[object]` is not assignable to `InferredContravariantTypeVarTupleOld[int]`",
-      "description": "`InferredContravariantTypeVarTupleOld[object]` is not assignable to `InferredContravariantTypeVarTupleOld[int]`",
-      "line": 108,
-      "name": "bad-assignment",
-      "severity": "error",
-      "stop_column": 109,
-      "stop_line": 108
-    },
-    {
-      "code": -2,
       "column": 60,
       "concise_description": "`InferredCovariantTypeVarTupleOld[object]` is not assignable to `InferredCovariantTypeVarTupleOld[int]`",
       "description": "`InferredCovariantTypeVarTupleOld[object]` is not assignable to `InferredCovariantTypeVarTupleOld[int]`",
@@ -8505,17 +8472,6 @@
       "severity": "error",
       "stop_column": 102,
       "stop_line": 116
-    },
-    {
-      "code": -2,
-      "column": 63,
-      "concise_description": "`InferredCovariantTypeVarTupleOld[int]` is not assignable to `InferredCovariantTypeVarTupleOld[object]`",
-      "description": "`InferredCovariantTypeVarTupleOld[int]` is not assignable to `InferredCovariantTypeVarTupleOld[object]`",
-      "line": 117,
-      "name": "bad-assignment",
-      "severity": "error",
-      "stop_column": 102,
-      "stop_line": 117
     }
   ],
   "generics_upper_bound.py": [
@@ -8544,8 +8500,8 @@
     {
       "code": -2,
       "column": 7,
-      "concise_description": "`int` is not assignable to upper bound `Sized` of type variable `ST`",
-      "description": "`int` is not assignable to upper bound `Sized` of type variable `ST`",
+      "concise_description": "While checking parameter `y`: `int` is not assignable to upper bound `Sized` of type variable `ST`",
+      "description": "While checking parameter `y`: `int` is not assignable to upper bound `Sized` of type variable `ST`",
       "line": 52,
       "name": "bad-specialization",
       "severity": "error",
@@ -9137,8 +9093,8 @@
     {
       "code": -2,
       "column": 21,
-      "concise_description": "`str` is not assignable to upper bound `LiteralString` of type variable `TLiteral`",
-      "description": "`str` is not assignable to upper bound `LiteralString` of type variable `TLiteral`",
+      "concise_description": "While checking parameter `s`: `str` is not assignable to upper bound `LiteralString` of type variable `TLiteral`",
+      "description": "While checking parameter `s`: `str` is not assignable to upper bound `LiteralString` of type variable `TLiteral`",
       "line": 119,
       "name": "bad-specialization",
       "severity": "error",
@@ -9159,8 +9115,8 @@
     {
       "code": -2,
       "column": 50,
-      "concise_description": "`str` is not assignable to upper bound `LiteralString` of type variable `T`",
-      "description": "`str` is not assignable to upper bound `LiteralString` of type variable `T`",
+      "concise_description": "While checking parameter `value`: `str` is not assignable to upper bound `LiteralString` of type variable `T`",
+      "description": "While checking parameter `value`: `str` is not assignable to upper bound `LiteralString` of type variable `T`",
       "line": 133,
       "name": "bad-specialization",
       "severity": "error",
@@ -10178,6 +10134,96 @@
       "severity": "error",
       "stop_column": 20,
       "stop_line": 232
+    }
+  ],
+  "overloads_definitions_stub.pyi": [
+    {
+      "code": -2,
+      "column": 5,
+      "concise_description": "Overloaded function needs at least two @overload declarations",
+      "description": "Overloaded function needs at least two @overload declarations",
+      "line": 14,
+      "name": "invalid-overload",
+      "severity": "error",
+      "stop_column": 10,
+      "stop_line": 14
+    },
+    {
+      "code": -2,
+      "column": 9,
+      "concise_description": "If `@staticmethod` is present on one overload, all overloads must have that decorator.",
+      "description": "If `@staticmethod` is present on one overload, all overloads must have that decorator.",
+      "line": 33,
+      "name": "invalid-overload",
+      "severity": "error",
+      "stop_column": 14,
+      "stop_line": 33
+    },
+    {
+      "code": -2,
+      "column": 9,
+      "concise_description": "If `@classmethod` is present on one overload, all overloads must have that decorator.",
+      "description": "If `@classmethod` is present on one overload, all overloads must have that decorator.",
+      "line": 44,
+      "name": "invalid-overload",
+      "severity": "error",
+      "stop_column": 14,
+      "stop_line": 44
+    },
+    {
+      "code": -2,
+      "column": 9,
+      "concise_description": "If an overloaded function has no implementation, `@final` should be applied to the first overload only.",
+      "description": "If an overloaded function has no implementation, `@final` should be applied to the first overload only.",
+      "line": 73,
+      "name": "invalid-overload",
+      "severity": "error",
+      "stop_column": 22,
+      "stop_line": 73
+    },
+    {
+      "code": -2,
+      "column": 9,
+      "concise_description": "If an overloaded function has no implementation, `@final` should be applied to the first overload only.",
+      "description": "If an overloaded function has no implementation, `@final` should be applied to the first overload only.",
+      "line": 86,
+      "name": "invalid-overload",
+      "severity": "error",
+      "stop_column": 24,
+      "stop_line": 86
+    },
+    {
+      "code": -2,
+      "column": 9,
+      "concise_description": "`final_method` is declared as final in parent class `Base`",
+      "description": "`final_method` is declared as final in parent class `Base`",
+      "line": 108,
+      "name": "bad-override",
+      "severity": "error",
+      "stop_column": 21,
+      "stop_line": 108
+    },
+    {
+      "code": -2,
+      "column": 9,
+      "concise_description": "Class member `Child.bad_override` is marked as an override, but no parent class has a matching attribute",
+      "description": "Class member `Child.bad_override` is marked as an override, but no parent class has a matching attribute",
+      "line": 122,
+      "name": "bad-override",
+      "severity": "error",
+      "stop_column": 21,
+      "stop_line": 122
+    },
+    {
+      "code": -2,
+      "column": 9,
+      "concise_description": "If an overloaded function has no implementation, `@override` should be applied to the first overload only.",
+      "description": "If an overloaded function has no implementation, `@override` should be applied to the first overload only.",
+      "line": 147,
+      "name": "invalid-overload",
+      "severity": "error",
+      "stop_column": 20,
+      "stop_line": 147
     }
   ],
   "overloads_evaluation.py": [

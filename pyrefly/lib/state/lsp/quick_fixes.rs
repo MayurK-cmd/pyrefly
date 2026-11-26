@@ -23,6 +23,7 @@ pub(crate) mod implicit_import;
 pub(crate) mod inline_method;
 pub(crate) mod inline_parameter;
 pub(crate) mod inline_variable;
+pub(crate) mod insert_inferred_annotation;
 pub(crate) mod introduce_parameter;
 pub(crate) mod invert_boolean;
 pub(crate) mod move_members;
@@ -36,3 +37,5 @@ pub(crate) mod types;
 pub(crate) mod unnecessary_type_conversion;
 pub(crate) mod unused_ignore;
 pub(crate) mod unused_import;
+
+pub(crate) use self::extract_shared::line_indent_and_start;

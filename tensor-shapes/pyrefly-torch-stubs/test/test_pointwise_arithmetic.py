@@ -50,6 +50,17 @@ def test_arithmetic_method_shapes() -> None:
     assert_shape(left.nextafter(right).shape, (2, 3))
 
 
+def test_maximum_out_broadcasts_and_reuses_buffer() -> None:
+    left = torch.tensor([[1.0], [2.0]])
+    right = torch.tensor([[3.0, -1.0, 1.5]])
+    out = torch.empty(2, 3)
+    result = torch.maximum(left, right, out=out)
+    assert_shape(result.shape, (2, 3))
+    assert result is out
+    assert torch.equal(out, torch.tensor([[3.0, 1.0, 1.5], [3.0, 2.0, 2.0]]))
+    assert_shape(torch.maximum(left, right, out=None).shape, (2, 3))
+
+
 def test_lerp_tensor_weight_shapes() -> None:
     start = torch.zeros(2)
     end = torch.ones(2)
@@ -88,6 +99,10 @@ def test_arithmetic_scalar_shapes() -> None:
     assert_shape(x.sub(1.0).shape, (2, 3))
     assert_shape(torch.mul(x, 2.0).shape, (2, 3))
     assert_shape(x.div(2.0).shape, (2, 3))
+    functional = torch.fmod(x, 0.75)
+    method = x.fmod(2)
+    assert_shape(functional.shape, (2, 3))
+    assert_shape(method.shape, (2, 3))
 
 
 def test_min_max_reject_scalar_operands() -> None:

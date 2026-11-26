@@ -75,6 +75,22 @@ class Base(ABC):
         raise NotImplementedError  # OK: canonical abstract placeholder
 ```
 
+## any-function-decorator
+
+Default severity: `ignore`
+
+A function or method decorator obscures the function's type because the decorator itself has an explicit `Any` type or applying it produces a top-level explicit `Any`, including a union member. Implicit unknowns are reported separately by [`untyped-function-decorator`](#untyped-function-decorator).
+
+```python
+from typing import Any
+
+def dec(value: Any) -> Any:
+    return value
+
+@dec  # the type of `fn` is lost [any-function-decorator]
+def fn(value: int) -> None: ...
+```
+
 ## assert-type
 
 An `assert-type` error is raised when a `typing.assert_type()` call fails.
@@ -260,6 +276,29 @@ class C:
     x: Desc = Desc()  # instance attribute shadows the descriptor [bad-dataclass-descriptor]
 ```
 
+## bad-descriptor-inheritance
+
+Default severity: `warn`
+
+A descriptor's `__get__` return type is incompatible with a base class that has no getter.
+Widening the descriptor to that base type can hide its descriptor behavior when it is stored on a class.
+
+```python
+class A: ...
+
+class B(A):
+    def __get__(self, instance: object | None, owner: type[object]) -> int:  # incompatible with A
+        return 1
+```
+
+Every advertised getter return type, including class and instance overloads, must be assignable to each non-descriptor direct base.
+Returning `Self` preserves that contract. Bases with getters remain subject to ordinary override checks.
+This conservative signature check does not select overloads for a particular receiver or owner. Implementation-inheritance mixins may therefore require a named suppression or a different base.
+It checks declarations in checked files, not structural protocol assignments or unchecked third-party declarations; setter contracts and function method-binding behavior are outside its scope. Dynamic or unresolved getters and `Any` follow gradual typing.
+
+The check is a warning by default and an error in `strict` and `all`. Disable it with `bad-descriptor-inheritance = "ignore"` under `[errors]`.
+It is independently configurable: existing `bad-override` settings do not enable or disable it. Nominal subtyping is unchanged.
+
 ## bad-dunder-all
 
 This error occurs when `__all__` is explicitly defined for a module but contains an entry that cannot be found in the module's definitions, wildcard imports, or submodules (for `__init__.py` files).
@@ -382,7 +421,55 @@ That means everywhere that we call `Base.f` can safely call `Sub.f`.
 
 The opposite case, where `Base.f` takes `float` and `Sub.f` takes `int`, is an error because `Sub.f` cannot accept every `float` value.
 
-Note that bad overrides caused by inconsistent parameter names are separately reported as [bad-override-param-name](#bad-override-param-name), and some overrides involving mutable attributes are reported as [bad-override-mutable-attribute](#bad-override-mutable-attribute).
+Note that bad overrides caused by inconsistent parameter names are separately reported as [bad-override-param-name](#bad-override-param-name), some overrides involving mutable attributes are reported as [bad-override-mutable-attribute](#bad-override-mutable-attribute), and compatibility checks requested by `@override` on normally exempt members are reported as [bad-override-explicit](#bad-override-explicit).
+
+## bad-override-descriptor
+
+Default severity: `ignore`
+
+A descriptor override has an incompatible type when accessed through the class, even if instance access is compatible.
+
+```python
+from typing import overload
+
+class Descriptor:
+    @overload
+    def __get__(self, instance: None, owner: type) -> str: ...
+    @overload
+    def __get__(self, instance: object, owner: type) -> int: ...
+    def __get__(self, instance: object | None, owner: type) -> str | int: ...
+
+class Base:
+    value = Descriptor()
+
+class Child(Base):
+    value = 1  # Class access returns int rather than str
+```
+
+This check is ignored by default and enabled by the `strict` and `all` presets. Libraries that intentionally change class-access behavior can set `bad-override-descriptor = "ignore"` under `[errors]` without disabling instance override checks.
+It is a sub-kind of [bad-override](#bad-override): suppressing `bad-override` also suppresses this error.
+
+## bad-override-explicit
+
+Pyrefly normally allows incompatible overrides of `__init__`, `__new__`, `__init_subclass__`, and `__class__`.
+Adding `@override` explicitly requests compatibility checking for these members, including when the inherited definition comes from `object`.
+The same applies to `__call__` overrides of members inherited from non-Protocol classes; overrides of Protocol members are checked even without the decorator and use the ordinary override error codes.
+This error is enabled by default and covers both incompatible types and parameter names.
+
+```python
+from typing import override
+
+class Example:
+  @override
+  def __init_subclass__(cls, enabled: bool) -> None:  # Error
+    pass
+```
+
+Here, `object.__init_subclass__` accepts no `enabled` argument.
+Remove `@override` if you do not want to assert compatibility, or keep the decorator and suppress this check with `# pyrefly: ignore[bad-override-explicit]`.
+To disable it project-wide, set `bad-override-explicit = "ignore"` in the `[errors]` section of `pyrefly.toml`.
+Suppressing this error does not suppress other errors on the member, such as overriding a `@final` method.
+This is a sub-kind of [bad-override](#bad-override): suppressing `bad-override` also suppresses this error.
 
 ## bad-override-mutable-attribute
 
@@ -698,6 +785,21 @@ from . import helper
 # or: import pkg.helper
 ```
 
+## ignore-without-code
+
+Default severity: `ignore`
+
+A `# pyrefly: ignore` comment suppresses any error on its line without naming the specific error code(s) it silences. This rule is off by default; enable it to require every Pyrefly suppression to be explicit, so a blanket ignore can't silently hide a new, unrelated error introduced later. Only `# pyrefly: ignore` comments are checked, since Pyrefly only honors error codes for its own tool.
+
+```python
+def f() -> int:
+    return "oops"  # pyrefly: ignore  # ignore-without-code
+
+# Fix: name the error code being suppressed.
+def g() -> int:
+    return "oops"  # pyrefly: ignore[bad-return]
+```
+
 ## implicit-abstract-class
 
 Default severity: `ignore`
@@ -913,6 +1015,31 @@ class C:
         self.y = 0  # error, `y` may be undefined if `f` does not execute
 ```
 
+## import-cycle
+
+Default severity: `ignore`
+
+A module imports itself through a chain of other first-party modules. For each
+group of modules that import each other, Pyrefly reports one shortest cycle, at
+an import in the module of the group whose name sorts first. Every import
+statement counts, including imports inside functions and under
+`if TYPE_CHECKING:`, and importing `a.b` also imports the package `a`. Imports
+of stub files and installed packages are not followed. Which imports count
+matches basedpyright's `reportImportCycles`, which can report several cycles
+for the same group.
+
+```python
+# a.py
+from b import g  # import-cycle: Import cycle: `a` -> `b` -> `a`
+
+def f() -> None: ...
+
+# b.py
+from a import f
+
+def g() -> None: ...
+```
+
 ## inactive-code
 
 Default severity: `hint`
@@ -969,6 +1096,19 @@ project(f, 1)  # Overload type was not compatible with solved type variables: S 
 Deprecated: this error code has been renamed to [incompatible-overload-argument](#incompatible-overload-argument).
 The old name is still accepted in suppression comments and configuration for backwards compatibility.
 
+## inconsistent-constructor
+
+`__new__` and `__init__` have no common argument list. This check detects incompatible
+argument counts and required keyword-only names; parameter types are not compared.
+
+```python
+from typing import Self
+
+class C:
+    def __new__(cls, value: int) -> Self: ...
+    def __init__(self) -> None: ...  # error: no common argument list
+```
+
 ## inconsistent-inheritance
 
 When a class inherits from multiple base classes, the inherited fields must be consistent.
@@ -1015,6 +1155,18 @@ def f(x: bool = False) -> int | None:
     return 0 if x else None
 ```
 
+## ineffective-final
+
+Default severity: `warn`
+
+`final` was called directly on a class. Only `@final` used as a decorator marks a class as
+final, so subclasses of the result are not reported.
+
+```python
+from typing import final
+MyClass = final(type("MyClass", (), {}))  # error, calling `final` on a class has no effect
+```
+
 ## instance-var-assign
 
 Default severity: `ignore`
@@ -1035,7 +1187,7 @@ assigned via the class.
 
 ## internal-error
 
-Ideally you'll never see this one. If you do, please consider [filing a bug](https://github.com/facebook/pyrefly/issues).
+Ideally you'll never see this one. If you do, please consider [filing a bug](https://github.com/pyrefly-org/pyrefly/issues).
 
 ## invalid-abstract-method
 
@@ -1139,6 +1291,19 @@ types, invalid flags, and unrecognized specifications.
 f"{None:>10}"  # invalid-format-spec, if enabled
 f"{'text':.2f}"  # invalid-format-spec, if enabled
 f"{1:.2d}"  # invalid-format-spec, if enabled
+```
+
+## invalid-ignore-comment
+
+Default severity: `warn`
+
+Malformed ignore comments are flagged without changing their lenient suppression effects: misspelled tool directives (`# pyrefly: ignoree`), unterminated lists (`# pyrefly: ignore[bad-code`), and empty lists (`# pyrefly: ignore[]`). Identifier extensions in `# type: <identifier>` can be ordinary type comments, so they are not flagged as typos.
+
+```python
+x: int = "oops"  # pyrefly: ignoree  # invalid-ignore-comment: did you mean `ignore`?
+
+# Fix: use a valid directive.
+y: int = "oops"  # pyrefly: ignore[bad-assignment]
 ```
 
 ## invalid-inheritance
@@ -1876,6 +2041,25 @@ A path that raises, or ends in a call to a `Never` or `NoReturn` function, does 
 A bare class-body annotation is checked against the methods that assign it.
 If no initialization method assigns it, [`uninitialized-instance-variable`](#uninitialized-instance-variable) reports it instead.
 
+## possibly-unsolved-type-var
+
+Default severity: `warn`
+
+In a stub, or any function whose body is `...` (such as an overload), a `...` default does not
+give the parameter a value. If only such parameters mention a type variable in the return type, a
+call that omits them leaves the type variable unsolved, and the call returns `Unknown`. Type
+variables with defaults are not reported.
+
+```python
+def first[T](items: list[T] = ...) -> T: ...  # possibly-unsolved-type-var
+
+first()  # Unknown
+```
+
+To fix it, add an overload for calls that omit the argument, or give the type variable a default.
+
+This is a sub-kind of [invalid-type-var](#invalid-type-var): suppressing `invalid-type-var` also suppresses this error.
+
 ## potential-bad-keyword-argument
 
 Default severity: `ignore`
@@ -1893,6 +2077,25 @@ def f(name: str, **kwargs) -> None: ...
 opts: Options = {}
 # Potential conflict: if 'name' is in opts at runtime, this will crash
 f(name="test", **opts)  # E: Multiple values for argument `name`
+```
+
+## property-type-mismatch
+
+Default severity: `ignore`
+
+The `strict` preset enables this check as an error.
+
+Pyrefly reports a property setter whose value type cannot overlap the getter's return type.
+Such a property is type safe, but reading it back never returns a value of the type that was assigned, which is usually a mistake.
+A setter that accepts a wider or narrower type than the getter returns is not reported.
+
+```python
+class Config:
+    @property
+    def port(self) -> int: ...
+
+    @port.setter
+    def port(self, value: str) -> None: ...  # property-type-mismatch
 ```
 
 ## protected-access
@@ -2050,7 +2253,7 @@ s = typing.cast(str, obj)  # No warning - this is a valid cast
 
 Default severity: `warn`
 
-This error is used to indicate a type that's equivalent to True or False is used as a boolean condition (e.g. an uncalled function)
+This warning flags predictably true or false conditions (e.g. an uncalled function) and nonempty tuple assertions.
 
 ```python
 def f() -> bool:
@@ -2062,6 +2265,20 @@ if f:
 # This is likely a mistake, as it's equivalent to `if True`.
 if "abc":
   ...
+```
+
+## redundant-type-check
+
+Default severity: `ignore`
+
+This warning flags `isinstance` and `issubclass` conditions whose result is determined by the inferred types. Only named callees and values, with named classes or flat tuples of class names, are checked. Gradual types, protocols and custom metaclasses represented in typing metadata, and numeric promotion are excluded; direct assertions are exempt.
+
+Intentional runtime validation can be redundant under annotations. Enable this warning with `pyrefly check --warn=redundant-type-check example.py`; its severity is independent of `redundant-condition`.
+
+```python
+def check(value: int) -> None:
+    if isinstance(value, int):  # redundant-type-check
+        print(value)
 ```
 
 ## regex
@@ -2136,11 +2353,35 @@ class MyProto(Protocol):
     x: int | None = None
 ```
 
+## unannotated-public-return
+
+Default severity: `ignore`
+
+A public function is missing a return annotation. Here, public means a name without a leading underscore (or a dunder name), with only public classes as enclosing scopes. Functions nested inside functions are excluded. This is a name-based check: it does not follow `__all__`, re-exports, or module visibility. As with [unannotated-return](#unannotated-return), `__init__` methods and `@no_type_check` functions are exempt.
+
+To require return annotations only on public functions:
+
+```toml
+[errors]
+unannotated-return = "ignore"
+unannotated-public-return = "error"
+```
+
+```python
+def calculate_sum(x: int, y: int):  # error: missing a return annotation
+    return x + y
+
+def _helper():  # private: return type is inferred
+    return 1
+```
+
+This is a sub-kind of `unannotated-return`: it inherits that code's configured severity unless overridden explicitly. Suppressing `unannotated-return` also suppresses this code.
+
 ## unannotated-return
 
 Default severity: `ignore`
 
-This error is raised when a function is missing a return type annotation. This helps enforce fully-typed codebases by ensuring all functions declare their return types explicitly. To fix it, add a return type annotation to the function.
+This error is raised when a function is missing a return type annotation. This helps enforce fully-typed codebases by ensuring all functions declare their return types explicitly. Public functions are reported under the [unannotated-public-return](#unannotated-public-return) sub-kind. To fix it, add a return type annotation to the function.
 
 ```python
 def calculate_sum(x: int, y: int):  # error: `calculate_sum` is missing a return annotation
@@ -2197,6 +2438,18 @@ def takes_kwonly(*, x: int) -> int:
   ...
 
 takes_kwonly(1)  # should be `takes_kwonly(x=1)`!
+```
+
+## unhashable
+
+Default severity: `warn`
+
+A set element or dictionary key has a type that is not hashable, so building the
+set or dictionary raises `TypeError` at runtime.
+
+```python
+{[1, 2]}  # unhashable
+{[1, 2]: "a"}  # unhashable
 ```
 
 ## unimported-directive
@@ -2375,8 +2628,7 @@ a, b = untyped(1)  # the types of `a` and `b` are unknown
 
 Default severity: `warn`
 
-This warning is raised when an identity comparison (`is` or `is not`) is made between
-literals whose comparison result is statically known.
+This warning flags identity or builtin membership comparisons whose result is statically known.
 
 ```python
 def test0() -> None:
@@ -2408,6 +2660,21 @@ This warning is raised when a builtin type constructor (`str`, `int`, `float`, `
 def f(x: str) -> None:
     y = str(x)  # unnecessary-type-conversion: `x` is already of type `str`
 ```
+
+## unnecessary-type-var
+
+Default severity: `ignore`
+
+A function-scoped type variable that appears only once in the function's signature relates no
+types, so its bound (or `object`) can be used instead. Nested uses such as `list[T]` are not
+reported, because `list[T]` accepts lists that `list[object]` does not.
+
+```python
+def log[T](value: T) -> None:  # unnecessary-type-var: use `object` instead
+    print(value)
+```
+
+This is a sub-kind of [invalid-type-var](#invalid-type-var): suppressing `invalid-type-var` also suppresses this error.
 
 ## unreachable
 
@@ -2491,43 +2758,21 @@ __all__ = generate_all()
 # `__all__` could not be statically analyzed [unresolvable-dunder-all]
 ```
 
-## unresolved-import-signature
+## unsafe-multiple-inheritance
 
-Default severity: `warn`
+Default severity: `ignore`
 
-For example, when `missing_backend` cannot be resolved:
+A class inherits from multiple base classes that define `__init__`. Only one of them is called directly when the class is instantiated, and whether the others are called depends on cooperative `super()` calls and the method resolution order, so there is no way to guarantee that they are called with the correct arguments, or at all. This matches basedpyright's `reportUnsafeMultipleInheritance`.
 
 ```python
-from missing_backend import Array
+class A:
+    def __init__(self) -> None: ...
 
+class B:
+    def __init__(self) -> None: ...
 
-def consume(value: Array) -> None: ...
-
-
-value = object()
-consume(value)  # unresolved-import-signature
+class C(A, B): ...  # unsafe-multiple-inheritance: `B.__init__` may not get called
 ```
-
-This warning is emitted when a call needs input types recovered from unresolved
-imports. Known alternatives such as `int` in `int | missing.Array` remain usable,
-and an omitted optional parameter does not make the call unavailable. The warning
-is reported for the signature, not separately for each affected parameter.
-
-In overloaded functions, each signature is checked independently. Unavailable
-candidates do not prevent another overload from matching. If only one overload has
-compatible arity, it can still supply recovery information while this warning is
-reported. When no overload matches, `no-matching-overload` may also be reported.
-Configuring this warning to `ignore` hides it without restoring skipped candidates.
-
-Explicit `Any` and imports intentionally replaced with `Any` are unaffected.
-Passing an unknown value to a well-defined generic API does not make its signature
-unavailable.
-
-This check does not validate every imported annotation. Return-only and nested
-contravariant dependencies can still weaken inference or shadow a usable overload.
-In non-overloaded calls, arguments containing calls or contextual
-lambda/comprehension bindings are not checked for this warning and retain their
-normal contextual typing.
 
 ## unsafe-overlap
 
@@ -2590,14 +2835,14 @@ x = 1 + "oops"  # `+` is not supported between `int` and `str` [unsupported-oper
 
 Default severity: `ignore`
 
-A class decorator may modify the class in unexpected ways, either because the decorator's own type is `Any` or because it returns an unknown type. This mirrors pyright's `reportUntypedClassDecorator`, except that fully unannotated decorators are also reported. A decorator annotated to return an explicit `Any` is treated as intentional and is not reported.
+A class decorator may modify the class in unexpected ways, either because the decorator's own type is `Any` or because it returns an unknown type. Under [`class-decorator-behavior = "typed-only"`](../configuration#class-decorator-behavior), a partly unknown result, such as `list[Unknown]`, is also reported. Pyrefly keeps the class's type in all of these cases. This mirrors pyright's `reportUntypedClassDecorator`, except that fully unannotated decorators are also reported. A decorator annotated to return an explicit `Any` is treated as intentional and is not reported.
 
 ```python
 from typing import Any
 
 my_decorator: Any = lambda cls: cls
 
-@my_decorator  # `my_decorator` is `Any`, so the type of `A` is lost [untyped-class-decorator]
+@my_decorator  # `my_decorator` is `Any`, so it may change `A` [untyped-class-decorator]
 class A: ...
 
 def unannotated(cls):  # returns an implicit `Any`
@@ -2611,17 +2856,9 @@ class B: ...
 
 Default severity: `ignore`
 
-A function or method decorator obscures the decorated function's type, either because the decorator's own type is `Any` or because applying it produces an unknown type. This mirrors pyright's `reportUntypedFunctionDecorator`, except that fully unannotated decorators are also reported. A decorator annotated to return an explicit `Any` is treated as intentional and is not reported.
+A function or method decorator obscures the decorated function's type because the decorator's own type or its result is an implicit `Any` (unknown). Fully unannotated decorators are also reported. Explicit `Any` is covered separately by [`any-function-decorator`](#any-function-decorator).
 
 ```python
-from typing import Any
-
-my_decorator: Any = lambda f: f
-
-@my_decorator  # `my_decorator` is `Any`, so the type of `g` is lost [untyped-function-decorator]
-def g() -> int:
-    return 1
-
 def unannotated(f):  # returns an implicit `Any`
     return f
 
@@ -2639,6 +2876,22 @@ library's source code. This error is emitted when we detect that a library is be
 the recommended stubs package being installed. It only applies to libraries found on the site package
 path that do not ship a `py.typed` file; modules found on the search path, such as local stubs in a
 `typings/` directory or your own code, are never reported.
+
+## untyped-import-no-stubs
+
+Default severity: `ignore`
+
+An installed third-party module has no applicable `.pyi` stub file or `py.typed` marker,
+and Pyrefly has no separately distributed stubs package to recommend for it, including modules omitted by
+partial stubs. Enable this rule with
+`untyped-import-no-stubs = "error"` in `[errors]` to identify libraries that need
+custom stubs. Modules on the search path or in editable installations are not reported;
+known stubs packages are covered by `untyped-import`.
+
+```python
+# With pymsteams installed without stubs or py.typed:
+from pymsteams import TeamsWebhookException  # untyped-import-no-stubs
+```
 
 ## untyped-namedtuple
 
@@ -2764,11 +3017,6 @@ This warning suggests covariance or contravariance for an invariant protocol
 only returns `T`, the warning suggests declaring `T` as covariant. Incorrect usage
 of an explicitly covariant or contravariant `TypeVar` is reported as
 [`invalid-variance`](#invalid-variance) instead.
-
-Constrained `TypeVar`s, such as `TypeVar("T", str, bytes)`, are exempt from this
-warning. Constraints commonly describe a fixed set of unrelated alternatives, so
-invariance is often sufficient and narrower-variance suggestions are noisy.
-Bounded `TypeVar`s, such as `TypeVar("T", bound=float)`, are still checked.
 
 ```python
 from typing import Protocol, TypeVar

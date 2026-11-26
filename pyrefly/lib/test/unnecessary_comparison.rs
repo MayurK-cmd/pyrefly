@@ -5,6 +5,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use pyrefly_python::sys_info::PythonVersion;
+
+use crate::test::util::TestEnv;
 use crate::testcase;
 
 testcase!(
@@ -136,5 +139,141 @@ from collections.abc import Hashable
 def f(x: Hashable):
     if x is int:  # OK - class objects may satisfy protocols
         pass
+"#,
+);
+
+testcase!(
+    test_unnecessary_membership,
+    r#"
+from typing import Any, assert_type
+
+class Equal:
+    def __eq__(self, other: object) -> bool:
+        return True
+class Container:
+    def __contains__(self, value: object) -> bool:
+        return True
+
+def check(value: int, texts: list[str], names: set[str], keys: dict[str, int],
+          fixed: tuple[str, bytes], variable: tuple[str, ...], empty: tuple[()],
+          containers: list[str] | set[bytes], mixed: list[str] | list[int],
+          unknown: Any, gradual: list[Any], numbers: list[int], equal: Equal,
+          custom: Container):
+    result = value in texts  # E: Membership test `in` is always False
+    assert_type(result, bool)
+    if value not in names: pass  # E: Membership test `not in` is always True
+    if value in keys: pass  # E: Membership test `in` is always False
+    if value in fixed: pass  # E: Membership test `in` is always False
+    if value in variable: pass  # E: Membership test `in` is always False
+    if value in empty: pass  # E: Membership test `in` is always False
+    if value in containers: pass  # E: Membership test `in` is always False
+    if value in mixed: pass
+    if unknown in texts: pass
+    if value in gradual: pass
+    if True in numbers: pass
+    if 1.0 in numbers: pass
+    if equal in texts: pass
+    if value in custom: pass
+    if "" in "abc": pass
+"#,
+);
+
+// https://github.com/pyrefly-org/pyrefly/issues/5150
+testcase!(
+    test_enum_members_with_equal_values,
+    r#"
+from dataclasses import dataclass
+from enum import Enum, IntEnum
+
+@dataclass
+class Foo: ...
+
+class X(IntEnum):
+    A = 1
+
+class Y(IntEnum):
+    B = 1
+
+class E(Enum):
+    A = Foo()
+    B = Foo()
+
+class F(Enum):
+    A = 2.0
+    B = 2.0
+
+class G(Enum):
+    A = 1
+    B = True
+
+class H(Enum):
+    A = X.A
+    B = Y.B
+
+if E.A is E.B:
+    pass
+if F.A is F.B:
+    pass
+if G.A is G.B:
+    pass
+if H.A is H.B:
+    pass
+"#,
+);
+
+testcase!(
+    test_enum_members_with_distinct_values,
+    r#"
+from enum import Enum
+
+class E(Enum):
+    A = 1
+    B = 2
+
+if E.A is E.B:  # E: Identity comparison `E.A is E.B` is always False
+    pass
+if E.A is not E.B:  # E: Identity comparison `E.A is not E.B` is always True
+    pass
+"#,
+);
+
+testcase!(
+    test_enum_auto_members,
+    r#"
+from enum import Enum, auto
+
+class E(Enum):
+    X = auto()
+    Y = auto()
+
+class F(Enum):
+    @staticmethod
+    def _generate_next_value_(name: str, start: int, count: int, last_values: list[int]) -> int:
+        return 1
+
+    X = auto()
+    Y = auto()
+
+if E.X is E.Y:  # E: Identity comparison `E.X is E.Y` is always False
+    pass
+if F.X is F.Y:
+    pass
+"#,
+);
+
+testcase!(
+    test_enum_auto_members_before_3_13,
+    TestEnv::new_with_version(PythonVersion::new(3, 12, 0)),
+    r#"
+from enum import Enum, auto
+
+class E(Enum):
+    X = auto()
+    S = "s"
+    Z = 0
+    Y = auto()  # 1 at runtime, the same as `X`
+
+if E.X is E.Y:
+    pass
 "#,
 );

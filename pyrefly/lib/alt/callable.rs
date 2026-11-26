@@ -19,9 +19,11 @@ use pyrefly_types::literal::Lit;
 use pyrefly_types::literal::LitStyle;
 use pyrefly_types::simplify::simplify_tuples;
 use pyrefly_types::tuple::Tuple;
+use pyrefly_types::typed_dict::ANONYMOUS_TYPED_DICT;
 use pyrefly_types::typed_dict::ExtraItems;
 use pyrefly_types::types::TArgs;
 use pyrefly_types::types::TParams;
+use pyrefly_util::display::DisplayWithCtx;
 use pyrefly_util::display::count;
 use pyrefly_util::display::pluralize;
 use pyrefly_util::owner::Owner;
@@ -808,15 +810,13 @@ impl CallArgPreEval<'_> {
                     solver.maybe_error_any_argument_type(&ty, range, arg_errors);
                     return Some(ty);
                 }
-                let ty = solver
-                    .expr_with_argument_cache(
-                        x,
-                        ExprOptions::check(hint, arg_errors, call_errors, tcc, Some(call_context)),
-                        cache,
-                    )
-                    .into_ty();
-                solver.maybe_error_any_argument_type(&ty, range, arg_errors);
-                Some(ty)
+                let (checked, inferred) = solver.expr_with_argument_cache_and_inferred(
+                    x,
+                    ExprOptions::check(hint, arg_errors, call_errors, tcc, Some(call_context)),
+                    cache,
+                );
+                solver.maybe_error_any_argument_type(checked.ty(), range, arg_errors);
+                Some(inferred)
             }
             Self::Star {
                 prefix,
@@ -908,27 +908,61 @@ impl CallArgPreEval<'_> {
 pub struct MatchedParam {
     pub ty: Type,
     pub name: Option<Name>,
+    /// The inferred input before its check against `ty`, including failed checks.
+    /// Unpacking and specialized pattern checks can leave this unavailable.
+    pub arg_ty: Option<Type>,
 }
 
 impl MatchedParam {
-    fn new(ty: Type, name: Option<Name>) -> Self {
-        Self { ty, name }
+    fn new(ty: Type, name: Option<Name>, arg_ty: Option<Type>) -> Self {
+        Self { ty, name, arg_ty }
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct ArgMap {
     pub arg_to_param: HashMap<ArgumentKey, MatchedParam>,
+    ambiguous_arguments: SmallSet<ArgumentKey>,
     /// Required parameters that were left unmatched
     pub unmatched_params: SmallSet<Option<Name>>,
+    /// Positional slots skipped before the first exposed source argument.
+    /// Counts implicit receivers and synthetic prefixes omitted from that source view.
+    positional_offset: usize,
 }
 
 impl ArgMap {
     pub fn new() -> Self {
         Self {
             arg_to_param: HashMap::new(),
+            ambiguous_arguments: SmallSet::new(),
             unmatched_params: SmallSet::new(),
+            positional_offset: 0,
         }
+    }
+
+    /// Read the inferred input using the exposed source call's argument indices.
+    pub(crate) fn source_argument_type(&self, argument: ArgumentKey) -> Option<&Type> {
+        let argument = match argument {
+            ArgumentKey::Positional(index) => {
+                ArgumentKey::Positional(index + self.positional_offset)
+            }
+            ArgumentKey::Keyword(index) => ArgumentKey::Keyword(index),
+        };
+        self.arg_to_param.get(&argument)?.arg_ty.as_ref()
+    }
+
+    /// Expose inputs for a source call that omits this call's leading argument.
+    /// Stored matching keys stay unchanged; only source positional lookups shift.
+    pub(crate) fn without_first_positional_argument(mut self) -> Self {
+        self.positional_offset += 1;
+        self
+    }
+
+    pub(crate) fn parameter_name(&self, argument: ArgumentKey) -> Option<&Name> {
+        if self.ambiguous_arguments.contains(&argument) {
+            return None;
+        }
+        self.arg_to_param.get(&argument)?.name.as_ref()
     }
 
     fn insert(
@@ -936,9 +970,18 @@ impl ArgMap {
         argument: ArgumentKey,
         ty: Type,
         name: Option<Name>,
+        arg_ty: Option<Type>,
     ) -> Option<MatchedParam> {
+        // A splat can match multiple parameters under the same argument key.
+        if self
+            .arg_to_param
+            .get(&argument)
+            .is_some_and(|param| param.name != name)
+        {
+            self.ambiguous_arguments.insert(argument);
+        }
         self.arg_to_param
-            .insert(argument, MatchedParam::new(ty, name))
+            .insert(argument, MatchedParam::new(ty, name, arg_ty))
     }
 }
 
@@ -971,7 +1014,7 @@ impl<'a> PosParam<'a> {
                 name: Some(name),
                 kind: PosParamKind::Positional,
             }),
-            Param::Varargs(name, Type::Unpack(ty)) => Some(Self {
+            Param::Varargs(name, Type::Unpack(ty, ..)) => Some(Self {
                 ty: &**ty,
                 name: name.as_ref(),
                 kind: PosParamKind::Unpacked,
@@ -1038,7 +1081,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 );
             }
             Type::Any(AnyStyle::Error | AnyStyle::MissingImport) => {
-                self.error_unknown_from_error(arg_errors, range, "The type of this argument")
+                self.error_unknown_from_error(arg_errors, range, range, "The type of this argument")
             }
             Type::Any(AnyStyle::Explicit) => {
                 self.error_explicit_any_use(arg_errors, range, "The type of this argument")
@@ -1172,7 +1215,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 format!(
                     "{}{}",
                     msg,
-                    function_suffix(callable_name, self.module().name())
+                    function_suffix(self, callable_name, self.module().name())
                 ),
                 context,
             )
@@ -1222,10 +1265,26 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     }
                 }
                 TypeOrExpr::Type(ty, _) => match ty {
-                    Type::TypedDict(typed_dict) | Type::PartialTypedDict(typed_dict) => {
+                    Type::ClassType(typed_dict)
+                        if self.is_typed_dict_class(typed_dict.class_object()) =>
+                    {
                         for (name, field) in self.typed_dict_fields(typed_dict) {
                             if field.required {
                                 keyword_arg_names.insert(name);
+                            }
+                        }
+                    }
+                    Type::PartialTypedDict(class_type) => {
+                        for (name, field) in self.typed_dict_fields(class_type) {
+                            if field.required {
+                                keyword_arg_names.insert(name);
+                            }
+                        }
+                    }
+                    Type::AnonymousTypedDict(typed_dict) => {
+                        for (name, field) in &typed_dict.fields {
+                            if field.required {
+                                keyword_arg_names.insert(name.clone());
                             }
                         }
                     }
@@ -1263,7 +1322,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         // (forwarding case), meaning the caller should validate that the
         // remaining args are `*P.args` / `**P.kwargs` and stop matching.
         let var_to_rparams = |var| -> Result<Vec<&Param>, Box<Quantified>> {
-            let ps = match self.solver().force_var(var) {
+            let ps = match self.solver().force_var(var, self) {
                 Type::ParamSpecValue(ps) => ps,
                 Type::Any(_) | Type::Ellipsis => ParamList::everything(),
                 Type::Concatenate(prefix, _) => {
@@ -1281,7 +1340,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         call_errors,
                         arguments_range,
                         ErrorKind::BadArgumentType,
-                        format!("Expected `{}` to be a ParamSpec value", self.for_display(t)),
+                        format!("Expected `{}` to be a ParamSpec value", self.display(t)),
                     );
                     ParamList::everything()
                 }
@@ -1353,7 +1412,6 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                             // We ignore positional-only parameters because they can't be passed in by name.
                             seen_names.insert(name, (ty, NameOrigin::Param, true));
                         }
-                        argmap.insert(argument, ty.clone(), name.cloned());
                         if match arg_pre {
                             CallArgPreEval::Expr(Expr::Lambda(_), _, _) => true,
                             CallArgPreEval::Expr(..) | CallArgPreEval::Type(..) => {
@@ -1362,6 +1420,8 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                             }
                             _ => false,
                         } {
+                            // Reserve the same source key that the deferred check will fill.
+                            argmap.insert(argument, ty.clone(), name.cloned(), None);
                             deferred_callbacks.push((
                                 arg_pre.clone(),
                                 ty,
@@ -1371,7 +1431,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                             ));
                             arg_pre.mark_done();
                         } else {
-                            arg_pre.post_check(
+                            let arg_ty = arg_pre.post_check(
                                 self,
                                 callable_name,
                                 ty,
@@ -1384,6 +1444,12 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                                 context,
                                 call_context,
                             );
+                            let arg_ty = if matches!(arg, CallArg::Arg(_)) {
+                                arg_ty
+                            } else {
+                                None
+                            };
+                            argmap.insert(argument, ty.clone(), name.cloned(), arg_ty);
                         }
                     }
                     Some(PosParam {
@@ -1393,7 +1459,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     }) => {
                         // Store args that get matched to an unpacked *args param
                         // Matched args are typechecked separately later
-                        argmap.insert(argument, ty.clone(), name.cloned());
+                        argmap.insert(argument, ty.clone(), name.cloned(), None);
                         unpacked_vararg = Some((name, ty));
                         unpacked_vararg_matched_args.push((arg_pre.clone(), arg.range()));
                         arg_pre.post_skip();
@@ -1403,8 +1469,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         name,
                         kind: PosParamKind::Variadic,
                     }) => {
-                        argmap.insert(argument, ty.clone(), name.cloned());
-                        arg_pre.post_check(
+                        let arg_ty = arg_pre.post_check(
                             self,
                             callable_name,
                             ty,
@@ -1417,6 +1482,12 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                             context,
                             call_context,
                         );
+                        let arg_ty = if matches!(arg, CallArg::Arg(_)) {
+                            arg_ty
+                        } else {
+                            None
+                        };
+                        argmap.insert(argument, ty.clone(), name.cloned(), arg_ty);
                     }
                     None => {
                         arg_pre.post_infer(self, arg_errors);
@@ -1455,7 +1526,13 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 let specialization_errors =
                     self.finish_quantified(self_qs, self.solver().config.infer_with_first_use);
                 if let Err(errors) = specialization_errors {
-                    self.add_specialization_errors(errors, arg.range(), call_errors, context);
+                    self.add_specialization_errors(
+                        errors,
+                        Some(&argmap),
+                        arg.range(),
+                        call_errors,
+                        context,
+                    );
                 }
             }
         }
@@ -1659,7 +1736,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     }
                     Required::Optional(None) => {}
                 },
-                Param::Varargs(name, Type::Unpack(unpacked)) => {
+                Param::Varargs(name, Type::Unpack(unpacked, ..)) => {
                     if !has_matched_unpacked_vararg {
                         if let Some(pattern) = map_int_tuples_parameter_pattern(unpacked) {
                             self.check_map_int_tuples_parameter_pattern(
@@ -1712,20 +1789,19 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     kwparams.insert(name, (ty, NameOrigin::Param, required));
                 }
                 Param::Kwargs(name, ty) if let Some(typed_dict) = ty.unpacked_typed_dict() => {
+                    // Synthesized partial signatures may override a bound TypedDict key with
+                    // an optional named parameter while preserving the original Unpack tail.
                     self.typed_dict_fields(typed_dict).into_iter().for_each(
                         |(field_name, field)| {
-                            kwparams.insert(
-                                name_owner.push(field_name),
-                                (
-                                    type_owner.push(field.ty),
-                                    NameOrigin::UnpackedKwargs(name.as_ref()),
-                                    if field.required {
-                                        &Required::Required
-                                    } else {
-                                        &Required::Optional(None)
-                                    },
-                                ),
-                            );
+                            kwparams.entry(name_owner.push(field_name)).or_insert((
+                                type_owner.push(field.ty),
+                                NameOrigin::UnpackedKwargs(name.as_ref()),
+                                if field.required {
+                                    &Required::Required
+                                } else {
+                                    &Required::Optional(None)
+                                },
+                            ));
                         },
                     );
                     kwargs = match self.typed_dict_extra_items(typed_dict) {
@@ -1773,13 +1849,29 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 None => {
                     let ty = kw.value.infer(self, arg_errors);
                     self.maybe_error_any_argument_type(&ty, kw.range, arg_errors);
-                    if let Type::TypedDict(typed_dict) = ty {
-                        let fields = self.typed_dict_fields(&typed_dict);
-                        // A non-closed TypedDict may carry arbitrary unknown keys, which can
-                        // match the callee's kwargs or any of its unmatched keyword params. An
-                        // anonymous TypedDict comes from a dict display, whose keys are all known.
-                        let extra_items = self.typed_dict_extra_items(&typed_dict);
-                        let anonymous = typed_dict.is_anonymous();
+                    // Both declared and anonymous TypedDicts splat into individual keyword
+                    // arguments, but they resolve their name, fields and extra items differently.
+                    // A non-closed declared TypedDict may carry arbitrary unknown keys, which can
+                    // match the callee's kwargs or any of its unmatched keyword params. An
+                    // anonymous TypedDict comes from a dict display, whose keys are all known.
+                    let typed_dict = match &ty {
+                        Type::ClassType(ct) if self.is_typed_dict_class(ct.class_object()) => {
+                            Some((
+                                ct.name(self).clone(),
+                                self.typed_dict_fields(ct),
+                                self.typed_dict_extra_items(ct),
+                                false,
+                            ))
+                        }
+                        Type::AnonymousTypedDict(td) => Some((
+                            ANONYMOUS_TYPED_DICT.clone(),
+                            td.fields.iter().cloned().collect(),
+                            ExtraItems::Closed,
+                            true,
+                        )),
+                        _ => None,
+                    };
+                    if let Some((td_name, fields, extra_items, anonymous)) = typed_dict {
                         if let Some(capture) = &mut named_ints_capture {
                             for (name, field) in fields.iter() {
                                 if !kwparams.contains_key(name)
@@ -1792,11 +1884,11 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                                     );
                                 }
                             }
-                            if !anonymous && !matches!(extra_items, ExtraItems::Closed) {
+                            if !matches!(extra_items, ExtraItems::Closed) {
                                 capture.mark_open();
                             }
                         }
-                        if !anonymous && !matches!(extra_items, ExtraItems::Closed) {
+                        if !matches!(extra_items, ExtraItems::Closed) {
                             let open = matches!(extra_items, ExtraItems::Default);
                             let extra_ty = extra_items.extra_item(self.stdlib).ty;
                             match &kwargs {
@@ -1811,8 +1903,8 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                                         },
                                         format!(
                                             "`{}` may contain extra items of type `{}`, which cannot be unpacked into a callable that accepts no extra keyword arguments",
-                                            typed_dict.name(),
-                                            self.for_display(extra_ty.clone()),
+                                            td_name,
+                                            self.display(extra_ty.clone()),
                                         ),
                                     );
                                 }
@@ -1931,7 +2023,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                                         ErrorKind::BadUnpacking,
                                         format!(
                                             "Expected argument after ** to have `str` keys, got: {}",
-                                            self.for_display(key)
+                                            self.display(key)
                                         ),
                                     );
                                 }
@@ -1943,7 +2035,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                                     ErrorKind::BadUnpacking,
                                     format!(
                                         "Expected argument after ** to be a mapping, got: {}",
-                                        self.for_display(ty)
+                                        self.display(ty)
                                     ),
                                 );
                             }
@@ -1981,13 +2073,6 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     {
                         unexpected_keyword_error(&id.id, id.range);
                     }
-                    if let Some((origin, expected)) = &hint {
-                        let name = match origin {
-                            NameOrigin::Param => Some(id.id.clone()),
-                            NameOrigin::UnpackedKwargs(kwargs_name) => kwargs_name.cloned(),
-                        };
-                        argmap.insert(argument, (*expected).clone(), name);
-                    }
                     let tcc: &dyn Fn() -> TypeCheckContext = &|| {
                         TypeCheckContext::of_kind(if has_matching_param {
                             TypeCheckKind::CallArgument(Some(id.id.clone()), callable_name.cloned())
@@ -2000,7 +2085,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         })
                         .with_context(context.map(|ctx| ctx()))
                     };
-                    let arg_ty = if let Some(pattern) = hint
+                    let (arg_ty, inferred_input) = if let Some(pattern) = hint
                         .as_ref()
                         .and_then(|(_, hint)| map_int_tuples_parameter_pattern(hint))
                     {
@@ -2010,7 +2095,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                                 MapIntTuplesPatternArgument::Type((*ty).clone())
                             }
                         };
-                        self.check_map_int_tuples_parameter_pattern(
+                        let arg_ty = self.check_map_int_tuples_parameter_pattern(
                             pattern,
                             argument,
                             kw.range,
@@ -2019,25 +2104,28 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                             tcc,
                             call_context,
                             context,
-                        )
+                        );
+                        (arg_ty, None)
                     } else {
                         match kw.value.as_type_or_expr() {
-                            TypeOrExpr::Expr(x) => self
-                                .expr_with_argument_cache(
-                                    x,
-                                    match hint {
-                                        Some((_, ty)) => ExprOptions::check(
-                                            ty,
-                                            arg_errors,
-                                            call_errors,
-                                            tcc,
-                                            Some(call_context),
-                                        ),
-                                        None => ExprOptions::infer(arg_errors, None),
-                                    },
-                                    kw.value.argument_cache(),
-                                )
-                                .into_ty(),
+                            TypeOrExpr::Expr(x) => {
+                                let (checked, inferred) = self
+                                    .expr_with_argument_cache_and_inferred(
+                                        x,
+                                        match hint {
+                                            Some((_, ty)) => ExprOptions::check(
+                                                ty,
+                                                arg_errors,
+                                                call_errors,
+                                                tcc,
+                                                Some(call_context),
+                                            ),
+                                            None => ExprOptions::infer(arg_errors, None),
+                                        },
+                                        kw.value.argument_cache(),
+                                    );
+                                (checked.into_ty(), Some(inferred))
+                            }
                             TypeOrExpr::Type(x, range) => {
                                 if let Some((_, hint)) = &hint
                                     && !hint.is_any()
@@ -2050,7 +2138,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                                             .with_call_context(call_context),
                                     );
                                 }
-                                (*x).clone()
+                                ((*x).clone(), Some((*x).clone()))
                             }
                         }
                     };
@@ -2061,6 +2149,13 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         && let Some(capture) = &mut named_ints_capture
                     {
                         capture.insert(id.id.clone(), value, true);
+                    }
+                    if let Some((origin, expected)) = &hint {
+                        let name = match origin {
+                            NameOrigin::Param => Some(id.id.clone()),
+                            NameOrigin::UnpackedKwargs(kwargs_name) => kwargs_name.cloned(),
+                        };
+                        argmap.insert(argument, (*expected).clone(), name, inferred_input);
                     }
                 }
             }
@@ -2174,15 +2269,18 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             }
         }
         for (name, ty, default) in default_check {
+            let Some(default_ty) = &default.ty else {
+                continue;
+            };
             // `ty` may contain type variables, so we record quantified bounds from the default and
             // check for inconsistent solutions. We mark any literals in the default as implicit so
             // that ordinary type variables get solved to promoted types (`int` rather than
             // `Literal[N]`). A shape-extension restriction's single binding source preserves the
             // literal instead.
             let default_ty = if call_context.is_shape_extension_var_type(ty) {
-                default.ty.clone()
+                default_ty.clone()
             } else {
-                default.ty.clone().with_literal_style(LitStyle::Implicit)
+                default_ty.clone().with_literal_style(LitStyle::Implicit)
             };
             self.check_type_with_options(
                 &default_ty,
@@ -2197,27 +2295,30 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 .with_call_context(call_context),
             );
         }
-        for (mut arg, hint, name, range, argument) in deferred_callbacks {
+        for (mut arg, param_ty, name, range, argument) in deferred_callbacks {
             let call_context = &call_context.clone().with_argument(argument);
-            let mut hint = hint.clone();
+            let mut hint = param_ty.clone();
             // Read parameter bounds collected from the other arguments while leaving the return
             // type open for the argument to constrain. Every input of a DSL call in a parameter
             // type is now as solved as it will be, so the call is evaluated here.
             if let Type::Callable(callable) = &mut hint {
                 callable.params.visit_mut(&mut |ty| {
-                    self.solver().expand_with_bounds(ty);
-                    for error in ty.finalize_type_level_dsl_at_boundary() {
+                    self.solver().expand_with_bounds(ty, self);
+                    for error in ty.finalize_type_level_dsl_at_boundary(self) {
                         self.error_with_context(
                             call_errors,
                             range,
                             ErrorKind::UnsupportedOperation,
-                            format!("Cannot evaluate type-level shape DSL call: {error}"),
+                            format!(
+                                "Cannot evaluate type-level shape DSL call: {}",
+                                error.display_with(self)
+                            ),
                             context,
                         );
                     }
                 });
             }
-            arg.post_check(
+            let arg_ty = arg.post_check(
                 self,
                 callable_name,
                 &hint,
@@ -2230,6 +2331,8 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 context,
                 call_context,
             );
+            // Replace the entry made when the callback was deferred, now that its type is known.
+            argmap.insert(argument, param_ty.clone(), name.cloned(), arg_ty);
         }
         let num_extra_positional_args = extra_positional_args.len();
         if let Some(arg_range) = extra_arg_pos
@@ -2610,7 +2713,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         };
         let (mut self_qs, remaining_callable_qs) = if self_obj.is_some()
             && let Some(first_param) = callable.get_first_param()
-            // TODO(https://github.com/facebook/pyrefly/issues/105): handle nested vars
+            // TODO(https://github.com/pyrefly-org/pyrefly/issues/105): handle nested vars
             && matches!(first_param, Type::Var(_))
         {
             // Quantifieds in `self` need to be finished as soon as `self_arg` is matched, unlike
@@ -2622,6 +2725,9 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             (None, callable_qs)
         };
         call_boundary.defer_quantified(remaining_callable_qs);
+        // Count only receivers supplied outside args. __new__ can later move a cls
+        // already in args into self_obj without changing the source argument list.
+        let implicit_receiver_count = usize::from(self_obj.is_some());
         if let Some(targs) = ctor_targs.as_mut() {
             let qs = self.solver().freshen_class_targs(targs, self.uniques);
             extend_shape_extension_vars_from_targs(&mut shape_extension_vars, targs);
@@ -2649,7 +2755,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             arguments_range,
         });
         let self_arg = self_obj.as_ref().map(|ty| CallArg::ty(ty, arguments_range));
-        let argmap = match callable.params {
+        let mut argmap = match callable.params {
             Params::List(params) | Params::Partial(params) => self.callable_infer_params(
                 callable_name,
                 &params,
@@ -2665,17 +2771,38 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 &call_context,
             ),
             Params::Ellipsis | Params::Materialization => {
-                // Deal with Callable[..., R]
-                for arg in self_arg.iter().chain(args.iter()) {
-                    arg.pre_eval(self, arg_errors).post_infer(self, arg_errors)
+                let mut argmap = ArgMap::new();
+                for (index, arg) in self_arg.iter().chain(args.iter()).enumerate() {
+                    match arg {
+                        CallArg::Arg(value) => {
+                            let ty = value.infer(self, arg_errors);
+                            argmap.insert(
+                                ArgumentKey::Positional(index),
+                                self.heap.mk_any_implicit(),
+                                None,
+                                Some(ty),
+                            );
+                        }
+                        CallArg::Star(..) => {
+                            arg.pre_eval(self, arg_errors).post_infer(self, arg_errors);
+                        }
+                    }
                 }
-                for keyword in keywords {
-                    keyword.value.infer(self, arg_errors);
+                for (index, keyword) in keywords.iter().enumerate() {
+                    let ty = keyword.value.infer(self, arg_errors);
+                    if keyword.arg.is_some() {
+                        argmap.insert(
+                            ArgumentKey::Keyword(index),
+                            self.heap.mk_any_implicit(),
+                            None,
+                            Some(ty),
+                        );
+                    }
                 }
-                ArgMap::new()
+                argmap
             }
             Params::ParamSpec(concatenate, p) => {
-                let p = self.solver().expand(p);
+                let p = self.solver().expand(p, self);
                 match p {
                     Type::ParamSpecValue(params) => self.callable_infer_params(
                         callable_name,
@@ -2750,7 +2877,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                             call_errors,
                             arguments_range,
                             ErrorKind::InvalidParamSpec,
-                            format!("Unexpected ParamSpec type: `{}`", self.for_display(p)),
+                            format!("Unexpected ParamSpec type: `{}`", self.display(p)),
                             context,
                         );
                         ArgMap::new()
@@ -2758,6 +2885,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 }
             }
         };
+        argmap.positional_offset = implicit_receiver_count;
         if let Some(self_qs) = self_qs {
             call_boundary.defer_quantified(self_qs);
         }
@@ -2768,7 +2896,8 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         });
         if let Some(targs) = ctor_targs {
             let recorded_vars = call_context.captured_vars();
-            self.solver().generalize_class_targs(targs, &recorded_vars);
+            self.solver()
+                .generalize_class_targs(targs, &recorded_vars, self);
         }
         let (overload_table, finish_result, defaults_used) = self.solver().finish_call_boundary(
             self.solver().config.infer_with_first_use,

@@ -47,6 +47,7 @@ use crate::binding::polars::polars_column_mutation;
 use crate::config::error_kind::ErrorKind;
 use crate::error::collector::ErrorCollector;
 use crate::types::class::Class;
+use crate::types::env::TypeEnv;
 use crate::types::function::FuncDefId;
 use crate::types::function::FunctionKind;
 use crate::types::literal::Lit;
@@ -286,7 +287,7 @@ fn is_polars_selector_name(name: &Name) -> bool {
 /// Map a resolved type to the Polars dtype it names, e.g. the `pl.Float64` class to `Float64`.
 /// Only the modeled scalar dtypes are recognized, and only from a package whose dtype classes
 /// carry Polars' names and meanings; anything else is `None`.
-fn polars_dtype_from_type(ty: &Type) -> Option<PolarsDType> {
+fn polars_dtype_from_type<E: TypeEnv + ?Sized>(env: &E, ty: &Type) -> Option<PolarsDType> {
     let cls = match ty {
         Type::ClassDef(cls) => cls,
         Type::ClassType(cls) => cls.class_object(),
@@ -300,7 +301,7 @@ fn polars_dtype_from_type(ty: &Type) -> Option<PolarsDType> {
     {
         return None;
     }
-    PolarsDType::from_polars_name(cls.name().as_str())
+    PolarsDType::from_polars_name(cls.name(env).as_str())
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -417,13 +418,13 @@ impl PolarsFunction {
         }
     }
 
-    fn from_callee(callee: &Type) -> Option<Self> {
+    fn from_callee(env: &dyn TypeEnv, callee: &Type) -> Option<Self> {
         if let Type::ClassType(cls) = callee
             && is_polars_col(cls.class_object())
         {
             return Some(Self::Col);
         }
-        match callee.callee_kind() {
+        match callee.callee_kind(env) {
             Some(CalleeKind::Function(FunctionKind::Def(id))) => Some(Self::from_id(&id)),
             _ => None,
         }
@@ -431,8 +432,11 @@ impl PolarsFunction {
 }
 
 /// For a resolved `polars.col` or `polars.lit`, whether strings name columns rather than values.
-pub(crate) fn polars_function_treats_strings_as_columns(callee: &Type) -> Option<bool> {
-    match PolarsFunction::from_callee(callee)? {
+pub(crate) fn polars_function_treats_strings_as_columns(
+    env: &dyn TypeEnv,
+    callee: &Type,
+) -> Option<bool> {
+    match PolarsFunction::from_callee(env, callee)? {
         PolarsFunction::Col => Some(true),
         PolarsFunction::Lit => Some(false),
         _ => None,
@@ -445,31 +449,19 @@ enum CsvColumnSelection {
     Indices(SmallSet<usize>),
 }
 
+enum CsvSchema {
+    Missing,
+    Given(Vec<(Name, PolarsDType)>),
+}
+
 enum CsvDtypeOverrides {
     Unchanged,
     Sequence(Vec<PolarsDType>),
-}
-
-impl CsvDtypeOverrides {
-    /// A complete schema changes only for positional dtype overrides.
-    fn parse(
-        expr: Option<&Expr>,
-        parse_dtype: impl FnMut(&Expr) -> Option<PolarsDType>,
-    ) -> Option<Self> {
-        Some(match expr {
-            None | Some(Expr::NoneLiteral(_) | Expr::Dict(_)) => Self::Unchanged,
-            Some(expr) => Self::Sequence(
-                literal_sequence(expr)?
-                    .iter()
-                    .map(parse_dtype)
-                    .collect::<Option<Vec<_>>>()?,
-            ),
-        })
-    }
+    Mapping(SmallMap<Name, PolarsDType>),
 }
 
 struct PolarsCsvCommonOptions {
-    schema: Vec<(Name, PolarsDType)>,
+    schema: CsvSchema,
     overrides: CsvDtypeOverrides,
     new_columns: Vec<Name>,
     row_index_name: Option<Name>,
@@ -1218,7 +1210,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 },
             );
         }
-        match PolarsFunction::from_callee(callee) {
+        match PolarsFunction::from_callee(self, callee) {
             Some(PolarsFunction::Csv(function)) => {
                 return self
                     .infer_polars_csv_schema(arguments, function)
@@ -1286,7 +1278,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             return Some(dtype);
         }
         let ty = self.expr_infer(e, &self.error_swallower());
-        polars_dtype_from_type(&ty)
+        polars_dtype_from_type(self, &ty)
     }
 
     fn polars_nested_dtype_from_call(&self, call: &ExprCall) -> Option<PolarsDType> {
@@ -1298,7 +1290,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         if module.as_str() != POLARS_MODULE && !module.as_str().starts_with(POLARS_MODULE_PREFIX) {
             return None;
         }
-        match cls.name().as_str() {
+        match cls.name(self).as_str() {
             "Array" => {
                 if !arguments_are_valid(&call.arguments, 2, Some(&["inner", "shape"])) {
                     return None;
@@ -1436,7 +1428,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
     }
 
     /// Parse static projections; an empty sequence selects every column.
-    fn polars_csv_selection(&self, expr: &Expr, width: usize) -> Option<CsvColumnSelection> {
+    fn polars_csv_selection(&self, expr: &Expr) -> Option<CsvColumnSelection> {
         let values = literal_sequence(expr)?;
         if values.is_empty() {
             return Some(CsvColumnSelection::All);
@@ -1453,19 +1445,64 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             .iter()
             .map(|expr| usize::try_from(self.polars_int_literal(expr)?).ok())
             .collect::<Option<SmallSet<_>>>()?;
-        (indices.len() == values.len() && indices.iter().all(|index| *index < width))
-            .then_some(CsvColumnSelection::Indices(indices))
+        (indices.len() == values.len()).then_some(CsvColumnSelection::Indices(indices))
     }
 
-    fn polars_csv_schema(&self, expr: &Expr) -> Option<Vec<(Name, PolarsDType)>> {
-        let (form, dict) = self.schema_literal_dict(expr)?;
-        if dict.items.is_empty() {
-            return Some(Vec::new());
-        }
-        self.schema_dict_entries(form, dict)?
-            .into_iter()
-            .map(|(name, dtype)| Some((name, dtype?)))
-            .collect()
+    fn polars_csv_schema(&self, expr: Option<&Expr>) -> Option<CsvSchema> {
+        Some(match expr {
+            Some(expr) => {
+                let (form, dict) = self.schema_literal_dict(expr)?;
+                if dict.items.is_empty() {
+                    CsvSchema::Given(Vec::new())
+                } else {
+                    CsvSchema::Given(
+                        self.schema_dict_entries(form, dict)?
+                            .into_iter()
+                            .map(|(name, dtype)| Some((name, dtype?)))
+                            .collect::<Option<Vec<_>>>()?,
+                    )
+                }
+            }
+            None => CsvSchema::Missing,
+        })
+    }
+
+    fn polars_csv_schema_overrides(
+        &self,
+        expr: Option<&Expr>,
+        schema: &CsvSchema,
+    ) -> Option<CsvDtypeOverrides> {
+        Some(match expr {
+            Some(Expr::NoneLiteral(_)) => CsvDtypeOverrides::Unchanged,
+            // A complete schema changes only for positional dtype overrides.
+            Some(Expr::Dict(_)) if matches!(schema, CsvSchema::Given(_)) => {
+                CsvDtypeOverrides::Unchanged
+            }
+            Some(Expr::Dict(dict)) => {
+                let mut overrides = SmallMap::with_capacity(dict.items.len());
+                for item in &dict.items {
+                    let (Some(key), value) = (&item.key, &item.value) else {
+                        return None;
+                    };
+                    overrides.insert(
+                        self.polars_column_name(key)?,
+                        self.polars_dtype_from_expr(value)
+                            .unwrap_or(PolarsDType::Unknown),
+                    );
+                }
+                CsvDtypeOverrides::Mapping(overrides)
+            }
+            Some(expr) => CsvDtypeOverrides::Sequence(
+                literal_sequence(expr)?
+                    .iter()
+                    .map(|expr| {
+                        self.polars_dtype_from_expr(expr)
+                            .unwrap_or(PolarsDType::Unknown)
+                    })
+                    .collect(),
+            ),
+            None => CsvDtypeOverrides::Unchanged,
+        })
     }
 
     /// An omitted option and explicit `None` both represent semantic absence.
@@ -1492,18 +1529,28 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
     }
 
     /// Positional dtypes replace leading column dtypes unless the sequence is too large.
-    fn apply_polars_csv_sequence_overrides(
+    /// Mapped dtypes replace the dtypes of matching columns.
+    fn apply_polars_csv_overrides(
         columns: &mut [(Name, PolarsDType)],
         overrides: CsvDtypeOverrides,
     ) -> bool {
-        let CsvDtypeOverrides::Sequence(dtypes) = overrides else {
-            return true;
-        };
-        if dtypes.len() > columns.len() {
-            return false;
-        }
-        for ((_, dtype), override_dtype) in columns.iter_mut().zip(dtypes) {
-            *dtype = override_dtype;
+        match overrides {
+            CsvDtypeOverrides::Unchanged => {}
+            CsvDtypeOverrides::Sequence(dtypes) => {
+                if dtypes.len() > columns.len() {
+                    return false;
+                }
+                for ((_, dtype), override_dtype) in columns.iter_mut().zip(dtypes) {
+                    *dtype = override_dtype;
+                }
+            }
+            CsvDtypeOverrides::Mapping(map) => {
+                for (name, dtype) in columns.iter_mut() {
+                    if let Some(override_dtype) = map.get(name) {
+                        *dtype = override_dtype.clone();
+                    }
+                }
+            }
         }
         true
     }
@@ -1586,9 +1633,8 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             return None;
         }
 
-        let schema = self.polars_csv_schema(schema?)?;
-        let overrides =
-            CsvDtypeOverrides::parse(overrides, |expr| self.polars_dtype_from_expr(expr))?;
+        let schema = self.polars_csv_schema(schema)?;
+        let overrides = self.polars_csv_schema_overrides(overrides, &schema)?;
         let new_columns = self.polars_csv_names(new_columns)?;
         let row_index_name = self.polars_optional_csv_name(row_index_name)?;
         let common = PolarsCsvCommonOptions {
@@ -1602,7 +1648,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             PolarsCsvFunction::Read => {
                 let selection = match Self::non_none_csv_option(selection) {
                     None => CsvColumnSelection::All,
-                    Some(expr) => self.polars_csv_selection(expr, common.schema.len())?,
+                    Some(expr) => self.polars_csv_selection(expr)?,
                 };
                 PolarsCsvOptions::Read { common, selection }
             }
@@ -1626,17 +1672,30 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         selection: CsvColumnSelection,
     ) -> Option<Vec<(Name, PolarsDType)>> {
         let PolarsCsvCommonOptions {
-            schema: mut columns,
+            schema,
             overrides,
             new_columns,
             row_index_name,
         } = common;
+        let (mut columns, selection) = match schema {
+            CsvSchema::Given(columns) => (columns, selection),
+            CsvSchema::Missing => {
+                let CsvColumnSelection::Names(names) = selection else {
+                    return None;
+                };
+                let columns = names
+                    .into_iter()
+                    .map(|name| (name, PolarsDType::Unknown))
+                    .collect();
+                (columns, CsvColumnSelection::All)
+            }
+        };
         if matches!(&overrides, CsvDtypeOverrides::Sequence(_))
             && !matches!(selection, CsvColumnSelection::All)
         {
             return None;
         }
-        if !Self::apply_polars_csv_sequence_overrides(&mut columns, overrides) {
+        if !Self::apply_polars_csv_overrides(&mut columns, overrides) {
             return None;
         }
         if !matches!(selection, CsvColumnSelection::All) {
@@ -1644,6 +1703,11 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 && !names
                     .iter()
                     .all(|name| columns.iter().any(|(column, _)| column == name))
+            {
+                return None;
+            }
+            if let CsvColumnSelection::Indices(indices) = &selection
+                && indices.iter().any(|index| *index >= columns.len())
             {
                 return None;
             }
@@ -1674,12 +1738,15 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         include_file_paths: Option<Name>,
     ) -> Option<Vec<(Name, PolarsDType)>> {
         let PolarsCsvCommonOptions {
-            schema: mut columns,
+            schema,
             overrides,
             new_columns,
             row_index_name,
         } = common;
-        if !Self::apply_polars_csv_sequence_overrides(&mut columns, overrides)
+        let CsvSchema::Given(mut columns) = schema else {
+            return None;
+        };
+        if !Self::apply_polars_csv_overrides(&mut columns, overrides)
             || !Self::apply_polars_csv_row_index(&mut columns, row_index_name)
             || !Self::apply_polars_csv_new_columns(&mut columns, new_columns)
         {
@@ -1833,7 +1900,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         }
         let mut columns = Vec::with_capacity(fields.len());
         for (name, field) in &fields {
-            columns.push((name.clone(), polars_dtype_from_type(&field.ty())?));
+            columns.push((name.clone(), polars_dtype_from_type(self, &field.ty())?));
         }
         Some(columns)
     }
@@ -1844,10 +1911,13 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         expr: &Expr,
     ) -> Option<(Vec<(Name, PolarsDType)>, SchemaCompleteness)> {
         let ty = self.expr_infer(expr, &self.error_swallower());
-        let Type::TypedDict(typed_dict) = &ty else {
-            return None;
+        let fields = match &ty {
+            Type::ClassType(ct) if self.is_typed_dict_class(ct.class_object()) => {
+                self.typed_dict_fields(ct)
+            }
+            Type::AnonymousTypedDict(typed_dict) => typed_dict.fields.iter().cloned().collect(),
+            _ => return None,
         };
-        let fields = self.typed_dict_fields(typed_dict);
         if fields.is_empty() {
             return None;
         }
@@ -2775,7 +2845,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
     }
 
     fn polars_function(&self, func: &Expr) -> Option<PolarsFunction> {
-        PolarsFunction::from_callee(&self.expr_infer(func, &self.error_swallower()))
+        PolarsFunction::from_callee(self, &self.expr_infer(func, &self.error_swallower()))
     }
 
     fn polars_col_attribute_name(&self, expr: &Expr) -> Option<Name> {

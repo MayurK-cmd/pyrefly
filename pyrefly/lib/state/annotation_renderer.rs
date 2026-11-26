@@ -7,11 +7,11 @@
 
 //! Render annotations as source text for a module, with the imports they need.
 
+use std::slice::from_ref;
 use std::sync::Arc;
 
 use dupe::Dupe;
 use pyrefly_build::handle::Handle;
-use pyrefly_types::stdlib::Stdlib;
 use pyrefly_types::type_output::AnnotationPart;
 use pyrefly_types::types::Type;
 use ruff_python_ast::ModModule;
@@ -19,6 +19,7 @@ use ruff_python_ast::name::Name;
 use ruff_text_size::TextRange;
 use ruff_text_size::TextSize;
 use starlark_map::small_map::SmallMap;
+use starlark_map::small_set::SmallSet;
 
 use crate::state::ide::import_module_name;
 use crate::state::ide::import_regular_import_edit;
@@ -36,6 +37,8 @@ struct DirectImport {
 /// Source text for annotations, with the imports the text needs.
 pub(crate) struct RenderedAnnotation {
     pub text: String,
+    /// Leading names used by references, for callers that also have a class scope.
+    pub reference_roots: SmallSet<String>,
     /// Names the text uses unqualified, which need `from <module> import <name>`.
     names: Vec<DirectImport>,
     /// Modules the text references by qualified name, which need `import <module>`.
@@ -48,7 +51,6 @@ pub(crate) struct AnnotationRenderer<'a, 'state> {
     handle: &'a Handle,
     tracker: ImportTracker,
     ast: Arc<ModModule>,
-    stdlib: &'a Stdlib,
     import_format: ImportFormat,
 }
 
@@ -57,7 +59,6 @@ impl<'a, 'state> AnnotationRenderer<'a, 'state> {
         transaction: &'a Transaction<'state>,
         handle: &'a Handle,
         ast: Arc<ModModule>,
-        stdlib: &'a Stdlib,
         import_format: ImportFormat,
     ) -> Self {
         Self {
@@ -70,17 +71,26 @@ impl<'a, 'state> AnnotationRenderer<'a, 'state> {
                 *handle.sys_info(),
             ),
             ast,
-            stdlib,
             import_format,
         }
     }
 
     pub(crate) fn render(&self, ty: &Type) -> Option<RenderedAnnotation> {
-        self.render_parts(&ty.get_annotation_parts(Some(self.stdlib)))
+        let env = self.transaction.type_env(self.handle);
+        self.render_parts(&ty.get_annotation_parts(&env))
     }
 
-    /// Returns `None` when a reference cannot be rendered unambiguously.
+    /// Returns `None` for ambiguous references or dependencies on stub-only modules.
     pub(crate) fn render_parts(&self, parts: &[AnnotationPart]) -> Option<RenderedAnnotation> {
+        if parts.iter().any(|part| {
+            matches!(
+                part,
+                AnnotationPart::Reference { module, .. }
+                    if module.as_str().split('.').next() == Some("_typeshed")
+            )
+        }) {
+            return None;
+        }
         let mut direct = Vec::<DirectImport>::new();
         for (module, head) in self
             .tracker
@@ -138,6 +148,22 @@ impl<'a, 'state> AnnotationRenderer<'a, 'state> {
         let (text, missing) =
             self.tracker
                 .resolve_annotation(parts, self.handle.module(), &direct_imports)?;
+        let mut reference_roots = SmallSet::new();
+        for part in parts {
+            if let AnnotationPart::Reference { .. } = part {
+                let (name, _) = self.tracker.resolve_annotation(
+                    from_ref(part),
+                    self.handle.module(),
+                    &direct_imports,
+                )?;
+                reference_roots.insert(
+                    name.split('.')
+                        .next()
+                        .expect("references have a name")
+                        .to_owned(),
+                );
+            }
+        }
 
         let mut missing = missing.into_iter().collect::<Vec<_>>();
         missing.sort_by(|left, right| left.as_str().cmp(right.as_str()));
@@ -151,6 +177,7 @@ impl<'a, 'state> AnnotationRenderer<'a, 'state> {
             .collect::<Option<Vec<_>>>()?;
         Some(RenderedAnnotation {
             text,
+            reference_roots,
             names: direct,
             modules,
         })

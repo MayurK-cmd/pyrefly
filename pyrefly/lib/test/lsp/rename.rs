@@ -7,6 +7,7 @@
 
 use std::fs;
 use std::ops::Range;
+use std::sync::Arc;
 
 use dupe::Dupe;
 use itertools::Itertools;
@@ -18,13 +19,181 @@ use ruff_text_size::TextRange;
 use ruff_text_size::TextSize;
 use tempfile::TempDir;
 
+use crate::state::load::FileContents;
 use crate::state::lsp::FindPreference;
+use crate::state::lsp::ImportBehavior;
 use crate::state::lsp::ReferenceOptions;
 use crate::state::require::Require;
 use crate::state::state::State;
+use crate::test::pydantic::util::pydantic_env;
 use crate::test::util::TestEnv;
 use crate::test::util::code_frame_of_source_at_range;
 use crate::test::util::get_batched_lsp_operations_report;
+
+/// Cached reference searches must honor cancellation without another validation run.
+#[test]
+fn canceled_reference_search_stops_scanning_candidates() {
+    for cancel_before_search in [true, false] {
+        let mut env = TestEnv::new().with_default_require_level(Require::Everything);
+        env.add("main", "def target(): pass\ntarget()\n");
+        env.add("usage", "from main import target\ntarget()\n");
+        let (state, handle) = env.to_state();
+        let handle = handle("main");
+        let mut transaction = state.cancellable_transaction();
+        let definition = transaction
+            .as_ref()
+            .find_definition(&handle, TextSize::new(4), FindPreference::default())
+            .unwrap()
+            .first()
+            .clone();
+        let cancellation = transaction.get_cancellation_handle();
+        if cancel_before_search {
+            cancellation.cancel();
+        }
+        let mut visited = 0;
+        assert!(
+            transaction
+                .process_rdeps_with_definition(
+                    *handle.sys_info(),
+                    &TextRangeWithModule::new(definition.module, definition.definition_range),
+                    |_, _, _| {
+                        visited += 1;
+                        cancellation.cancel();
+                        Some(())
+                    },
+                )
+                .is_err()
+        );
+        assert_eq!(visited, usize::from(!cancel_before_search));
+    }
+}
+
+/// Reference searches and rename must not use disk contents after an editor removes an import.
+#[test]
+fn references_ignore_removed_imports_in_unsaved_files() {
+    for options in [
+        ReferenceOptions::all(false),
+        ReferenceOptions::textual_only(true),
+    ] {
+        let root = TempDir::new().unwrap();
+        let definition_path = root.path().join("definitions.py");
+        let usage_path = root.path().join("usage.py");
+        fs::write(&definition_path, "def target() -> None:\n    pass\n").unwrap();
+        fs::write(&usage_path, "from definitions import target\ntarget()\n").unwrap();
+        let mut env = TestEnv::new().with_default_require_level(Require::Everything);
+        env.add_real_path("definitions", definition_path.clone());
+        env.add_real_path("usage", usage_path.clone());
+        let (state, handle) = env.to_state();
+        let definition_handle = handle("definitions");
+        let usage_handle = handle("usage").for_module(
+            handle("usage").module(),
+            ModulePath::memory(usage_path.clone()),
+        );
+        let mut transaction = state.transaction();
+        transaction.set_memory(vec![(
+            usage_path,
+            Some(Arc::new(FileContents::from_source(
+                "# No imports remain.\n".to_owned(),
+            ))),
+        )]);
+        transaction.run(&[usage_handle], Require::Everything, None);
+        let definition = transaction
+            .find_definition(
+                &definition_handle,
+                TextSize::new(4),
+                FindPreference::default(),
+            )
+            .unwrap()
+            .first()
+            .clone();
+        let references = transaction
+            .find_global_references_from_definition(
+                *definition_handle.sys_info(),
+                definition.metadata,
+                TextRangeWithModule::new(definition.module, definition.definition_range),
+                options,
+            )
+            .unwrap();
+        assert_eq!(
+            references
+                .iter()
+                .map(|(_, ranges)| ranges.len())
+                .sum::<usize>(),
+            usize::from(options.include_declaration),
+        );
+        assert!(references.iter().all(|(module, _)| {
+            module.path() == &ModulePath::filesystem(definition_path.clone())
+        }));
+    }
+}
+
+/// Buffered definitions in import cycles must not restore references from their disk copies.
+#[test]
+fn references_ignore_deleted_calls_in_buffered_import_cycles() {
+    for options in [
+        ReferenceOptions::all(false),
+        ReferenceOptions::textual_only(true),
+    ] {
+        let root = TempDir::new().unwrap();
+        let definition_path = root.path().join("definitions.py");
+        let usage_path = root.path().join("usage.py");
+        let buffered_source = "from usage import marker\ndef target() -> None:\n    pass\n";
+        fs::write(&definition_path, format!("{buffered_source}target()\n")).unwrap();
+        fs::write(
+            &usage_path,
+            "from definitions import target\nmarker = 1\ntarget()\n",
+        )
+        .unwrap();
+        let mut env = TestEnv::new().with_default_require_level(Require::Everything);
+        env.add_real_path("definitions", definition_path.clone());
+        env.add_real_path("usage", usage_path);
+        let (state, handle) = env.to_state();
+        let usage_handle = handle("usage");
+        let memory_path = ModulePath::memory(definition_path.clone());
+        let memory_handle =
+            handle("definitions").for_module(handle("definitions").module(), memory_path.dupe());
+        let mut transaction = state.transaction();
+        transaction.set_memory(vec![(
+            definition_path.clone(),
+            Some(Arc::new(FileContents::from_source(
+                buffered_source.to_owned(),
+            ))),
+        )]);
+        transaction.run(&[memory_handle], Require::Everything, None);
+        let definition = transaction
+            .find_definition(&usage_handle, TextSize::new(24), FindPreference::default())
+            .unwrap()
+            .first()
+            .clone();
+        assert_eq!(
+            definition.module.path(),
+            &ModulePath::filesystem(definition_path.clone()),
+        );
+        let references = transaction
+            .find_global_references_from_definition(
+                *usage_handle.sys_info(),
+                definition.metadata,
+                TextRangeWithModule::new(definition.module, definition.definition_range),
+                options,
+            )
+            .unwrap();
+        assert_eq!(
+            references
+                .iter()
+                .map(|(_, ranges)| ranges.len())
+                .sum::<usize>(),
+            2,
+        );
+        assert!(references.iter().all(|(module, _)| {
+            module.path() != &ModulePath::filesystem(definition_path.clone())
+        }));
+        assert!(
+            references
+                .iter()
+                .any(|(module, _)| module.path() == usage_handle.path())
+        );
+    }
+}
 
 /// Applies the reference edits used by rename to a source file, its stub, and a consumer.
 ///
@@ -91,6 +260,7 @@ fn replace_paired_references(
             &source_handle,
             TextSize::try_from(position).unwrap(),
             FindPreference {
+                import_behavior: ImportBehavior::StopAtRenamedImports,
                 resolve_call_dunders: false,
                 ..Default::default()
             },
@@ -361,8 +531,51 @@ fn get_test_report(state: &State, handle: &Handle, position: TextSize) -> String
     )
 }
 
-// BUG: prepare_rename returns None for __all__ and __slots__ entries.
-// It should return the range of foo or bar inside the quotes (issue #4344).
+#[test]
+fn test_prepare_rename_identifier_without_answers() {
+    let source = "value = 1\nvalue\n";
+    let (state, handle) = TestEnv::one("main", source)
+        .with_run_require(Require::Exports)
+        .to_state();
+    let handle = handle("main");
+    let mut transaction = state.transaction();
+    transaction.set_evict_answers_after_scip_hook(true);
+    transaction.run(&[handle.dupe()], Require::Everything, None);
+    assert!(transaction.get_ast(&handle).is_some());
+    assert!(transaction.get_answers(&handle).is_none());
+    for start in [
+        source.find("value").unwrap(),
+        source.rfind("value").unwrap(),
+    ] {
+        let range = TextRange::at(TextSize::try_from(start).unwrap(), TextSize::of("value"));
+        assert_eq!(
+            transaction.prepare_rename(&handle, range.start()),
+            Some(range),
+        );
+    }
+}
+
+#[test]
+fn test_prepare_rename_ordinary_alias_of_bundled_symbol() {
+    let source = "from math import sin as alias\nalias(0)\n";
+    let (state, handle) = TestEnv::one("main", source).to_state();
+    let handle = handle("main");
+    for start in [
+        source.find("alias").unwrap(),
+        source.rfind("alias").unwrap(),
+    ] {
+        let range = TextRange::at(TextSize::try_from(start).unwrap(), TextSize::of("alias"));
+        assert_eq!(
+            state.transaction().prepare_rename(&handle, range.start()),
+            Some(range),
+        );
+        assert_eq!(
+            rename_local_symbol(source, start),
+            source.replace("alias", "renamed"),
+        );
+    }
+}
+
 #[test]
 fn prepare_rename_symbol_literals() {
     let code = r#"
@@ -378,24 +591,193 @@ class C:
         self.bar = 1
 "#;
     let report = get_batched_lsp_operations_report(&[("main", code)], |state, handle, position| {
-        format!(
-            "Rename range: {:?}",
-            state.transaction().prepare_rename(handle, position)
-        )
+        let transaction = state.transaction();
+        match transaction.prepare_rename(handle, position) {
+            Some(range) => {
+                let module = transaction.get_module_info(handle).unwrap();
+                format!(
+                    "Rename range:\n{}",
+                    code_frame_of_source_at_range(module.contents(), range)
+                )
+            }
+            None => "Rename range: None".to_owned(),
+        }
     });
     assert_eq!(
         r#"
 # main.py
 3 | __all__ = ["foo"]
                  ^
-Rename range: None
+Rename range:
+3 | __all__ = ["foo"]
+                ^^^
 
 7 |     __slots__ = ("bar",)
                        ^
-Rename range: None
+Rename range:
+7 |     __slots__ = ("bar",)
+                      ^^^
 "#
         .trim(),
         report.trim(),
+    );
+}
+
+#[test]
+fn test_prepare_rename_dunder_all_entries() {
+    for name in ["foo", "café", "变量"] {
+        let source = format!(
+            "{name} = 1\n__all__ = [\"{name}\", r'{name}', \"\"\"{name}\"\"\"]\n__all__.append(\"{name}\")\n__all__.extend([\"{name}\"])\n__all__.remove(\"{name}\")\n"
+        );
+        let (state, handle) = TestEnv::one("main", &source).to_state();
+        let handle = handle("main");
+        let transaction = state.transaction();
+        for (start, text) in source.match_indices(name).skip(1) {
+            let range = TextRange::at(TextSize::try_from(start).unwrap(), TextSize::of(text));
+            for position in [range.start(), range.end()] {
+                assert_eq!(transaction.prepare_rename(&handle, position), Some(range));
+            }
+            assert_eq!(
+                rename_local_symbol(&source, start),
+                source.replace(name, "renamed"),
+            );
+        }
+    }
+}
+
+#[test]
+fn test_prepare_rename_dunder_all_rejects_invalid_targets() {
+    for (source, literal) in [
+        ("foo = 1\n__all__ = [\"foo\"]\ntext = \"foo\"\n", "\"foo\""),
+        ("__all__ = [\"missing\"]\n", "\"missing\""),
+        ("foo = 1\n__all__ = [\"f\" \"oo\"]\n", "\"f\""),
+        ("from math import sin\n__all__ = [\"sin\"]\n", "\"sin\""),
+    ] {
+        let (state, handle) = TestEnv::one("main", source).to_state();
+        let handle = handle("main");
+        let position = TextSize::try_from(source.rfind(literal).unwrap() + 1).unwrap();
+        assert_eq!(state.transaction().prepare_rename(&handle, position), None);
+    }
+}
+
+#[test]
+fn test_prepare_rename_dunder_all_import_alias() {
+    let source = "from math import sin as alias\n__all__ = [\"alias\"]\nalias(0.0)\n";
+    let (state, handle) = TestEnv::one("main", source).to_state();
+    let handle = handle("main");
+    let position = source.find("\"alias\"").unwrap() + 1;
+    let range = TextRange::at(TextSize::try_from(position).unwrap(), TextSize::of("alias"));
+    assert_eq!(
+        state.transaction().prepare_rename(&handle, range.start()),
+        Some(range),
+    );
+    assert_eq!(
+        rename_local_symbol(source, position),
+        source.replace("alias", "renamed"),
+    );
+}
+
+#[test]
+fn test_rename_dunder_all_updates_source_stub_and_consumers() {
+    let source = "foo = 1\n__all__ = ['foo']\n";
+    let stub = "foo: int\n__all__ = ['foo']\n";
+    let consumer = "from lib import foo\n__all__ = ['foo']\nfoo\n";
+    let position = source.find("'foo'").unwrap() + 1;
+    assert_eq!(
+        rename_paired_symbol(source, stub, consumer, None, position),
+        vec![
+            ("consumer.py".to_owned(), consumer.replace("foo", "renamed")),
+            ("lib.py".to_owned(), source.replace("foo", "renamed")),
+            ("lib.pyi".to_owned(), stub.replace("foo", "renamed")),
+        ],
+    );
+}
+
+#[test]
+fn test_prepare_rename_dunder_slots_entries() {
+    for name in ["foo", "café", "变量"] {
+        for assignment in [
+            format!("__slots__ = \"{name}\""),
+            format!("__slots__ = ('{name}',)"),
+            format!("__slots__ = [r'{name}']"),
+            format!("__slots__ = {{'{name}': 'Documentation.'}}"),
+            format!("__slots__: tuple[str, ...] = (\"\"\"{name}\"\"\",)"),
+        ] {
+            let source = format!(
+                "class C:\n    {assignment}\n    {name}: int\n    def __init__(self) -> None:\n        self.{name} = 1\n\nC().{name}\n"
+            );
+            let (state, handle) = TestEnv::one("main", &source).to_state();
+            let handle = handle("main");
+            let start = source.find(name).unwrap();
+            let range = TextRange::at(TextSize::try_from(start).unwrap(), TextSize::of(name));
+            for position in [range.start(), range.end()] {
+                assert_eq!(
+                    state.transaction().prepare_rename(&handle, position),
+                    Some(range)
+                );
+            }
+            assert_eq!(
+                rename_local_symbol(&source, start),
+                source.replace(name, "renamed"),
+            );
+        }
+    }
+}
+
+#[test]
+fn test_prepare_rename_dunder_slots_rejects_invalid_targets() {
+    for (source, literal) in [
+        ("class C:\n    __slots__ = ('missing',)\n", "'missing'"),
+        (
+            "class C:\n    foo: int\n    names = __slots__ = ('foo',)\n",
+            "'foo'",
+        ),
+        ("class C:\n    foo: int\n    text = 'foo'\n", "'foo'"),
+        (
+            "class C:\n    foo: int\n    __slots__ = {'foo': 'foo'}\n",
+            "'foo'",
+        ),
+        (
+            "class C:\n    foo: int\n    def method(self):\n        __slots__ = ('foo',)\n",
+            "'foo'",
+        ),
+        (
+            "class C:\n    foo: int\n    __slots__ = ('f' 'oo',)\n",
+            "'f'",
+        ),
+        ("class C:\n    __slots__ = ('__str__',)\n", "'__str__'"),
+    ] {
+        let (state, handle) = TestEnv::one("main", source).to_state();
+        let handle = handle("main");
+        let position = TextSize::try_from(source.rfind(literal).unwrap() + 1).unwrap();
+        assert_eq!(state.transaction().prepare_rename(&handle, position), None);
+    }
+}
+
+#[test]
+fn test_rename_dunder_slots_respects_class_identity() {
+    let source = "class C:\n    __slots__ = {'foo': 'foo'}\n    foo: int\n    class Nested:\n        __slots__ = ('foo',)\n        foo: str\n\nclass Other:\n    __slots__ = ('foo',)\n    foo: str\n\nC().foo\nC.Nested().foo\nOther().foo\n";
+    let position = source.find("'foo'").unwrap() + 1;
+    let expected = source
+        .replacen("'foo'", "'renamed'", 1)
+        .replace("foo: int", "renamed: int")
+        .replace("C().foo", "C().renamed");
+    assert_eq!(rename_local_symbol(source, position), expected);
+}
+
+#[test]
+fn test_rename_dunder_slots_updates_source_stub_and_consumers() {
+    let source = "class C:\n    __slots__ = ('foo',)\n    foo: int\n    def __init__(self) -> None:\n        self.foo = 1\n";
+    let stub = "class C:\n    __slots__ = ('foo',)\n    foo: int\n";
+    let consumer = "from lib import C\nC().foo\n";
+    let position = source.find("'foo'").unwrap() + 1;
+    assert_eq!(
+        rename_paired_symbol(source, stub, consumer, None, position),
+        vec![
+            ("consumer.py".to_owned(), consumer.replace("foo", "renamed")),
+            ("lib.py".to_owned(), source.replace("foo", "renamed")),
+            ("lib.pyi".to_owned(), stub.replace("foo", "renamed")),
+        ],
     );
 }
 
@@ -431,6 +813,199 @@ Rename locations:
         .trim(),
         report.trim(),
     );
+}
+
+#[test]
+fn test_rename_dataclass_field_updates_keyword_arguments() {
+    let model = r#"
+from dataclasses import dataclass
+@dataclass
+class Region:
+    trigger: str
+
+region = Region(trigger='Hlt1')
+print(region.trigger)
+region.trigger = 'Hlt2'
+"#;
+    let unrelated = r#"
+@dataclass
+class Other:
+    trigger: str
+other = Other(trigger='other')
+print(other.trigger)
+
+class Explicit:
+    trigger: str
+    def __init__(self, trigger: str):
+        self.trigger = trigger
+Explicit(trigger='explicit')
+
+def function(trigger: str):
+    return trigger
+function(trigger='function')
+"#;
+    let source = format!("{model}{unrelated}");
+    for (position, _) in model.match_indices("trigger") {
+        assert_eq!(
+            rename_local_symbol(&source, position),
+            format!("{}{unrelated}", model.replace("trigger", "renamed")),
+        );
+    }
+}
+
+#[test]
+fn test_rename_member_does_not_change_aliased_constructor_keyword() {
+    for (member, call, target) in [
+        (
+            "    @property\n    def x(self) -> int: return self._x",
+            "C(x=1)",
+            "def x",
+        ),
+        (
+            "    x: int = model_field(alias=\"y\")",
+            "C(x=1, y=2)",
+            "    x: int",
+        ),
+    ] {
+        let source = format!(
+            r#"
+from typing import Any, dataclass_transform
+def model_field(*, alias: str | None = None) -> Any: ...
+@dataclass_transform(field_specifiers=(model_field,))
+def model(cls): return cls
+@model
+class C:
+    _x: int = model_field(alias="x")
+{member}
+{call}
+print({call}.x)
+"#
+        );
+        let expected = source
+            .replace("def x(", "def renamed(")
+            .replace("    x: int", "    renamed: int")
+            .replace(".x)", ".renamed)");
+        for position in [
+            source.find(target).unwrap() + 4,
+            source.rfind(".x").unwrap() + 1,
+        ] {
+            assert_eq!(rename_local_symbol(&source, position), expected);
+        }
+    }
+}
+
+#[test]
+fn test_rename_property_does_not_change_attrs_constructor_keyword() {
+    let source = r#"
+import attrs
+@attrs.define
+class C:
+    _x: int
+    @property
+    def x(self) -> int: return self._x
+C(x=1)
+print(C(x=1).x)
+"#;
+    let path = std::env::var("ATTRS_TEST_PATH").unwrap();
+    let mut env = TestEnv::new_with_site_package_paths(&[&path]);
+    env.add("main", source);
+    let (state, handle) = env.to_state();
+    let handle = handle("main");
+    let expected = source
+        .replace("def x(", "def renamed(")
+        .replace(".x)", ".renamed)");
+    for position in [
+        source.find("x(self)").unwrap(),
+        source.rfind(".x").unwrap() + 1,
+    ] {
+        let ranges = state.transaction().find_local_references(
+            &handle,
+            TextSize::try_from(position).unwrap(),
+            ReferenceOptions::textual_only(true),
+        );
+        let mut renamed = source.to_owned();
+        for range in ranges.into_iter().rev() {
+            renamed.replace_range(Range::<usize>::from(range), "renamed");
+        }
+        assert_eq!(renamed, expected);
+    }
+}
+
+#[test]
+fn test_rename_model_field_updates_other_files() {
+    for (env, declaration) in [
+        (
+            TestEnv::new(),
+            "from dataclasses import dataclass\n@dataclass\nclass Region:\n    trigger: str\n",
+        ),
+        (
+            pydantic_env(),
+            "from pydantic import BaseModel\nclass Region(BaseModel):\n    trigger: str\n",
+        ),
+    ] {
+        let source = format!(
+            "{declaration}\nregion = Region(trigger='Hlt1')\nprint(region.trigger)\nregion.trigger = 'Hlt2'\n"
+        );
+        let consumer = "from model import Region\n\nregion = Region(trigger='Hlt1')\nprint(region.trigger)\nregion.trigger = 'Hlt2'\n";
+        let root = TempDir::new().unwrap();
+        let mut env = env
+            .with_default_require_level(Require::Indexing)
+            .with_run_require(Require::Indexing);
+        for (name, code) in [("model", source.as_str()), ("consumer", consumer)] {
+            let path = root.path().join(format!("{name}.py"));
+            fs::write(&path, code).unwrap();
+            env.add_real_path(name, path);
+        }
+        let (state, handle) = env.to_state();
+        let consumer_handle = handle("consumer");
+        for (name, code) in [("model", source.as_str()), ("consumer", consumer)] {
+            let handle = handle(name);
+            let mut transaction = state.transaction();
+            transaction.run(&[handle.dupe()], Require::Everything, None);
+            for (position, _) in code.match_indices("trigger") {
+                let definition = transaction
+                    .find_definition(
+                        &handle,
+                        TextSize::try_from(position).unwrap(),
+                        FindPreference::default(),
+                    )
+                    .unwrap()
+                    .first()
+                    .clone();
+                let references = transaction
+                    .find_global_references_from_definition(
+                        *handle.sys_info(),
+                        definition.metadata,
+                        TextRangeWithModule::new(definition.module, definition.definition_range),
+                        ReferenceOptions::textual_only(true),
+                    )
+                    .unwrap();
+                let mut renamed = Vec::new();
+                for (module, ranges) in references {
+                    let mut code = module.contents().as_str().to_owned();
+                    for range in ranges.into_iter().rev() {
+                        code.replace_range(Range::<usize>::from(range), "renamed");
+                    }
+                    renamed.push((module.name().to_string(), code));
+                }
+                renamed.sort();
+                assert_eq!(
+                    renamed,
+                    vec![
+                        (
+                            "consumer".to_owned(),
+                            consumer.replace("trigger", "renamed")
+                        ),
+                        ("model".to_owned(), source.replace("trigger", "renamed")),
+                    ],
+                );
+                if name == "model" {
+                    assert!(transaction.get_ast(&consumer_handle).is_none());
+                    assert!(transaction.get_answers(&consumer_handle).is_none());
+                }
+            }
+        }
+    }
 }
 
 #[test]

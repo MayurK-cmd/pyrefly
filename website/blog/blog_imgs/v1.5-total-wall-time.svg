@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="250" viewBox="0 0 720 250" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Helvetica, Arial, sans-serif">
+<rect width="720" height="250" fill="#ffffff"/>
+<text x="360.0" y="26" text-anchor="middle" font-size="17" font-weight="600" fill="#222">Total wall time, 18 projects (lower is better)</text>
+<text x="130" y="72.0" text-anchor="end" font-size="14" fill="#222">Pyrefly 1.5.0</text>
+<rect x="140" y="50" width="10.8" height="34" rx="3" fill="#E8833A"/>
+<text x="158.8" y="72.0" font-size="14" font-weight="600" fill="#222">8.8 s</text>
+<text x="130" y="120.0" text-anchor="end" font-size="14" fill="#222">ty 0.0.107</text>
+<rect x="140" y="98" width="11.0" height="34" rx="3" fill="#7B61C9"/>
+<text x="159.0" y="120.0" font-size="14" font-weight="600" fill="#222">9.0 s</text>
+<text x="130" y="168.0" text-anchor="end" font-size="14" fill="#222">mypy 2.4.1</text>
+<rect x="140" y="146" width="229.7" height="34" rx="3" fill="#2F7FB8"/>
+<text x="377.7" y="168.0" font-size="14" font-weight="600" fill="#222">187.5 s</text>
+<text x="130" y="216.0" text-anchor="end" font-size="14" fill="#222">Pyright 1.1.414</text>
+<rect x="140" y="194" width="464.2" height="34" rx="3" fill="#9AA0A6"/>
+<text x="612.2" y="216.0" font-size="14" font-weight="600" fill="#222">378.9 s</text>
+</svg>

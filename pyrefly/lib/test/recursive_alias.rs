@@ -158,7 +158,7 @@ from typing import reveal_type, TypeVar, Union
 
 T = TypeVar("T")
 
-X = Union[T, list[X[T]]]
+X = Union[T, "list[X[T]]"]
 
 x1: X[int] = [[1]]
 x2: X[str] = [[1]]  # E: not assignable
@@ -175,7 +175,7 @@ from typing import reveal_type, TypeAliasType, TypeVar, Union
 
 T = TypeVar("T")
 
-X = TypeAliasType("X", T | list[X[T]], type_params=(T,))
+X = TypeAliasType("X", T | list["X[T]"], type_params=(T,))
 
 x1: X[int] = [[1]]
 x2: X[str] = [[1]]  # E: not assignable
@@ -190,7 +190,7 @@ testcase!(
     r#"
 from typing import Union
 type X = int | list[X[int]]  # E: `type[X]` is not subscriptable
-Y = Union[int, list[Y[int]]]  # E: `type[Y]` is not subscriptable
+Y = Union[int, "list[Y[int]]"]  # E: `type[Y]` is not subscriptable
     "#,
 );
 
@@ -450,7 +450,7 @@ ok: IncEx = {"a": {"__all__": [B()]}}
     "#,
 );
 
-// Regression test for https://github.com/facebook/pyrefly/issues/4324: a
+// Regression test for https://github.com/pyrefly-org/pyrefly/issues/4324: a
 // self-referential alias reached *through* another alias used to leave a live
 // reference into the cycle, so attribute lookup recursed until the stack
 // overflowed. Contrast with `type T2 = T2` alone, which was already detected.

@@ -73,7 +73,7 @@ from typing import assert_type
 import sys
 if sys.version_info >= (3, 0):
     class Bar:
-        def magic(self) -> Foo:
+        def magic(self) -> "Foo":
             return Foo()
     class Foo: ...
 
@@ -571,7 +571,7 @@ testcase!(
     "",
 );
 
-// https://github.com/facebook/pyrefly/issues/3756: a module-level `TYPE_CHECKING` constant is
+// https://github.com/pyrefly-org/pyrefly/issues/3756: a module-level `TYPE_CHECKING` constant is
 // treated as `True` by type checkers and `False` at runtime, so it must have type `bool`.
 testcase!(
     test_type_checking_constant_bad_annotation,

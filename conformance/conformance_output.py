@@ -176,14 +176,10 @@ def compare_conformance_output(
     Compare conformance output with expected results in conformance test sources.
     Returns a mapping of files to error messages if there are discrepancies.
     """
-    messages = defaultdict(lambda: [])
-    for root, _, files in os.walk(directory):
-        for file in files:
-            if file.endswith(".py") and not is_excluded(file):
-                file_path = os.path.join(root, file)
-                messages_for_file = diff_expected_errors(directory, file_path)
-                messages[file_path] = messages_for_file
-    return messages
+    return {
+        file_path: diff_expected_errors(directory, file_path)
+        for file_path in collect_test_cases(directory)
+    }
 
 
 def get_pyrefly_command(executable: Path | None) -> list[str]:
@@ -206,11 +202,7 @@ def get_conformance_output(
     """
     Run minpyre on conformance test suite, parse and group the output by file
     """
-    files_to_check = []
-    for root, _, files in os.walk(directory):
-        for file in files:
-            if file.endswith(".py") and not is_excluded(file):
-                files_to_check.append(os.path.join(root, file))
+    files_to_check = collect_test_cases(directory)
     outputs: dict[str, list[dict[str, Any]]] = defaultdict(list)
     with tempfile.NamedTemporaryFile(delete_on_close=False) as tmp_file:
         cmd = (
@@ -248,11 +240,7 @@ def get_conformance_output_separate(
     Run minpyre on conformance test suite, parse and group the output by file
     This function runs Pyrefly separately for each file, which is slower but more robust to failures
     """
-    files_to_check = []
-    for root, _, files in os.walk(directory):
-        for file in files:
-            if file.endswith(".py") and not is_excluded(file):
-                files_to_check.append(os.path.join(root, file))
+    files_to_check = collect_test_cases(directory)
     outputs = defaultdict(lambda: [])
     for file in files_to_check:
         with tempfile.NamedTemporaryFile(delete_on_close=False) as tmp_file:
@@ -289,10 +277,8 @@ def collect_test_cases(directory: str) -> list[str]:
     test_cases = []
     for root, _, files in os.walk(directory):
         for file in files:
-            if file.endswith(".py") and not is_excluded(file):
-                python_file_path = os.path.join(root, file)
-                if os.path.exists(python_file_path):
-                    test_cases.append(os.path.normpath(python_file_path))
+            if file.endswith((".py", ".pyi")) and not is_excluded(file):
+                test_cases.append(os.path.normpath(os.path.join(root, file)))
     return sorted(test_cases)
 
 

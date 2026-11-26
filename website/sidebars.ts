@@ -192,7 +192,12 @@ let docsSidebar = [
             {
                 type: 'doc' as const,
                 id: 'scip',
-                label: 'SCIP Indexing',
+                label: 'Indexing',
+            },
+            {
+                type: 'doc' as const,
+                id: 'query',
+                label: 'LSP Queries',
             },
         ],
     },

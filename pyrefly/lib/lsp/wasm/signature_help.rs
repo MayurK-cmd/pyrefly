@@ -35,17 +35,25 @@ use ruff_text_size::TextRange;
 use ruff_text_size::TextSize;
 use vec1::Vec1;
 
+use crate::alt::answers::TraceReceiver;
 use crate::state::lsp::FindPreference;
 use crate::state::state::Transaction;
 use crate::types::callable::Param;
 use crate::types::callable::Params;
+use crate::types::env::TypeEnv;
 use crate::types::types::Type;
+
+/// A call signature with receiver information that its type alone cannot express.
+pub(crate) struct CallSignature {
+    pub callable: Type,
+    pub receiver: TraceReceiver,
+}
 
 /// Information about a call site at the cursor position, returned by
 /// [`Transaction::get_callables_from_call`].
 pub(crate) struct CallInfo {
     /// All callable signatures at this call site (one per overload, or just one).
-    pub callables: Vec<Type>,
+    pub callables: Vec<CallSignature>,
     /// Which overload the type-checker resolved, if any.
     /// `None` when overloads were expanded from a type without call-site analysis.
     pub chosen_overload_index: Option<usize>,
@@ -61,8 +69,8 @@ pub(crate) struct CallInfo {
 pub(crate) fn is_constructor_call(callee_type: Type) -> bool {
     matches!(
         callee_type,
-        Type::ClassDef(_) | Type::SpecializedClassDef(_)
-    ) || matches!(callee_type, Type::Type(t) if matches!(*t, Type::ClassType(_)))
+        Type::ClassDef(_) | Type::SpecializedClassDef(_) | Type::Type(_)
+    )
 }
 
 // Normally the constructor for a class returns `None`, but for hover/signature we change it to show the class for clarity
@@ -236,7 +244,10 @@ impl Transaction<'_> {
         if let Some((overloads, chosen_overload_index)) =
             answers.get_all_overload_trace(call_args_range)
         {
-            let callables = overloads.into_map(|callable| Type::Callable(Box::new(callable)));
+            let callables = overloads.into_map(|trace| CallSignature {
+                callable: Type::Callable(Box::new(trace.callable)),
+                receiver: trace.receiver,
+            });
             Some(CallInfo {
                 callables,
                 chosen_overload_index,
@@ -250,10 +261,13 @@ impl Transaction<'_> {
                 // If the coerced type is an Overload, expand it into multiple signatures
                 // so signature help displays each overload separately.
                 if let Type::Overload(overload) = coerced {
-                    let callables: Vec<Type> = overload
+                    let callables: Vec<CallSignature> = overload
                         .signatures
                         .into_iter()
-                        .map(|s| s.as_type())
+                        .map(|s| CallSignature {
+                            callable: s.as_type(),
+                            receiver: TraceReceiver::Unknown,
+                        })
                         .collect();
                     CallInfo {
                         callables,
@@ -264,7 +278,10 @@ impl Transaction<'_> {
                     }
                 } else {
                     CallInfo {
-                        callables: vec![coerced],
+                        callables: vec![CallSignature {
+                            callable: coerced,
+                            receiver: TraceReceiver::Unknown,
+                        }],
                         chosen_overload_index: Some(0),
                         active_argument,
                         callee_range,
@@ -342,31 +359,42 @@ impl Transaction<'_> {
             .unwrap_or_default()
             .into_iter()
             .find_map(|item| {
-                item.docstring_range
+                item.doc_ranges
+                    .docstring()
                     .map(|range| (range, item.module.clone()))
             })
     }
 
-    fn parameter_documentation_for_callee(
+    /// Parameter documentation for the callee at `callee_range`, read from its docstring and
+    /// from `Doc` metadata in its parameter annotations. `Doc` text takes precedence.
+    pub(crate) fn parameter_documentation_for_callee(
         &self,
         handle: &Handle,
         callee_range: TextRange,
     ) -> Option<HashMap<String, String>> {
         let position = callee_range.end();
+        let source_preference = FindPreference {
+            prefer_pyi: false,
+            include_interpreter_stdlib: true,
+            ..Default::default()
+        };
 
-        let (range, module) = self
-            .find_range_and_module(
-                handle,
-                position,
-                FindPreference {
-                    prefer_pyi: false,
-                    include_interpreter_stdlib: true,
-                    ..Default::default()
-                },
-            )
-            .or_else(|| self.find_range_and_module(handle, position, FindPreference::default()))?;
+        let mut docs = self
+            .find_range_and_module(handle, position, source_preference)
+            .or_else(|| self.find_range_and_module(handle, position, FindPreference::default()))
+            .map(|(range, module)| parse_parameter_documentation(module.code_at(range)))
+            .unwrap_or_default();
 
-        let docs = parse_parameter_documentation(module.code_at(range));
+        if let Some(item) = [source_preference, FindPreference::default()]
+            .into_iter()
+            .find_map(|preference| {
+                let items = self.find_definition(handle, position, preference).ok()?;
+                items.into_vec().into_iter().next()
+            })
+        {
+            docs.extend(item.doc_ranges.parameter_docs(&item.module));
+        }
+
         if docs.is_empty() { None } else { Some(docs) }
     }
 
@@ -426,32 +454,36 @@ impl Transaction<'_> {
     }
 
     fn create_signature_information(
+        env: &dyn TypeEnv,
         type_: Type,
         active_argument: &ActiveArgument,
         parameter_docs: Option<&HashMap<String, String>>,
         function_docstring: Option<&Docstring>,
-        is_constructor_call: bool,
+        consumes_receiver: bool,
     ) -> SignatureInformation {
-        let type_ = type_.deterministic_printing();
+        let mut display_type = type_.deterministic_printing();
 
-        // Display the return type as the class instance type instead of None
-        let display_type = if is_constructor_call {
-            override_constructor_return_type(type_.clone()).unwrap_or(type_)
-        } else {
-            type_
-        };
+        // Binding consumes the receiver regardless of its parameter name.
+        if consumes_receiver {
+            display_type.transform_toplevel_callable_signatures(|callable, _| {
+                if let Some(stripped) = callable.strip_first_param() {
+                    *callable = stripped;
+                }
+            });
+        }
 
-        let label = display_type.as_lsp_string(LspDisplayMode::SignatureHelp);
-        let (parameters, active_parameter) = if let Some(params) =
-            Self::normalize_singleton_function_type_into_params(display_type)
+        let label = display_type.as_lsp_string(env, LspDisplayMode::SignatureHelp);
+        let (parameters, active_parameter) = if let Some(Params::List(params)) =
+            display_type.to_callable().map(|callable| callable.params)
         {
+            let params = params.items();
             // Create a type display context for consistent parameter formatting
             let param_types: Vec<&Type> = params.iter().map(|p| p.as_type()).collect();
-            let mut type_ctx = TypeDisplayContext::new(&param_types);
+            let mut type_ctx = TypeDisplayContext::new(env, &param_types);
             type_ctx.set_lsp_display_mode(LspDisplayMode::SignatureHelp);
 
             let active_parameter =
-                Self::active_parameter_index(&params, active_argument).map(|idx| idx as u32);
+                Self::active_parameter_index(params, active_argument).map(|idx| idx as u32);
 
             let parameter_info: Vec<ParameterInformation> = params
                 .iter()
@@ -500,23 +532,45 @@ impl Transaction<'_> {
              }| {
                 let parameter_docs = self.parameter_documentation_for_callee(handle, callee_range);
                 let function_docstring = self.function_docstring_for_callee(handle, callee_range);
+                let type_env = self.type_env(handle);
 
-                let is_constructor_call = self
+                // Traces without receiver information fall back to the callee type.
+                let callee_type = self
                     .get_answers(handle)
-                    .and_then(|ans| ans.get_type_trace(callee_range))
-                    .is_some_and(is_constructor_call);
+                    .and_then(|ans| ans.get_type_trace(callee_range));
+                let is_constructor_call = callee_type.clone().is_some_and(is_constructor_call);
+                let consumes_receiver = is_constructor_call
+                    || callee_type
+                        .map(|ty| self.coerce_type_to_callable(handle, ty))
+                        .is_some_and(|ty| matches!(ty, Type::BoundMethod(_)));
 
                 let signatures = callables
                     .into_iter()
-                    .map(|t| {
-                        Self::create_signature_information(
-                            t,
-                            &active_argument,
-                            parameter_docs.as_ref(),
-                            function_docstring.as_ref(),
-                            is_constructor_call,
-                        )
-                    })
+                    .map(
+                        |CallSignature {
+                             callable: t,
+                             receiver,
+                         }| {
+                            let consumes_receiver = match receiver {
+                                TraceReceiver::Unknown => consumes_receiver,
+                                TraceReceiver::Present => true,
+                                TraceReceiver::Stripped => false,
+                            };
+                            let t = if is_constructor_call {
+                                override_constructor_return_type(t.clone()).unwrap_or(t)
+                            } else {
+                                t
+                            };
+                            Self::create_signature_information(
+                                &type_env,
+                                t,
+                                &active_argument,
+                                parameter_docs.as_ref(),
+                                function_docstring.as_ref(),
+                                consumes_receiver,
+                            )
+                        },
+                    )
                     .collect_vec();
                 let chosen = chosen_overload_index.unwrap_or_default();
                 let active_parameter = signatures

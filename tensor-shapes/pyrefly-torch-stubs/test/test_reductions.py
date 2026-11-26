@@ -27,6 +27,26 @@ def test_sum_dtype_preserves_reduced_shape() -> None:
     )
 
 
+def test_var_mean_correction_shapes_and_values() -> None:
+    tensor = torch.arange(24, dtype=torch.float64).reshape(2, 3, 4)
+    variance, mean = torch.var_mean(tensor, dim=(1, 2), correction=0, keepdim=True)
+    assert_shape(variance.shape, (2, 1, 1))
+    assert_shape(mean.shape, (2, 1, 1))
+    assert torch.equal(mean.flatten(), torch.tensor([5.5, 17.5], dtype=torch.float64))
+    assert torch.allclose(
+        variance.flatten(), torch.full((2,), 143.0 / 12.0, dtype=torch.float64)
+    )
+    scalar_var, scalar_mean = torch.var_mean(tensor, correction=0)
+    assert_shape(scalar_var.shape, ())
+    assert_shape(scalar_mean.shape, ())
+    default_var, default_mean = torch.var_mean(tensor, dim=-1, correction=None)
+    legacy_var, legacy_mean = torch.var_mean(tensor, dim=-1, unbiased=True)
+    assert_shape(default_var.shape, (2, 3))
+    assert_shape(default_mean.shape, (2, 3))
+    assert torch.equal(default_var, legacy_var)
+    assert torch.equal(default_mean, legacy_mean)
+
+
 def test_median_shapes() -> None:
     matrix = torch.randn((3, 4))
     assert_shape(torch.median(matrix).shape, ())

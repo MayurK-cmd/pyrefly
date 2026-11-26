@@ -29,12 +29,14 @@ use pyrefly_python::short_identifier::ShortIdentifier;
 use pyrefly_types::display::LspDisplayMode;
 use pyrefly_types::literal::Lit;
 use pyrefly_types::tuple::Tuple;
+use pyrefly_util::display::DisplayWithCtx;
 use pyrefly_util::thread_pool::ThreadPool;
 use ruff_python_ast::AnyNodeRef;
 use ruff_python_ast::ExprContext;
 use ruff_python_ast::Identifier;
 use ruff_python_ast::ModModule;
 use ruff_python_ast::Pattern;
+use ruff_python_ast::StmtFunctionDef;
 use ruff_python_ast::StmtImportFrom;
 use ruff_python_ast::name::Name;
 use ruff_python_ast::token::TokenKind;
@@ -50,6 +52,7 @@ use crate::binding::binding::Key;
 use crate::config::error_kind::ErrorKind;
 use crate::export::exports::Export;
 use crate::export::exports::ExportLocation;
+use crate::lsp::wasm::override_completion::OverrideCompletion;
 use crate::lsp::wasm::signature_help::CallInfo;
 use crate::state::ide::common_alias_target_module;
 use crate::state::ide::import_regular_import_edit;
@@ -61,6 +64,7 @@ use crate::state::lsp::ImportFormat;
 use crate::state::lsp::MIN_CHARACTERS_TYPED_AUTOIMPORT;
 use crate::state::state::Transaction;
 use crate::types::callable::Param;
+use crate::types::env::TypeEnv;
 use crate::types::types::Type;
 
 /// Classification of a completion item's source, used for ranking.
@@ -190,6 +194,7 @@ pub(crate) fn supports_snippet_completions(capabilities: &lsp_types::ClientCapab
 /// `TypedDict("M", {"class": int})`, and via the parameters synthesized for its
 /// constructor — and inserting those would not parse.
 fn push_kwarg_completion(
+    env: &dyn TypeEnv,
     name: &Name,
     ty: &Type,
     seen: &mut SmallSet<(String, String)>,
@@ -199,7 +204,7 @@ fn push_kwarg_completion(
         return;
     }
     let label = format!("{}=", name.as_str());
-    let detail = ty.to_string();
+    let detail = ty.display_with(env).to_string();
     if seen.insert((label.clone(), detail.clone())) {
         completions.push(RankedCompletion::new(CompletionItem {
             label,
@@ -258,6 +263,7 @@ impl Transaction<'_> {
 
     /// Adds completion items for literal types (e.g., `Literal["foo", "bar"]`).
     pub(crate) fn add_literal_completions_from_type(
+        env: &dyn TypeEnv,
         param_type: &Type,
         completions: &mut Vec<RankedCompletion>,
         in_string_literal: bool,
@@ -265,7 +271,7 @@ impl Transaction<'_> {
         match param_type {
             Type::Literal(lit) => {
                 // TODO: Pass the flag correctly for whether literal string is single quoted or double quoted
-                let label = lit.value.to_string_escaped(true);
+                let label = lit.value.to_string_escaped(true, env);
                 let insert_text = if in_string_literal {
                     if let Lit::Str(s) = &lit.value {
                         s.to_string()
@@ -278,14 +284,19 @@ impl Transaction<'_> {
                 completions.push(RankedCompletion::new(CompletionItem {
                     label,
                     kind: Some(CompletionItemKind::Value),
-                    detail: Some(format!("{param_type}")),
+                    detail: Some(param_type.display_with(env).to_string()),
                     insert_text: Some(insert_text),
                     ..Default::default()
                 }));
             }
             Type::Union(u) => {
                 for member in &u.members {
-                    Self::add_literal_completions_from_type(member, completions, in_string_literal);
+                    Self::add_literal_completions_from_type(
+                        env,
+                        member,
+                        completions,
+                        in_string_literal,
+                    );
                 }
             }
             _ => {}
@@ -302,7 +313,17 @@ impl Transaction<'_> {
             return;
         }
         for name in dunder::MAGIC_METHOD_NAMES {
-            if name.starts_with(typed) {
+            if !name.starts_with(typed) {
+                continue;
+            }
+            if let Some(completion) = completions
+                .iter_mut()
+                .find(|completion| completion.item.label == *name)
+            {
+                // Inherited dunder items retain their edits and the magic-method ranking.
+                completion.item.kind = Some(CompletionItemKind::Method);
+                completion.source = CompletionSource::Local;
+            } else {
                 completions.push(RankedCompletion::new(CompletionItem {
                     label: (*name).to_owned(),
                     kind: Some(CompletionItemKind::Method),
@@ -365,7 +386,7 @@ impl Transaction<'_> {
         export_info: Option<(Handle, Export)>,
     ) -> Option<lsp_types::Documentation> {
         let (definition_handle, export) = export_info?;
-        let docstring_range = export.docstring_range?;
+        let docstring_range = export.doc_ranges.docstring()?;
         let def_module = self.get_module_info(&definition_handle)?;
         let docstring = Docstring(docstring_range, def_module.clone()).resolve();
         let documentation = lsp_types::Documentation::MarkupContent(lsp_types::MarkupContent {
@@ -383,12 +404,13 @@ impl Transaction<'_> {
         completions: &mut Vec<RankedCompletion>,
     ) {
         let mut seen = SmallSet::new();
+        let type_env = self.type_env(handle);
         if let Some(mod_module) = self.get_ast(handle)
             && let Some(fields) =
                 self.typed_dict_constructor_kwargs(handle, mod_module.as_ref(), position)
         {
             for (name, ty) in fields {
-                push_kwarg_completion(&Name::new(name), &ty, &mut seen, completions);
+                push_kwarg_completion(&type_env, &Name::new(name), &ty, &mut seen, completions);
             }
         }
         if let Some(CallInfo {
@@ -397,8 +419,14 @@ impl Transaction<'_> {
             ..
         }) = self.get_callables_from_call(handle, position)
         {
-            let callables =
-                self.filter_compatible_overloads(handle, callables, &provided_arg_ranges);
+            let callables = self.filter_compatible_overloads(
+                handle,
+                callables
+                    .into_iter()
+                    .map(|signature| signature.callable)
+                    .collect(),
+                &provided_arg_ranges,
+            );
             for callable in callables {
                 if let Some(params) = Self::normalize_singleton_function_type_into_params(callable)
                 {
@@ -409,7 +437,13 @@ impl Transaction<'_> {
                             | Param::KwOnly(name, ty, _)
                             | Param::Varargs(Some(name), ty) => {
                                 if name.as_str() != "self" {
-                                    push_kwarg_completion(&name, &ty, &mut seen, completions);
+                                    push_kwarg_completion(
+                                        &type_env,
+                                        &name,
+                                        &ty,
+                                        &mut seen,
+                                        completions,
+                                    );
                                 }
                             }
                             // `**kwargs: Unpack[TypedDict]` accepts each field as a keyword
@@ -426,7 +460,13 @@ impl Transaction<'_> {
                                     .into_iter()
                                     .flatten()
                                 {
-                                    push_kwarg_completion(&name, &field.ty, &mut seen, completions);
+                                    push_kwarg_completion(
+                                        &type_env,
+                                        &name,
+                                        &field.ty,
+                                        &mut seen,
+                                        completions,
+                                    );
                                 }
                             }
                             Param::Varargs(None, _)
@@ -484,9 +524,8 @@ impl Transaction<'_> {
             FindPreference::default(),
         );
 
-        let (definition, Some(docstring_range)) = attribute_definition? else {
-            return None;
-        };
+        let (definition, doc_ranges) = attribute_definition?;
+        let docstring_range = doc_ranges.docstring()?;
         let docstring = Docstring(docstring_range, definition.module);
 
         Some(lsp_types::Documentation::MarkupContent(
@@ -570,6 +609,7 @@ impl Transaction<'_> {
         if let Some(answers) = self.get_answers(handle)
             && let Some(module_info) = self.get_module_info(handle)
         {
+            let type_env = self.type_env(handle);
             let bindings = answers.bindings();
             let matcher = SkimMatcherV2::default();
             for idx in bindings.available_definitions(position) {
@@ -615,7 +655,7 @@ impl Transaction<'_> {
                         t.function_deprecation().is_some()
                     }
                 });
-                let detail = ty.as_ref().map(|t| t.to_string());
+                let detail = ty.as_ref().map(|t| t.display_with(&type_env).to_string());
                 let documentation = self.get_documentation_from_export(export_info);
                 let is_incompatible =
                     self.is_incompatible_with_expected_type(handle, expected_type, ty.as_ref());
@@ -657,7 +697,12 @@ impl Transaction<'_> {
         in_string_literal: bool,
     ) {
         if let Some(expected) = self.get_expected_type_at(handle, position) {
-            Self::add_literal_completions_from_type(&expected, completions, in_string_literal);
+            Self::add_literal_completions_from_type(
+                &self.type_env(handle),
+                &expected,
+                completions,
+                in_string_literal,
+            );
         }
     }
 
@@ -871,7 +916,12 @@ impl Transaction<'_> {
             return;
         };
         if let Some(subject_type) = self.get_type_trace(handle, subject.range()) {
-            Self::add_literal_completions_from_type(&subject_type, completions, in_string_literal);
+            Self::add_literal_completions_from_type(
+                &self.type_env(handle),
+                &subject_type,
+                completions,
+                in_string_literal,
+            );
         }
     }
 
@@ -1003,8 +1053,16 @@ impl Transaction<'_> {
         handle: &Handle,
         base_type: Type,
         expected_type: Option<&Type>,
+        method: Option<&StmtFunctionDef>,
+        import_format: ImportFormat,
         completions: &mut Vec<RankedCompletion>,
     ) {
+        let class = match &base_type {
+            Type::ClassDef(class) => Some(class.dupe()),
+            _ => None,
+        };
+        let overrides =
+            method.and_then(|method| OverrideCompletion::new(self, handle, method, import_format));
         self.ad_hoc_solve(handle, "completion_attributes", |solver| {
             solver
                 .completions(base_type, None, true, true)
@@ -1022,7 +1080,7 @@ impl Transaction<'_> {
                     let detail = attr
                         .ty
                         .clone()
-                        .map(|t| t.as_lsp_string(LspDisplayMode::Hover));
+                        .map(|t| t.as_lsp_string(&solver, LspDisplayMode::Hover));
                     let documentation = self.get_docstring_for_attribute(handle, attr);
                     let is_incompatible = self.is_incompatible_with_expected_type(
                         handle,
@@ -1036,11 +1094,21 @@ impl Transaction<'_> {
                     } else {
                         CompletionSource::Local
                     };
+                    let edits = overrides
+                        .as_ref()
+                        .zip(class.as_ref())
+                        .and_then(|(overrides, class)| overrides.edits(class, attr, &solver));
                     completions.push(RankedCompletion {
                         item: CompletionItem {
                             label: attr.name.as_str().to_owned(),
                             detail,
-                            kind,
+                            kind: if edits.is_some() {
+                                Some(CompletionItemKind::Method)
+                            } else {
+                                kind
+                            },
+                            text_edit: edits.as_ref().map(|(edit, _)| edit.clone().into()),
+                            additional_text_edits: edits.map(|(_, edits)| edits),
                             documentation,
                             tags: if attr.is_deprecated {
                                 Some(vec![CompletionItemTag::Deprecated])
@@ -1229,7 +1297,7 @@ impl Transaction<'_> {
                             },
                         })),
                         label,
-                        detail: attr.ty.map(|ty| ty.to_string()),
+                        detail: attr.ty.map(|ty| ty.display_with(&solver).to_string()),
                         kind: Some(CompletionItemKind::Variable),
                         tags: if attr.is_deprecated {
                             Some(vec![CompletionItemTag::Deprecated])
@@ -1283,12 +1351,63 @@ impl Transaction<'_> {
         if let Some(nodes) = covering_nodes.as_deref() {
             self.add_match_class_keyword_completions(handle, nodes, position, &mut result);
         }
-        // Because of parser error recovery, `from x impo...` looks like `from x import impo...`
-        // If the user might be typing the `import` keyword, add that as an autocomplete option.
-        match covering_nodes
+        let mut at_statement_keyword = false;
+        let identifier_with_context = covering_nodes
             .as_deref()
             .and_then(Self::identifier_from_covering_nodes)
-        {
+            .or_else(|| {
+                // Parser recovery can discard a keyword such as `as` at statement start.
+                // Recover its prefix so filtering and deferred auto-imports use the normal path.
+                let tokens = self.get_parsed_module(handle)?.tokens()?;
+                let keyword = tokens
+                    .at_offset(position)
+                    .find(|token| token.kind().is_keyword() && token.start() < position)?;
+                let previous = tokens.before(keyword.start()).iter().rev().find(|token| {
+                    !token.kind().is_trivia()
+                        && !matches!(token.kind(), TokenKind::Indent | TokenKind::Dedent)
+                });
+                let at_statement_start = match previous {
+                    None => true,
+                    Some(token) if matches!(token.kind(), TokenKind::Newline | TokenKind::Semi) => {
+                        true
+                    }
+                    Some(colon) if colon.kind() == TokenKind::Colon => {
+                        // Only a compound-statement colon can introduce an inline suite.
+                        // Exclude child nodes that end immediately before the colon.
+                        matches!(
+                            Ast::locate_node(ast.as_ref()?.as_ref(), colon.start())
+                                .into_iter()
+                                .find(|node| node.range().contains(colon.start())),
+                            Some(
+                                AnyNodeRef::StmtFunctionDef(_)
+                                    | AnyNodeRef::StmtClassDef(_)
+                                    | AnyNodeRef::StmtIf(_)
+                                    | AnyNodeRef::StmtWhile(_)
+                                    | AnyNodeRef::StmtFor(_)
+                                    | AnyNodeRef::StmtWith(_)
+                                    | AnyNodeRef::StmtTry(_)
+                                    | AnyNodeRef::ElifElseClause(_)
+                                    | AnyNodeRef::ExceptHandlerExceptHandler(_)
+                                    | AnyNodeRef::MatchCase(_)
+                            )
+                        )
+                    }
+                    _ => false,
+                };
+                if !at_statement_start {
+                    return None;
+                }
+                let module_info = self.get_module_info(handle)?;
+                let range = TextRange::new(keyword.start(), position);
+                at_statement_keyword = true;
+                Some(IdentifierWithContext {
+                    identifier: Identifier::new(Name::new(module_info.code_at(range)), range),
+                    context: IdentifierContext::Expr(ExprContext::Load),
+                })
+            });
+        // Because of parser error recovery, `from x impo...` looks like `from x import impo...`
+        // If the user might be typing the `import` keyword, add that as an autocomplete option.
+        match identifier_with_context {
             Some(IdentifierWithContext {
                 context: IdentifierContext::AliasDefinition,
                 ..
@@ -1415,6 +1534,8 @@ impl Transaction<'_> {
                         handle,
                         base_type,
                         expected_type.as_ref(),
+                        None,
+                        import_format,
                         &mut result,
                     );
                 }
@@ -1438,17 +1559,16 @@ impl Transaction<'_> {
                 ) {
                     allow_function_call_parens = true;
                 }
-                if is_method_def {
-                    Self::add_magic_method_completions(&identifier, &mut result);
-                }
                 if (is_method_def || matches!(context, IdentifierContext::Expr(ExprContext::Store)))
                     && let Some(covering_nodes) = covering_nodes.as_deref()
                 {
-                    let mut saw_function = false;
+                    let mut enclosing_function = None;
                     let mut enclosing_class = None;
                     for node in covering_nodes.iter() {
                         match node {
-                            AnyNodeRef::StmtFunctionDef(_) => saw_function = true,
+                            AnyNodeRef::StmtFunctionDef(function) => {
+                                enclosing_function = Some(*function);
+                            }
                             AnyNodeRef::StmtClassDef(class_def) => {
                                 enclosing_class = Some(class_def);
                                 break;
@@ -1457,7 +1577,7 @@ impl Transaction<'_> {
                         }
                     }
                     if let Some(class_def) = enclosing_class
-                        && (!saw_function || is_method_def)
+                        && (enclosing_function.is_none() || is_method_def)
                     {
                         let key = Key::Definition(ShortIdentifier::new(&class_def.name));
                         if let Some(class_type) = self.get_type(handle, &key) {
@@ -1465,10 +1585,19 @@ impl Transaction<'_> {
                                 handle,
                                 class_type,
                                 None,
+                                if is_method_def {
+                                    enclosing_function
+                                } else {
+                                    None
+                                },
+                                import_format,
                                 &mut result,
                             );
                         }
                     }
+                }
+                if is_method_def {
+                    Self::add_magic_method_completions(&identifier, &mut result);
                 }
                 self.add_kwargs_completions(handle, position, &mut result);
                 // In `func(foo=1, ba|` the cursor can only be a keyword-argument
@@ -1477,10 +1606,11 @@ impl Transaction<'_> {
                     .as_deref()
                     .is_some_and(|nodes| Self::is_typing_keyword_argument_name(nodes, position));
                 if !skip_value_completions && !is_method_def {
-                    let at_statement_start = matches!(
-                        covering_nodes.as_deref().and_then(|nodes| nodes.get(1)),
-                        Some(AnyNodeRef::StmtExpr(_))
-                    );
+                    let at_statement_start = at_statement_keyword
+                        || matches!(
+                            covering_nodes.as_deref().and_then(|nodes| nodes.get(1)),
+                            Some(AnyNodeRef::StmtExpr(_))
+                        );
                     let expression_only =
                         matches!(context, IdentifierContext::Expr(_)) && !at_statement_start;
                     Self::add_keyword_completions(handle, expression_only, &mut result);

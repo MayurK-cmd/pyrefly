@@ -12,6 +12,45 @@ use pyrefly_util::thread_pool::ThreadCount;
 use crate::test::util::TestEnv;
 use crate::testcase;
 
+testcase!(
+    test_deferred_callbacks_keep_matched_keys_with_unpacking,
+    TestEnv::new().enable_implicit_any_lambda_error(),
+    r#"
+from typing import Callable, assert_type
+
+class Invoker:
+    def run[T](
+        self,
+        left: int,
+        right: str,
+        first: Callable[[T], T],
+        second: Callable[[T], T],
+        sample: T,
+        *rest: T,
+    ) -> T:
+        return second(first(sample))
+
+def check(rest: tuple[int, ...]) -> None:
+    invoker = Invoker()
+    plain = invoker.run(
+        1, "prefix",
+        lambda value: assert_type(value, int),
+        lambda value: assert_type(value, int),
+        0, *rest,
+    )
+    # One source argument supplies two parameters before the deferred callbacks.
+    prefix: tuple[int, str] = (1, "prefix")
+    expanded = invoker.run(
+        *prefix,
+        lambda value: assert_type(value, int),
+        lambda value: assert_type(value, int),
+        0, *rest,
+    )
+    assert_type(plain, int)
+    assert_type(expanded, int)
+"#,
+);
+
 // `CallArgPreEval::advance_after_match` is shared with shape-specific call matching. Keep this
 // regression in the general callable suite so the refactor cannot change ordinary variadic
 // type-variable consumption.
@@ -812,7 +851,7 @@ test2(1, *(2, 3), *(4, "5"))  # E: Unpacked argument `tuple[Literal[1], Literal[
 );
 
 // Splatting a tuple with a variadic middle preserves the positions of its fixed ends.
-// See https://github.com/facebook/pyrefly/issues/4482
+// See https://github.com/pyrefly-org/pyrefly/issues/4482
 testcase!(
     test_splat_unpacked_args_shape,
     r#"
@@ -1057,7 +1096,40 @@ def test_corountine() -> Callable[[int], Coroutine[Any, Any, int]]:
 def test_awaitable() -> Callable[[int], Awaitable[int]]:
     return f
 def test_sync() -> Callable[[int], int]:
-    return f  # E: Returned type `(x: int) -> Coroutine[Unknown, Unknown, int]` is not assignable to declared return type `(int) -> int`
+    return f  # E: Returned type `(x: int) -> Coroutine[Any, Any, int]` is not assignable to declared return type `(int) -> int`
+"#,
+);
+
+testcase!(
+    test_plain_kwargs_optional_parameter_subtyping,
+    r#"
+from typing import Protocol
+class IntKwargs(Protocol):
+    def __call__(self, **kwargs: int) -> str: ...
+def implementation(*, label: str = "", **kwargs: int) -> str:
+    return label.upper()
+def compatible(*, label: int = 0, **kwargs: int) -> str:
+    return str(label)
+def widened(*, label: float = 0, **kwargs: int) -> str:
+    return str(label)
+# An IntKwargs caller may pass label=1, which fails in implementation at runtime.
+wrong: IntKwargs = implementation  # E: is not assignable to `IntKwargs`
+same_type: IntKwargs = compatible
+wider_type: IntKwargs = widened
+"#,
+);
+
+testcase!(
+    test_plain_kwargs_optional_parameter_override,
+    r#"
+class Parent:
+    def f(self, **kwargs: str) -> None: ...
+class NarrowOptional(Parent):
+    def f(self, *, verbose: bool = False, **kwargs: str) -> None: ...  # E: Class member `NarrowOptional.f` overrides parent class `Parent` in an inconsistent manner
+class CompatibleOptional(Parent):
+    def f(self, *, verbose: str = "", **kwargs: str) -> None: ...
+class WiderOptional(Parent):
+    def f(self, *, verbose: object = None, **kwargs: str) -> None: ...
 "#,
 );
 
@@ -1118,8 +1190,53 @@ class P4(Protocol):
     def __call__(self, **kwargs: int): ...
 def test(unannotated: P1, unpacked: P2, annotated: P3, annotated_wrong: P4):
     a: P2 = unannotated
-    b: P2 = annotated
+    # `TD` is not closed, so `P2` may be called with extra keyword arguments of type `object`.
+    b: P2 = annotated  # E: `P3` is not assignable to `P2`
     c: P2 = annotated_wrong  # E: `P4` is not assignable to `P2`
+"#,
+);
+
+// https://github.com/python/typing/pull/2338#issuecomment-5395279191
+testcase!(
+    test_override_unpack_kwargs_with_extra_keyword,
+    r#"
+from typing import TypedDict, Unpack
+
+class Person(TypedDict):
+    name: str
+    age: int
+
+class Base:
+    def foo(self, **kwargs: Unpack[Person]) -> None: ...
+class SubGood(Base):
+    # `Person` is not closed, so `Base.foo` accepts `extra` with any type.
+    def foo(self, *, name: str, age: int, extra: bool = False) -> None: ...  # E: `SubGood.foo` overrides parent class `Base` in an inconsistent manner
+"#,
+);
+
+// https://github.com/python/typing/pull/2338#issuecomment-5395279191
+// A non-closed TypedDict in `Unpack` behaves as if it had `extra_items=object`.
+testcase!(
+    test_assignability_unpack_kwargs_open_typed_dict_extra_items,
+    r#"
+from typing import Protocol, TypedDict, Unpack
+
+class TDBase(TypedDict):
+    x: int
+
+class TD(TDBase, total=False):
+    y: int
+
+def a1(**kwargs: Unpack[TDBase]) -> None: ...
+def a2(**kwargs: Unpack[TD]) -> None: ...
+
+class P1(Protocol):
+    def __call__(self, **kwargs: Unpack[TDBase]) -> None: ...
+class P2(Protocol):
+    def __call__(self, **kwargs: Unpack[TD]) -> None: ...
+
+x1: P1 = a2  # E: `(**kwargs: Unpack[TD]) -> None` is not assignable to `P1`
+x2: P2 = a1
 "#,
 );
 
@@ -1160,6 +1277,108 @@ def src(**kwargs: Unpack[TD]) -> None: ...
 # keyword names and could be called with keys the TypedDict does not permit.
 a: Untyped = src  # E: `(**kwargs: Unpack[TD]) -> None` is not assignable to `Untyped`
 b: Traditional = src  # E: `(**kwargs: Unpack[TD]) -> None` is not assignable to `Traditional`
+"#,
+);
+
+// https://github.com/python/typing/pull/2338
+testcase!(
+    test_assignability_typed_dict_kwargs_tails,
+    r#"
+from typing import Never, Protocol, ReadOnly, TypedDict, Unpack
+class Closed(TypedDict, closed=True):
+    x: int
+class Open(TypedDict):
+    x: int
+class ExtraInt(TypedDict, extra_items=int):
+    x: int
+class ExtraStr(TypedDict, extra_items=str):
+    x: int
+class ExtraObject(TypedDict, extra_items=ReadOnly[object]):
+    x: int
+class ExtraNever(TypedDict, extra_items=Never):
+    x: int
+class ClosedCall(Protocol):
+    def __call__(self, **kwargs: Unpack[Closed]) -> None: ...
+class OpenCall(Protocol):
+    def __call__(self, **kwargs: Unpack[Open]) -> None: ...
+class IntCall(Protocol):
+    def __call__(self, **kwargs: Unpack[ExtraInt]) -> None: ...
+class StrCall(Protocol):
+    def __call__(self, **kwargs: Unpack[ExtraStr]) -> None: ...
+class ObjectCall(Protocol):
+    def __call__(self, **kwargs: Unpack[ExtraObject]) -> None: ...
+class NeverCall(Protocol):
+    def __call__(self, **kwargs: Unpack[ExtraNever]) -> None: ...
+class FixedCall(Protocol):
+    def __call__(self, *, x: int) -> None: ...
+class TraditionalIntCall(Protocol):
+    def __call__(self, *, x: int, **kwargs: int) -> None: ...
+def test(closed: ClosedCall, open: OpenCall, ints: IntCall, strings: StrCall,
+         objects: ObjectCall, never: NeverCall, traditional: TraditionalIntCall) -> None:
+    fixed_closed: FixedCall = closed
+    fixed_never: FixedCall = never
+    closed_fixed: ClosedCall = fixed_closed
+    closed_never: ClosedCall = never
+    never_closed: NeverCall = closed
+    closed_ints: ClosedCall = ints
+    ints_closed: IntCall = closed  # E: `ClosedCall` is not assignable to `IntCall`
+    strings_ints: StrCall = ints  # E: `IntCall` is not assignable to `StrCall`
+    ints_strings: IntCall = strings  # E: `StrCall` is not assignable to `IntCall`
+    ints_objects: IntCall = objects
+    objects_ints: ObjectCall = ints  # E: `IntCall` is not assignable to `ObjectCall`
+    open_objects: OpenCall = objects
+    objects_open: ObjectCall = open
+    open_ints: OpenCall = ints  # E: `IntCall` is not assignable to `OpenCall`
+    ints_open: IntCall = open
+    traditional_ints: TraditionalIntCall = ints
+    ints_traditional: IntCall = traditional
+    open_traditional: OpenCall = traditional  # E: `TraditionalIntCall` is not assignable to `OpenCall`
+    closed_traditional: TraditionalIntCall = closed  # E: `ClosedCall` is not assignable to `TraditionalIntCall`
+"#,
+);
+
+testcase!(
+    test_assignability_typed_dict_kwargs_optional_keys,
+    r#"
+from typing import NotRequired, Protocol, TypedDict, Unpack
+class Base(TypedDict):
+    x: int
+class OptionalKey(Base):
+    y: NotRequired[int]
+class BaseCall(Protocol):
+    def __call__(self, **kwargs: Unpack[Base]) -> None: ...
+class OptionalCall(Protocol):
+    def __call__(self, **kwargs: Unpack[OptionalKey]) -> None: ...
+def test(base: BaseCall, optional: OptionalCall) -> None:
+    base_optional: BaseCall = optional  # E: `OptionalCall` is not assignable to `BaseCall`
+    optional_base: OptionalCall = base
+class Parent:
+    def f(self, **kwargs: Unpack[Base]) -> None: ...
+class NarrowOptional(Parent):
+    def f(self, **kwargs: Unpack[OptionalKey]) -> None: ...  # E: Class member `NarrowOptional.f` overrides parent class `Parent` in an inconsistent manner
+class DropKwargs(Parent):
+    def f(self, *, x: int, extra: bool = False) -> None: ...  # E: Class member `DropKwargs.f` overrides parent class `Parent` in an inconsistent manner
+class CompatibleOptional(Parent):
+    def f(self, *, x: int, y: object = None, **kwargs: object) -> None: ...
+class NarrowNamedOptional(Parent):
+    def f(self, *, x: int, y: int = 0, **kwargs: object) -> None: ...  # E: Class member `NarrowNamedOptional.f` overrides parent class `Parent` in an inconsistent manner
+"#,
+);
+
+testcase!(
+    test_assignability_typed_dict_kwargs_empty_destination,
+    r#"
+from typing import Protocol, TypedDict, Unpack
+class RequiredKey(TypedDict, closed=True):
+    x: int
+class Empty(TypedDict, closed=True):
+    pass
+class NoArgs(Protocol):
+    def __call__(self) -> None: ...
+def required(**kwargs: Unpack[RequiredKey]) -> None: ...
+def empty(**kwargs: Unpack[Empty]) -> None: ...
+a: NoArgs = required  # E: `(**kwargs: Unpack[RequiredKey]) -> None` is not assignable to `NoArgs`
+b: NoArgs = empty
 "#,
 );
 
@@ -2076,7 +2295,7 @@ class Pipeline:
 "#,
 );
 
-// Regression test for https://github.com/facebook/pyrefly/issues/1178
+// Regression test for https://github.com/pyrefly-org/pyrefly/issues/1178
 testcase!(
     test_callable_as_base_class,
     r#"
@@ -2087,7 +2306,7 @@ class A(Callable):  # E: Invalid base class
 "#,
 );
 
-// Regression test for https://github.com/facebook/pyrefly/issues/769
+// Regression test for https://github.com/pyrefly-org/pyrefly/issues/769
 testcase!(
     test_callable_no_args_assignable_to_varargs,
     r#"
@@ -2101,7 +2320,7 @@ schedule(1000, after_func)
 "#,
 );
 
-// Regression test for https://github.com/facebook/pyrefly/issues/3912
+// Regression test for https://github.com/pyrefly-org/pyrefly/issues/3912
 testcase!(
     test_callable_ellipsis_return,
     r#"
@@ -2288,9 +2507,9 @@ callback: Callback = lambda **kwargs: (
 )[3]
 split_callback: SplitCallback = lambda consumed, **kwargs: (
     assert_type(consumed, int),
-    assert_type(kwargs, dict[str, str]),
-    assert_type(kwargs["remaining"], str),
-    assert_type(kwargs["consumed"], str),
+    assert_type(kwargs, dict[str, object]),
+    assert_type(kwargs["remaining"], object),
+    assert_type(kwargs["consumed"], object),
     None,
 )[4]
 generic_callback: GenericCallback = generic
@@ -2302,13 +2521,14 @@ apply(source, lambda **kwargs: (
 )[3])
 apply(split_source, lambda consumed, **kwargs: (
     assert_type(consumed, int),
-    assert_type(kwargs, dict[str, str]),
-    assert_type(kwargs["remaining"], str),
-    assert_type(kwargs["consumed"], str),
+    assert_type(kwargs, dict[str, object]),
+    assert_type(kwargs["remaining"], object),
+    assert_type(kwargs["consumed"], object),
     None,
 )[4])
-plain_callback: SplitCallback = split_plain
-apply(split_source, split_plain)
+# `SplitOptions` is not closed, so its extra items of type `object` are not assignable to `str`.
+plain_callback: SplitCallback = split_plain  # E: is not assignable to `SplitCallback`
+apply(split_source, split_plain)  # E: is not assignable to parameter `g`
 "#,
 );
 
@@ -2456,6 +2676,120 @@ def f(n: NoArgs) -> None:
     ok: Gradual = n        # a gradual target accepts a stricter callable
     err1: Subst[Any] = n   # E: `NoArgs` is not assignable to `Subst[Any]`
     err2: SubstP[...] = n  # E: `NoArgs` is not assignable to `SubstP[...]`
+    "#,
+);
+
+// A gradual `*args: Any, **kwargs: Any` tail does not make the rest of the signature gradual:
+// the other parameters are still checked. See https://github.com/pyrefly-org/pyrefly/issues/5194.
+testcase!(
+    test_gradual_variadic_params_check_other_params,
+    r#"
+from typing import Any, Callable, Protocol, TypedDict
+
+class Unannotated(Protocol):
+    def __call__(self, a: str, /, *args, **kwargs) -> None: ...
+
+class Annotated(Protocol):
+    def __call__(self, a: str, /, *args: Any, **kwargs: Any) -> None: ...
+
+def f(p1: Unannotated, p2: Annotated) -> None:
+    x1: Callable[[int], None] = p1  # E: `Unannotated` is not assignable to `(int) -> None`
+    x2: Callable[[int], None] = p2  # E: `Annotated` is not assignable to `(int) -> None`
+    x3: Callable[[str, int], None] = p2
+
+def g(a: str, /, *args, **kwargs) -> None: ...
+x4: Callable[[int], None] = g  # E: is not assignable to `(int) -> None`
+x5: Callable[[], None] = g  # E: is not assignable to `() -> None`
+
+def h(*args: Any, k: str, **kwargs: Any) -> None: ...
+x6: Callable[[], None] = h  # E: is not assignable to `() -> None`
+
+class A(TypedDict):
+    x: int
+class B(TypedDict):
+    y: int
+
+class KwStr(Protocol):
+    def __call__(self, *, b: int) -> None: ...
+def kw_str(*args: Any, b: str, **kwargs: Any) -> None: ...
+x7: KwStr = kw_str  # E: is not assignable to `KwStr`
+
+class KwTypedDict(Protocol):
+    def __call__(self, *, b: B) -> None: ...
+def kw_typed_dict(*args: Any, b: A, **kwargs: Any) -> None: ...
+x8: KwTypedDict = kw_typed_dict  # E: is not assignable to `KwTypedDict`
+    "#,
+);
+
+// A gradual tail in the target accepts whatever parameters remain after matching the target's
+// other parameters.
+testcase!(
+    test_gradual_variadic_params_target_tail,
+    r#"
+from typing import Any, Protocol
+
+class Prefix(Protocol):
+    def __call__(self, a: int, /, *args: Any, **kwargs: Any) -> None: ...
+
+class Keyword(Protocol):
+    def __call__(self, *args: Any, k: str, **kwargs: Any) -> None: ...
+
+def no_params() -> None: ...
+def extra_params(a: int, b: str, /, *, m: str) -> None: ...
+def wrong_prefix(a: str, b: str, /) -> None: ...
+def varargs(*args: int) -> None: ...
+def keyword(x: int, *, k: str) -> None: ...
+def wrong_keyword(*, k: int) -> None: ...
+
+ok1: Prefix = extra_params
+ok2: Prefix = varargs
+ok3: Keyword = keyword
+err1: Prefix = no_params  # E: is not assignable to `Prefix`
+err2: Prefix = wrong_prefix  # E: is not assignable to `Prefix`
+err3: Keyword = varargs  # E: is not assignable to `Keyword`
+err4: Keyword = wrong_keyword  # E: is not assignable to `Keyword`
+    "#,
+);
+
+// A gradual tail is `...` when matched against a `ParamSpec`.
+testcase!(
+    test_gradual_variadic_params_paramspec,
+    r#"
+from typing import Any, Callable, Concatenate, Protocol, reveal_type
+
+def drop_two[**P](f: Callable[Concatenate[int, str, P], None]) -> Callable[P, None]: ...
+
+def gradual(*args: Any, **kwargs: Any) -> None: ...
+def gradual_prefix(a: int, b: str, c: bytes, /, *args: Any, **kwargs: Any) -> None: ...
+def gradual_wrong_prefix(a: str, /, *args: Any, **kwargs: Any) -> None: ...
+
+reveal_type(drop_two(gradual))  # E: revealed type: (...) -> None
+reveal_type(drop_two(gradual_prefix))  # E: revealed type: (c: bytes, /, *args: Any, **kwargs: Any) -> None
+drop_two(gradual_wrong_prefix)  # E: Argument `(a: str, /, *args: Any, **kwargs: Any) -> None` is not assignable to parameter `f`
+
+# A gradual `*args` that consumes the rest of the prefix also stays in the remainder, along with
+# the keyword-only parameters after it.
+def keyword(*args: Any, flag: bool, **kwargs: Any) -> None: ...
+reveal_type(drop_two(keyword))  # E: revealed type: (*args: Any, *, flag: bool, **kwargs: Any) -> None
+
+class KeywordTail(Protocol):
+    def __call__(self, *args: Any, flag: bool, **kwargs: Any) -> None: ...
+
+def g[**P](x: Callable[Concatenate[int, str, P], None]) -> None:
+    y: KeywordTail = x  # E: is not assignable to `KeywordTail`
+
+class Prefix(Protocol):
+    def __call__(self, a: int, /, *args: Any, **kwargs: Any) -> None: ...
+
+class WithParamSpec[**P](Protocol):
+    def __call__(self, a: int, /, *args: P.args, **kwargs: P.kwargs) -> None: ...
+
+class WithParamSpecStr[**P](Protocol):
+    def __call__(self, a: str, /, *args: P.args, **kwargs: P.kwargs) -> None: ...
+
+def f[**P](x: WithParamSpec[P], y: WithParamSpecStr[P]) -> None:
+    ok: Prefix = x
+    err: Prefix = y  # E: is not assignable to `Prefix`
     "#,
 );
 

@@ -65,6 +65,21 @@ def _make_validator(schema_file: Path):
 class TestPositiveValidation(unittest.TestCase):
     """Positive tests: valid config files should pass schema validation."""
 
+    def test_class_decorator_behavior(self) -> None:
+        validator = _make_validator(SCHEMAS_DIR / "pyrefly.json")
+        for value in ("ignore", "typed-only"):
+            with self.subTest(value=value):
+                validator.validate({"class-decorator-behavior": value})
+                validator.validate(
+                    {
+                        "sub-config": [
+                            {"matches": "legacy/**", "class-decorator-behavior": value}
+                        ]
+                    }
+                )
+        with self.assertRaises(jsonschema.ValidationError):
+            validator.validate({"class-decorator-behavior": "invalid"})
+
     def test_pyrefly_toml(self) -> None:
         toml_file = SCHEMAS_DIR / "test-pyrefly.toml"
         schema_file = SCHEMAS_DIR / "pyrefly.json"
@@ -80,6 +95,13 @@ class TestPositiveValidation(unittest.TestCase):
             config = toml.load(f)
         validator = _make_validator(schema_file)
         validator.validate(config)
+
+    def test_sub_config_matches_as_array(self) -> None:
+        config = toml.loads('[[sub-config]]\nmatches = ["a.py", "src/**"]')
+        _make_validator(SCHEMAS_DIR / "pyrefly.json").validate(config)
+        _make_validator(SCHEMAS_DIR / "pyproject-tool-pyrefly.json").validate(
+            {"tool": {"pyrefly": config}}
+        )
 
     def test_legacy_site_package_path(self) -> None:
         config = {"site-package-path": ["site-packages"]}
@@ -168,6 +190,14 @@ NEGATIVE_TEST_CASES: list[tuple[str, str]] = [
     (
         "sub_config_entry_without_matches",
         "[[sub-config]]\npermissive-ignores = true",
+    ),
+    (
+        "sub_config_matches_empty_array",
+        "[[sub-config]]\nmatches = []",
+    ),
+    (
+        "sub_config_matches_non_string_items",
+        "[[sub-config]]\nmatches = [123]",
     ),
     # --- Conditional build-system validation ---
     (

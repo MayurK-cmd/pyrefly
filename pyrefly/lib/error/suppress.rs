@@ -196,7 +196,9 @@ impl SerializedError {
 
     /// Returns whether a suppression comment may be written for this error.
     pub fn is_suppressable(&self) -> bool {
-        !self.is_directive() && !self.is_unused_ignore()
+        !self.is_directive()
+            && !self.is_unused_ignore()
+            && self.name != ErrorKind::InvalidIgnoreComment.to_name()
     }
 }
 
@@ -1610,7 +1612,7 @@ foo(
 
     #[test]
     fn test_remove_first_unused_ignore_only() {
-        // Regression test for https://github.com/facebook/pyrefly/issues/1310
+        // Regression test for https://github.com/pyrefly-org/pyrefly/issues/1310
         let input = r#""""Test."""
 x = 1 + 1  # pyrefly: ignore
 y = 1 + "oops"  # pyrefly: ignore
@@ -1689,7 +1691,7 @@ def g() -> int:
     return "hello" # pyrefly: ignore[bad-return]"#;
         // No trailing newline on purpose.
         // Ensures files with only used suppressions are not rewritten (no newline added).
-        // https://github.com/facebook/pyrefly/issues/2185
+        // https://github.com/pyrefly-org/pyrefly/issues/2185
         assert_remove_ignores(input, input, 0);
     }
 
@@ -1700,7 +1702,7 @@ def f(x: int) -> int:
     return x + 1"#;
         // No trailing newline on purpose.
         // Ensures files without suppressions are not rewritten (no newline added).
-        // https://github.com/facebook/pyrefly/issues/2185
+        // https://github.com/pyrefly-org/pyrefly/issues/2185
         assert_remove_ignores(input, input, 0);
     }
 
@@ -1768,7 +1770,7 @@ a: int = "" # pyrefly: ignore [bad-assignment]
 
     #[test]
     fn test_strip_unused_error_code_preserves_original_formatting() {
-        // Regression: github.com/facebook/pyrefly/issues/3369
+        // Regression: github.com/pyrefly-org/pyrefly/issues/3369
         let before = r#"
 float(object())  # pyrefly:ignore[bad-argument-type,potato]
 "#;

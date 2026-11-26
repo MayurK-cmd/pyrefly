@@ -13,6 +13,8 @@ use ruff_annotate_snippets::Level as SnippetLevel;
 use ruff_annotate_snippets::Renderer as SnippetRenderer;
 use ruff_annotate_snippets::Snippet as SnippetBlock;
 
+use crate::solver::solver::ParamsSubsetError;
+
 /// Parse byte ranges for parameters and return type from a signature string
 /// produced by `TypeDisplayContext` with `SignatureHelp` mode.
 ///
@@ -56,6 +58,10 @@ fn signature_parts(sig: &str) -> Option<(Range<usize>, Range<usize>)> {
         sig.len()
     };
     Some((params, ret_start..ret_end))
+}
+
+fn shift(range: Range<usize>, offset: usize) -> Range<usize> {
+    (range.start + offset)..(range.end + offset)
 }
 
 /// Find the UTF-8-safe byte ranges where two strings differ, using longest
@@ -126,8 +132,124 @@ fn diff_ranges(expected: &str, found: &str) -> Option<(Range<usize>, Range<usize
     Some((expected_span, found_span))
 }
 
-/// Render a visual diff between two function signatures, highlighting where
-/// the parameters and/or return types differ.
+/// A signature as displayed in a signature diff.
+pub struct DisplayedSignature<'a> {
+    pub text: &'a str,
+    /// The display of each parameter, in the order the parameter list displays them. The
+    /// parameter indices of a `ParamsSubsetError` point into this list.
+    pub params: &'a [String],
+}
+
+/// Find the byte range of parameter `index` within the parameters of `sig`, which occupy
+/// `params_range` of its text. The displayed parameters appear in order, separated only by
+/// commas and the `/` and `*` markers, so searching for each one after the end of the previous
+/// one finds its occurrence in the parameter list.
+fn param_range(
+    sig: &DisplayedSignature,
+    params_range: &Range<usize>,
+    index: usize,
+) -> Option<Range<usize>> {
+    let mut start = params_range.start;
+    for param in sig.params.get(..=index)? {
+        start += sig.text[start..params_range.end].find(param.as_str())?;
+        start += param.len();
+    }
+    Some((start - sig.params[index].len())..start)
+}
+
+/// The parts of two signatures that fail the assignability check.
+pub enum SignatureFailure<'a> {
+    /// The parameters fail as `params` describes, and the return types also fail if
+    /// `return_type` is set.
+    Params {
+        params: &'a ParamsSubsetError,
+        return_type: bool,
+    },
+    /// The parameters are compatible, but the return types are not.
+    Return,
+}
+
+type Spans = Vec<(Range<usize>, &'static str)>;
+
+fn join_spans(a: Option<(Spans, Spans)>, b: Option<(Spans, Spans)>) -> Option<(Spans, Spans)> {
+    match (a, b) {
+        (Some((mut exp_spans, mut found_spans)), Some((exp_more, found_more))) => {
+            exp_spans.extend(exp_more);
+            found_spans.extend(found_more);
+            Some((exp_spans, found_spans))
+        }
+        (a, b) => a.or(b),
+    }
+}
+
+/// The byte ranges of the expected and found signatures to annotate, with their labels.
+fn mismatch_spans(
+    expected: &DisplayedSignature,
+    found: &DisplayedSignature,
+    failure: Option<&SignatureFailure>,
+) -> Option<(Spans, Spans)> {
+    let (expected_params, expected_ret) = signature_parts(expected.text)?;
+    let (found_params, found_ret) = signature_parts(found.text)?;
+    let diff = |expected_range: Range<usize>, found_range: Range<usize>, label| {
+        let (exp_span, found_span) = diff_ranges(
+            &expected.text[expected_range.clone()],
+            &found.text[found_range.clone()],
+        )?;
+        Some((
+            vec![(shift(exp_span, expected_range.start), label)],
+            vec![(shift(found_span, found_range.start), label)],
+        ))
+    };
+    let params_diff = || diff(expected_params.clone(), found_params.clone(), "parameters");
+    let return_diff = || diff(expected_ret.clone(), found_ret.clone(), "return type");
+    match failure {
+        None => join_spans(params_diff(), return_diff()),
+        Some(SignatureFailure::Return) => return_diff(),
+        Some(SignatureFailure::Params {
+            params:
+                ParamsSubsetError {
+                    got_index,
+                    want_index,
+                    ..
+                },
+            return_type,
+        }) => {
+            // `None` if the parameter cannot be located, `Some(None)` if there is no parameter.
+            let locate = |sig, params_range, index: Option<usize>| match index {
+                Some(index) => param_range(sig, params_range, index).map(Some),
+                None => Some(None),
+            };
+            let params_spans = match locate(expected, &expected_params, *want_index).zip(locate(
+                found,
+                &found_params,
+                *got_index,
+            )) {
+                // Narrow the annotation to the differing part of the two parameters.
+                Some((Some(exp_range), Some(found_range))) => {
+                    diff(exp_range.clone(), found_range.clone(), "parameter").or(Some((
+                        vec![(exp_range, "parameter")],
+                        vec![(found_range, "parameter")],
+                    )))
+                }
+                Some((Some(exp_range), None)) => Some((vec![(exp_range, "parameter")], Vec::new())),
+                Some((None, Some(found_range))) => {
+                    Some((Vec::new(), vec![(found_range, "parameter")]))
+                }
+                // The failure is not attributed to individual parameters, or they cannot be
+                // located in the displayed signatures.
+                Some((None, None)) | None => params_diff(),
+            };
+            join_spans(params_spans, return_type.then(return_diff).flatten())
+        }
+    }
+}
+
+/// Render a visual diff between two function signatures, highlighting the parts that make the
+/// found signature incompatible with the expected one.
+///
+/// When `failure` says which part of the signatures failed the assignability check, only that
+/// part is highlighted. Otherwise, or when the failing parameters cannot be located in the
+/// displayed signatures, the textual differences between the signatures are highlighted.
 ///
 /// Uses `ruff_annotate_snippets` to produce caret-underline annotations, then
 /// strips the line-number gutter from the rendered output. Returns `None` if
@@ -136,14 +258,17 @@ fn diff_ranges(expected: &str, found: &str) -> Option<(Range<usize>, Range<usize
 /// The gutter-stripping logic depends on the current output format of
 /// `SnippetRenderer::plain()`. If that format changes upstream, this
 /// post-processing may need to be updated.
-pub fn render_signature_diff(expected: &str, found: &str) -> Option<Vec<String>> {
-    let (expected_params, expected_ret) = signature_parts(expected)?;
-    let (found_params, found_ret) = signature_parts(found)?;
+pub fn render_signature_diff(
+    expected: &DisplayedSignature,
+    found: &DisplayedSignature,
+    failure: Option<&SignatureFailure>,
+) -> Option<Vec<String>> {
+    let (expected_spans, found_spans) = mismatch_spans(expected, found, failure)?;
 
     let expected_prefix = "expected: ";
     let found_prefix = "found:    ";
-    let expected_line_text = format!("{expected_prefix}{expected}");
-    let found_line_text = format!("{found_prefix}{found}");
+    let expected_line_text = format!("{expected_prefix}{}", expected.text);
+    let found_line_text = format!("{found_prefix}{}", found.text);
 
     // We strip line numbers from the output, so the starting line number doesn't matter
     // for the final text, but it's used by the renderer.
@@ -153,54 +278,20 @@ pub fn render_signature_diff(expected: &str, found: &str) -> Option<Vec<String>>
     source.push_str(&found_line_text);
     let found_offset = expected_line_text.len() + 1;
 
-    let mut annotations = Vec::new();
-    if let Some((exp_span, found_span)) = diff_ranges(
-        &expected[expected_params.clone()],
-        &found[found_params.clone()],
-    ) {
-        annotations.push(
-            AnnotationKind::Primary
-                .span(
-                    (expected_prefix.len() + expected_params.start + exp_span.start)
-                        ..(expected_prefix.len() + expected_params.start + exp_span.end),
-                )
-                .label("parameters"),
-        );
-        annotations.push(
-            AnnotationKind::Primary
-                .span(
-                    (found_offset + found_prefix.len() + found_params.start + found_span.start)
-                        ..(found_offset + found_prefix.len() + found_params.start + found_span.end),
-                )
-                .label("parameters"),
-        );
-    }
-    if let Some((exp_span, found_span)) =
-        diff_ranges(&expected[expected_ret.clone()], &found[found_ret.clone()])
-    {
-        annotations.push(
-            AnnotationKind::Primary
-                .span(
-                    (expected_prefix.len() + expected_ret.start + exp_span.start)
-                        ..(expected_prefix.len() + expected_ret.start + exp_span.end),
-                )
-                .label("return type"),
-        );
-        annotations.push(
-            AnnotationKind::Primary
-                .span(
-                    (found_offset + found_prefix.len() + found_ret.start + found_span.start)
-                        ..(found_offset + found_prefix.len() + found_ret.start + found_span.end),
-                )
-                .label("return type"),
-        );
-    }
+    let annotations = expected_spans
+        .into_iter()
+        .map(|(span, label)| (shift(span, expected_prefix.len()), label))
+        .chain(
+            found_spans
+                .into_iter()
+                .map(|(span, label)| (shift(span, found_offset + found_prefix.len()), label)),
+        )
+        .map(|(span, label)| AnnotationKind::Primary.span(span).label(label));
 
-    if annotations.is_empty() {
-        return None;
-    }
-
-    let mut snippet = SnippetBlock::source(&source).line_start(line_start);
+    // Without `fold(false)`, a line without annotations would be omitted.
+    let mut snippet = SnippetBlock::source(&source)
+        .line_start(line_start)
+        .fold(false);
     for ann in annotations {
         snippet = snippet.annotation(ann);
     }
@@ -232,7 +323,13 @@ pub fn render_signature_diff(expected: &str, found: &str) -> Option<Vec<String>>
 
 #[cfg(test)]
 mod tests {
+    use super::DisplayedSignature;
     use crate::test::util::TestEnv;
+
+    /// A signature whose parameters are not located, for tests without a callable subset failure.
+    fn signature(text: &str) -> DisplayedSignature<'_> {
+        DisplayedSignature { text, params: &[] }
+    }
 
     /// Run a single-module type check and return the error messages.
     fn error_messages(code: &str) -> Vec<String> {
@@ -270,13 +367,8 @@ class B(A):
   `B.foo` has type `() -> None`, which is not assignable to `(a: int, b: int, c: int) -> Unknown`, the type of `A.foo`
   Signature mismatch:
   expected: def foo(self: B, a: int, b: int, c: int) -> Unknown: ...
-                           ^^^^^^^^^^^^^^^^^^^^^^^^     ^^^^^^^ return type
-                           |
-                           parameters
-  found:    def foo(self: B) -> None: ...
-                           ^    ^^^^ return type
-                           |
-                           parameters"#;
+                             ^^^^^^ parameter
+  found:    def foo(self: B) -> None: ..."#;
         assert_eq!(messages[0], expected);
     }
 
@@ -299,9 +391,8 @@ class B(A):
   `B.foo` has type `(x: int, y: str) -> None`, which is not assignable to `() -> None`, the type of `A.foo`
   Signature mismatch:
   expected: def foo(self: B) -> None: ...
-                           ^ parameters
   found:    def foo(self: B, x: int, y: str) -> None: ...
-                           ^^^^^^^^^^^^^^^^ parameters"#;
+                             ^^^^^^ parameter"#;
         assert_eq!(messages[0], expected);
     }
 
@@ -324,9 +415,9 @@ class B(A):
   `B.foo` has type `(x: str) -> None`, which is not assignable to `(x: int) -> None`, the type of `A.foo`
   Signature mismatch:
   expected: def foo(self: B, x: int) -> None: ...
-                                ^^^ parameters
+                                ^^^ parameter
   found:    def foo(self: B, x: str) -> None: ...
-                                ^^^ parameters"#;
+                                ^^^ parameter"#;
         assert_eq!(messages[0], expected);
     }
 
@@ -352,6 +443,171 @@ class B(A):
                                         ^^^ return type
   found:    def foo(self: B, x: int) -> str: ...
                                         ^^^ return type"#;
+        assert_eq!(messages[0], expected);
+    }
+
+    /// A narrower return type is a valid override, so only the parameter is annotated.
+    /// https://github.com/pyrefly-org/pyrefly/issues/5684
+    #[test]
+    fn test_signature_diff_compatible_return_type() {
+        let messages = error_messages(
+            r#"
+class A:
+    def foo(self, x: object) -> object: ...
+
+class B(A):
+    def foo(self, x: int) -> int: ...
+"#,
+        );
+        assert_eq!(messages.len(), 1, "Expected one error, got {messages:?}");
+        let expected = r#"Class member `B.foo` overrides parent class `A` in an inconsistent manner
+  `B.foo` has type `(x: int) -> int`, which is not assignable to `(x: object) -> object`, the type of `A.foo`
+  Signature mismatch:
+  expected: def foo(self: B, x: object) -> object: ...
+                                ^^^^^ parameter
+  found:    def foo(self: B, x: int) -> int: ...
+                                ^^ parameter"#;
+        assert_eq!(messages[0], expected);
+    }
+
+    /// Only `b` is annotated: widening `a` and `c` is a valid override.
+    #[test]
+    fn test_signature_diff_one_of_several_params() {
+        let messages = error_messages(
+            r#"
+class A:
+    def foo(self, a: int, b: int, c: int) -> None: ...
+
+class B(A):
+    def foo(self, a: object, b: str, c: object) -> None: ...
+"#,
+        );
+        assert_eq!(messages.len(), 1, "Expected one error, got {messages:?}");
+        let expected = r#"Class member `B.foo` overrides parent class `A` in an inconsistent manner
+  `B.foo` has type `(a: object, b: str, c: object) -> None`, which is not assignable to `(a: int, b: int, c: int) -> None`, the type of `A.foo`
+  Signature mismatch:
+  expected: def foo(self: B, a: int, b: int, c: int) -> None: ...
+                                        ^^^ parameter
+  found:    def foo(self: B, a: object, b: str, c: object) -> None: ...
+                                           ^^^ parameter"#;
+        assert_eq!(messages[0], expected);
+    }
+
+    /// The override adds a required keyword-only parameter that callers of `A.foo` do not pass.
+    #[test]
+    fn test_signature_diff_extra_required_keyword() {
+        let messages = error_messages(
+            r#"
+class A:
+    def foo(self, x: int) -> None: ...
+
+class B(A):
+    def foo(self, x: int, *, y: str) -> None: ...
+"#,
+        );
+        assert_eq!(messages.len(), 1, "Expected one error, got {messages:?}");
+        let expected = r#"Class member `B.foo` overrides parent class `A` in an inconsistent manner
+  `B.foo` has type `(x: int, *, y: str) -> None`, which is not assignable to `(x: int) -> None`, the type of `A.foo`
+  Signature mismatch:
+  expected: def foo(self: B, x: int) -> None: ...
+  found:    def foo(self: B, x: int, *, y: str) -> None: ...
+                                        ^^^^^^ parameter"#;
+        assert_eq!(messages[0], expected);
+    }
+
+    /// The override drops a keyword-only parameter that callers of `A.foo` may pass.
+    #[test]
+    fn test_signature_diff_missing_keyword() {
+        let messages = error_messages(
+            r#"
+class A:
+    def foo(self, *, x: int, y: int) -> None: ...
+
+class B(A):
+    def foo(self, *, x: int) -> None: ...
+"#,
+        );
+        assert_eq!(messages.len(), 1, "Expected one error, got {messages:?}");
+        let expected = r#"Class member `B.foo` overrides parent class `A` in an inconsistent manner
+  `B.foo` has type `(*, x: int) -> None`, which is not assignable to `(*, x: int, y: int) -> None`, the type of `A.foo`
+  Signature mismatch:
+  expected: def foo(self: B, *, x: int, y: int) -> None: ...
+                                        ^^^^^^ parameter
+  found:    def foo(self: B, *, x: int) -> None: ..."#;
+        assert_eq!(messages[0], expected);
+    }
+
+    /// A generic method, whose displayed signature lists its type parameters before the
+    /// parameters.
+    #[test]
+    fn test_signature_diff_generic_method() {
+        let messages = error_messages(
+            r#"
+class A:
+    def foo[T](self, x: T, y: int) -> T: ...
+
+class B(A):
+    def foo[T](self, x: T, y: str) -> T: ...
+"#,
+        );
+        assert_eq!(messages.len(), 1, "Expected one error, got {messages:?}");
+        let expected = r#"Class member `B.foo` overrides parent class `A` in an inconsistent manner
+  `B.foo` has type `[T](x: T, y: str) -> T`, which is not assignable to `[T](x: T, y: int) -> T`, the type of `A.foo`
+  Signature mismatch:
+  expected: def foo(self: B, x: T, y: int) -> T: ...
+                                      ^^^ parameter
+  found:    def foo(self: B, x: T, y: str) -> T: ...
+                                      ^^^ parameter"#;
+        assert_eq!(messages[0], expected);
+    }
+
+    /// A classmethod, whose `cls` receiver is bound before the comparison.
+    #[test]
+    fn test_signature_diff_classmethod() {
+        let messages = error_messages(
+            r#"
+class A:
+    @classmethod
+    def make(cls, x: int, y: int) -> None: ...
+
+class B(A):
+    @classmethod
+    def make(cls, x: int, y: str) -> None: ...
+"#,
+        );
+        assert_eq!(messages.len(), 1, "Expected one error, got {messages:?}");
+        let expected = r#"Class member `B.make` overrides parent class `A` in an inconsistent manner
+  `B.make` has type `(x: int, y: str) -> None`, which is not assignable to `(x: int, y: int) -> None`, the type of `A.make`
+  Signature mismatch:
+  expected: def make(cls: type[B], x: int, y: int) -> None: ...
+                                              ^^^ parameter
+  found:    def make(cls: type[B], x: int, y: str) -> None: ...
+                                              ^^^ parameter"#;
+        assert_eq!(messages[0], expected);
+    }
+
+    /// A staticmethod, which has no receiver.
+    #[test]
+    fn test_signature_diff_staticmethod() {
+        let messages = error_messages(
+            r#"
+class A:
+    @staticmethod
+    def make(x: int, y: int) -> object: ...
+
+class B(A):
+    @staticmethod
+    def make(x: int, y: str) -> int: ...
+"#,
+        );
+        assert_eq!(messages.len(), 1, "Expected one error, got {messages:?}");
+        let expected = r#"Class member `B.make` overrides parent class `A` in an inconsistent manner
+  `B.make` has type `(x: int, y: str) -> int`, which is not assignable to `(x: int, y: int) -> object`, the type of `A.make`
+  Signature mismatch:
+  expected: def make(x: int, y: int) -> object: ...
+                                ^^^ parameter
+  found:    def make(x: int, y: str) -> int: ...
+                                ^^^ parameter"#;
         assert_eq!(messages[0], expected);
     }
 
@@ -386,6 +642,57 @@ class B(A):
         assert_eq!(messages[0], expected);
     }
 
+    /// Both the parameter and the return types are incompatible, so both are annotated.
+    #[test]
+    fn test_signature_diff_param_and_return() {
+        let messages = error_messages(
+            r#"
+class A:
+    def foo(self, x: int) -> int: ...
+
+class B(A):
+    def foo(self, x: str) -> str: ...
+"#,
+        );
+        assert_eq!(messages.len(), 1, "Expected one error, got {messages:?}");
+        let expected = r#"Class member `B.foo` overrides parent class `A` in an inconsistent manner
+  `B.foo` has type `(x: str) -> str`, which is not assignable to `(x: int) -> int`, the type of `A.foo`
+  Signature mismatch:
+  expected: def foo(self: B, x: int) -> int: ...
+                                ^^^     ^^^ return type
+                                |
+                                parameter
+  found:    def foo(self: B, x: str) -> str: ...
+                                ^^^     ^^^ return type
+                                |
+                                parameter"#;
+        assert_eq!(messages[0], expected);
+    }
+
+    /// Both a parameter and the return type are incompatible, but the return types mention a
+    /// type parameter, so only the parameter is annotated.
+    #[test]
+    fn test_signature_diff_generic_return() {
+        let messages = error_messages(
+            r#"
+class A:
+    def foo[T](self, x: int, y: T) -> T: ...
+
+class B(A):
+    def foo[T](self, x: str, y: T) -> list[T]: ...
+"#,
+        );
+        assert_eq!(messages.len(), 1, "Expected one error, got {messages:?}");
+        let expected = r#"Class member `B.foo` overrides parent class `A` in an inconsistent manner
+  `B.foo` has type `[T](x: str, y: T) -> list[T]`, which is not assignable to `[T](x: int, y: T) -> T`, the type of `A.foo`
+  Signature mismatch:
+  expected: def foo(self: B, x: int, y: T) -> T: ...
+                                ^^^ parameter
+  found:    def foo(self: B, x: str, y: T) -> list[T]: ...
+                                ^^^ parameter"#;
+        assert_eq!(messages[0], expected);
+    }
+
     /// Inferred (unannotated) return types: verifies signature diff works
     /// when return types have no explicit annotation.
     #[test]
@@ -408,11 +715,11 @@ class B(A):
   expected: def foo(self: B, x: int) -> int: ...
                                 ^^^     ^^^ return type
                                 |
-                                parameters
+                                parameter
   found:    def foo(self: B, x: str) -> str: ...
                                 ^^^     ^^^ return type
                                 |
-                                parameters"#;
+                                parameter"#;
         assert_eq!(messages[0], expected);
     }
 
@@ -436,13 +743,13 @@ class B(A):
   `B.foo` has type `(self: Unknown) -> None`, which is not assignable to `(x: int) -> int`, the type of `A.foo`
   Signature mismatch:
   expected: def foo(self: B, x: int) -> int: ...
-                          ^^^^^^^^^     ^^^ return type
-                          |
-                          parameters
+                             ^^^^^^     ^^^ return type
+                             |
+                             parameter
   found:    (self: Unknown) -> None
-                   ^^^^^^^     ^^^^ return type
-                   |
-                   parameters"#;
+             ^^^^^^^^^^^^^     ^^^^ return type
+             |
+             parameter"#;
         assert_eq!(messages[0], expected);
     }
 
@@ -468,13 +775,11 @@ class B(A):
   `B.method` has type `() -> None`, which is not assignable to `(x: int) -> int`, the type of `A.method`
   Signature mismatch:
   expected: def method(self: B, x: int) -> int: ...
-                             ^^^^^^^^^     ^^^ return type
-                             |
-                             parameters
+                                ^^^^^^     ^^^ return type
+                                |
+                                parameter
   found:    def method(self: Unknown) -> None: ...
-                             ^^^^^^^     ^^^^ return type
-                             |
-                             parameters"#;
+                                         ^^^^ return type"#;
         assert_eq!(messages[0], expected);
     }
 
@@ -487,7 +792,7 @@ class B(A):
         let expected = "() -> EdgeFoo | EdgeBar";
         let found = "() -> Edge";
         // Should not panic. The diff should highlight the return type difference.
-        let result = render_signature_diff(expected, found);
+        let result = render_signature_diff(&signature(expected), &signature(found), None);
         assert!(
             result.is_some(),
             "Expected a signature diff for differing return types"
@@ -500,7 +805,7 @@ class B(A):
 
         let expected = "def _money_desc(cls: type[PensionAsset]) -> Literal['累计可领(元)']: ...";
         let found = "def _money_desc(cls: type[PensionAsset]) -> Literal['90岁累计可领(元)']: ...";
-        let result = render_signature_diff(expected, found);
+        let result = render_signature_diff(&signature(expected), &signature(found), None);
         let lines = result.expect("Expected a signature diff for differing Unicode return types");
         let joined = lines.join("\n");
         assert!(
@@ -514,7 +819,7 @@ class B(A):
 
         let expected = "def _money_desc(cls: type[PensionAsset]) -> Literal['累计可领']: ...";
         let found = "def _money_desc(cls: type[PensionAsset]) -> Literal['累计可累']: ...";
-        let result = render_signature_diff(expected, found);
+        let result = render_signature_diff(&signature(expected), &signature(found), None);
         let lines = result.expect("Expected a signature diff for differing Unicode return types");
         let joined = lines.join("\n");
         assert!(
@@ -528,7 +833,7 @@ class B(A):
 
         let expected = "def _money_desc(cls: type[PensionAsset]) -> Literal['累计可领']: ...";
         let found = "def _money_desc(cls: type[PensionAsset]) -> Literal['领计可领']: ...";
-        let result = render_signature_diff(expected, found);
+        let result = render_signature_diff(&signature(expected), &signature(found), None);
         let lines = result.expect("Expected a signature diff for differing Unicode return types");
         let joined = lines.join("\n");
         assert!(

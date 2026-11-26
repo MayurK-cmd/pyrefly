@@ -27,7 +27,9 @@ use std::time::Instant;
 
 use dupe::Dupe;
 use dupe::OptionDupedExt;
+use pyrefly_build::handle::Handle;
 use pyrefly_graph::index::Idx;
+use pyrefly_python::module_key::ModuleKey;
 use pyrefly_python::module_name::ModuleName;
 use pyrefly_python::module_path::ModulePath;
 use pyrefly_util::display::DisplayWith;
@@ -40,6 +42,7 @@ use ruff_text_size::Ranged;
 use ruff_text_size::TextRange;
 use starlark_map::Hashed;
 use starlark_map::small_map::SmallMap;
+use vec1::Vec1;
 
 use crate::alt::answers_solver::AnswerScope;
 use crate::alt::answers_solver::AnswersSolver;
@@ -48,6 +51,8 @@ use crate::alt::answers_solver::ReservedSlot;
 use crate::alt::answers_solver::ThreadState;
 use crate::alt::attr::AttrDefinition;
 use crate::alt::attr::AttrInfo;
+use crate::alt::class::attrs::AttrsInitName;
+use crate::alt::class::class_field::DataclassMember;
 use crate::alt::traits::Solve;
 use crate::binding::binding::AnyIdx;
 use crate::binding::binding::Exported;
@@ -81,8 +86,10 @@ use crate::table_mut_for_each;
 use crate::table_try_for_each;
 use crate::types::callable::Callable;
 use crate::types::class::Class;
+use crate::types::class::ClassDef;
 use crate::types::class::ClassDefIndex;
 use crate::types::class::ClassFields;
+use crate::types::env::TypeEnv;
 use crate::types::equality::TypeEq;
 use crate::types::equality::TypeEqCtx;
 use crate::types::heap::TypeHeap;
@@ -111,6 +118,10 @@ pub struct Index {
     /// The call-site range spells the class name, not the definition's own name, so these are
     /// gated behind `ReferenceOptions::include_constructor_call_sites`.
     pub constructor_references: SmallMap<ModulePath, Vec<(IndexedAttribute, TextRange)>>,
+    /// Literal slot occurrences, including attributes declared in this module.
+    pub slot_references: SmallMap<ModulePath, Vec<(IndexedAttribute, TextRange)>>,
+    /// Constructor keywords that refer to class fields, including fields defined in this module.
+    pub keyword_argument_references: SmallMap<ModulePath, Vec<(IndexedAttribute, TextRange)>>,
     /// A map from (child method range) to a list of parent method definitions (ModulePath, parent method).
     /// This is used to find reimplementations when doing find-references on parent methods.
     pub parent_methods_map: SmallMap<TextRange, Vec<(ModulePath, IndexedAttribute)>>,
@@ -144,6 +155,10 @@ pub enum AttributeReferenceKind {
     /// constructor protocol, as in `Foo()` reaching `Foo.__init__`. Only class construction
     /// is recorded this way; calling an instance through its `__call__` is not.
     ConstructorCall,
+    /// A literal name in the owning class's `__slots__` binding.
+    Slot,
+    /// A keyword argument to a synthesized initializer that refers to a class field.
+    KeywordArgument,
 }
 
 /// Visiting a trace store reaches every type recorded in it.
@@ -159,39 +174,40 @@ impl VisitMut<Type> for Traces {
             }
         }
         for callee in self.overloaded_callees.values_mut() {
-            // Note: `tparams` does not need to be visited, as this comes from an answer
-            // which is already visited. `TArgs` skips tparams for the same reason.
-            match callee {
-                OverloadedCallee::Resolved { callable: trace } => {
-                    let OverloadTrace {
-                        callable,
-                        tparams: _,
-                    } = trace;
-                    callable.visit_mut(f);
-                }
-                OverloadedCallee::Candidates { all, closest, .. } => {
-                    for OverloadTrace {
-                        callable,
-                        tparams: _,
-                    } in all.iter_mut().chain(std::iter::once(closest))
-                    {
-                        callable.visit_mut(f);
-                    }
-                }
-            }
+            callee.recurse_mut(f);
         }
     }
 }
 
-#[derive(Debug, Clone)]
+/// Receiver information that a callable signature alone cannot preserve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TraceReceiver {
+    /// The trace lacks binding information; the callee determines receiver handling.
+    Unknown,
+    /// The implicit receiver is still present in this bound-call signature.
+    Present,
+    /// Recovery has already removed the implicit receiver from the signature.
+    Stripped,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OverloadTrace {
-    callable: Callable,
+    pub(crate) callable: Callable,
     tparams: Option<Arc<TParams>>,
+    pub(crate) receiver: TraceReceiver,
 }
 
 impl OverloadTrace {
-    pub(crate) fn new(callable: Callable, tparams: Option<Arc<TParams>>) -> Self {
-        Self { callable, tparams }
+    pub(crate) fn new(
+        callable: Callable,
+        tparams: Option<Arc<TParams>>,
+        receiver: TraceReceiver,
+    ) -> Self {
+        Self {
+            callable,
+            tparams,
+            receiver,
+        }
     }
 
     fn as_type(&self) -> Type {
@@ -205,7 +221,7 @@ impl OverloadTrace {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OverloadedCallee {
     Resolved {
         callable: OverloadTrace,
@@ -215,6 +231,87 @@ pub enum OverloadedCallee {
         closest: OverloadTrace,
         is_closest_chosen: bool,
     },
+    /// Chosen callees from mutually exclusive, accepted contextual checks.
+    Alternatives(Vec1<OverloadedCallee>),
+}
+
+impl OverloadedCallee {
+    fn chosen_type(&self) -> Option<Type> {
+        match self {
+            Self::Resolved { callable } => Some(callable.as_type()),
+            Self::Candidates {
+                closest,
+                is_closest_chosen: true,
+                ..
+            } => Some(closest.as_type()),
+            Self::Candidates { .. } => None,
+            Self::Alternatives(alternatives) => alternatives
+                .iter()
+                .map(Self::chosen_type)
+                .collect::<Option<Vec<_>>>()
+                .map(Type::union),
+        }
+    }
+
+    fn signatures(&self) -> (Vec<OverloadTrace>, Option<usize>) {
+        match self {
+            Self::Resolved { callable } => (vec![callable.clone()], Some(0)),
+            Self::Candidates { all, closest, .. } => (
+                all.clone(),
+                all.iter()
+                    .position(|trace| trace.callable == closest.callable),
+            ),
+            Self::Alternatives(alternatives) => (
+                alternatives
+                    .iter()
+                    .flat_map(|callee| callee.signatures().0)
+                    .collect(),
+                None,
+            ),
+        }
+    }
+
+    fn merge_alternative(&mut self, other: Self) {
+        if *self == other {
+            return;
+        }
+        match self {
+            Self::Alternatives(alternatives) => match other {
+                Self::Alternatives(others) => {
+                    for other in others {
+                        if !alternatives.contains(&other) {
+                            alternatives.push(other);
+                        }
+                    }
+                }
+                other if !alternatives.contains(&other) => alternatives.push(other),
+                _ => {}
+            },
+            _ => {
+                let mut alternatives = Vec1::new(self.clone());
+                alternatives.push(other);
+                *self = Self::Alternatives(alternatives);
+            }
+        }
+    }
+}
+
+impl VisitMut<Type> for OverloadedCallee {
+    fn recurse_mut(&mut self, f: &mut dyn FnMut(&mut Type)) {
+        match self {
+            Self::Resolved { callable } => callable.callable.visit_mut(f),
+            Self::Candidates { all, closest, .. } => {
+                for trace in all.iter_mut().chain(std::iter::once(closest)) {
+                    trace.callable.visit_mut(f);
+                }
+            }
+            Self::Alternatives(alternatives) => {
+                for alternative in alternatives {
+                    alternative.recurse_mut(f);
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -254,6 +351,53 @@ pub struct TraceSideEffects {
     pub overloaded_callees: SmallMap<TextRange, OverloadedCallee>,
     pub invoked_properties: SmallMap<TextRange, Arc<Type>>,
     pub expected_types: SmallMap<TextRange, Arc<Type>>,
+}
+
+impl VisitMut<Type> for TraceSideEffects {
+    fn recurse_mut(&mut self, f: &mut dyn FnMut(&mut Type)) {
+        for map in [
+            &mut self.types,
+            &mut self.invoked_properties,
+            &mut self.expected_types,
+        ] {
+            for ty in map.values_mut() {
+                f(Arc::make_mut(ty));
+            }
+        }
+        for callee in self.overloaded_callees.values_mut() {
+            callee.recurse_mut(f);
+        }
+    }
+}
+
+impl TraceSideEffects {
+    /// Preserve every accepted context at each source range, rather than the last writer.
+    pub(crate) fn merge_alternatives(&mut self, other: Self, union: impl Fn(Vec<Type>) -> Type) {
+        for (destination, source) in [
+            (&mut self.types, other.types),
+            (&mut self.invoked_properties, other.invoked_properties),
+            (&mut self.expected_types, other.expected_types),
+        ] {
+            for (range, ty) in source {
+                destination
+                    .entry(range)
+                    .and_modify(|current| {
+                        if current != &ty {
+                            *current = Arc::new(union(vec![(**current).clone(), (*ty).clone()]));
+                        }
+                    })
+                    .or_insert(ty);
+            }
+        }
+        for (range, callee) in other.overloaded_callees {
+            match self.overloaded_callees.get_mut(&range) {
+                Some(current) => current.merge_alternative(callee),
+                None => {
+                    self.overloaded_callees.insert(range, callee);
+                }
+            }
+        }
+    }
 }
 
 /// Invariants:
@@ -729,12 +873,13 @@ table!(
     pub struct AnswerTable(pub AnswerEntry)
 );
 
-impl fmt::Display for Answers {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl<'e> DisplayWith<dyn TypeEnv + 'e> for Answers {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>, env: &(dyn TypeEnv + 'e)) -> fmt::Result {
         fn go<K: Keyed>(
             answers: &Answers,
             _entry: &AnswerEntry<K>,
             f: &mut fmt::Formatter<'_>,
+            env: &dyn TypeEnv,
         ) -> fmt::Result
         where
             AnswerTable: TableKeyed<K, Value = AnswerEntry<K>>,
@@ -751,7 +896,7 @@ impl fmt::Display for Answers {
                     bindings.module().display(key),
                     value.display_with(bindings),
                     match answers.get_idx(idx) {
-                        Some(v) => v.to_string(),
+                        Some(v) => v.display_with(env).to_string(),
                         None => "(unsolved)".to_owned(),
                     },
                 )?;
@@ -759,7 +904,7 @@ impl fmt::Display for Answers {
             Ok(())
         }
 
-        table_try_for_each!(self.table, |x| go(self, x, f));
+        table_try_for_each!(self.table, |x| go(self, x, f, env));
         Ok(())
     }
 }
@@ -828,9 +973,14 @@ impl SolutionsData {
                 // structurally mutated after this loop, so each `SmallMap`
                 // position remains identical to its binding `Idx`.
                 for idx in keys {
-                    items
-                        .0
-                        .insert(bindings.idx_to_key(idx).clone(), AnswerSlot::default());
+                    let key = bindings.idx_to_key(idx);
+                    // `changed_exports` reports a change to an exported key as its
+                    // `AnyExportedKey`, so every exported key must have one.
+                    debug_assert!(
+                        key.try_to_anykey().is_some(),
+                        "exported key `{key:?}` has no `AnyExportedKey`"
+                    );
+                    items.0.insert(key.clone(), AnswerSlot::default());
                 }
                 assert_eq!(items.len(), len, "exported solution keys must be unique");
             }
@@ -860,13 +1010,14 @@ pub struct Solutions {
     cinderx_solutions: Option<Arc<CinderxSolutions>>,
 }
 
-impl Display for Solutions {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl<'e> DisplayWith<dyn TypeEnv + 'e> for Solutions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>, env: &(dyn TypeEnv + 'e)) -> fmt::Result {
         fn go<K: Keyed>(
             _entry: &SolutionsEntry<K>,
             solutions: &Solutions,
             f: &mut fmt::Formatter<'_>,
             ctx: &ModuleInfo,
+            env: &dyn TypeEnv,
         ) -> fmt::Result
         where
             BindingTable: TableKeyed<K, Value = BindingEntry<K>>,
@@ -874,20 +1025,20 @@ impl Display for Solutions {
         {
             for (key, slot) in solutions.solution_slots::<K>() {
                 let answer = slot.get();
-                writeln!(f, "{} = {}", ctx.display(key), answer)?;
+                writeln!(f, "{} = {}", ctx.display(key), answer.display_with(env))?;
             }
             Ok(())
         }
 
-        table_try_for_each!(&self.data.table, |x| go(x, self, f, &self.module_info));
+        table_try_for_each!(&self.data.table, |x| go(x, self, f, &self.module_info, env));
         Ok(())
     }
 }
 
 pub struct SolutionsDifference<'a> {
     key: (&'a dyn DisplayWith<ModuleInfo>, &'a dyn Debug),
-    lhs: Option<(&'a dyn Display, &'a dyn Debug)>,
-    rhs: Option<(&'a dyn Display, &'a dyn Debug)>,
+    lhs: Option<(&'a dyn for<'e> DisplayWith<dyn TypeEnv + 'e>, &'a dyn Debug)>,
+    rhs: Option<(&'a dyn for<'e> DisplayWith<dyn TypeEnv + 'e>, &'a dyn Debug)>,
 }
 
 impl Debug for SolutionsDifference<'_> {
@@ -900,12 +1051,16 @@ impl Debug for SolutionsDifference<'_> {
     }
 }
 
-impl Display for SolutionsDifference<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let missing = |f: &mut fmt::Formatter, x: Option<(&dyn Display, &dyn Debug)>| match x {
-            None => write!(f, "missing"),
-            Some(x) => write!(f, "`{}`", x.0),
-        };
+impl<'e> DisplayWith<dyn TypeEnv + 'e> for SolutionsDifference<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>, env: &(dyn TypeEnv + 'e)) -> fmt::Result {
+        let missing =
+            |f: &mut fmt::Formatter,
+             x: Option<(&dyn for<'x> DisplayWith<dyn TypeEnv + 'x>, &dyn Debug)>| {
+                match x {
+                    None => write!(f, "missing"),
+                    Some(x) => write!(f, "`{}`", x.0.display_with(env)),
+                }
+            };
 
         // The key has type DisplayWith<ModuleInfo>.
         // We don't know if the key originates on the LHS or RHS, so we don't know which is the appropriate ModuleInfo.
@@ -1216,14 +1371,35 @@ impl Solutions {
     }
 }
 
+/// The module that a cross-module lookup reads from.
+#[derive(Debug, Clone, Copy, Dupe)]
+pub enum LookupModule {
+    /// The module that this name resolves to when imported from the current module.
+    Import(ModuleName),
+    /// The module loaded from exactly this name and path. Lookups compare the key with
+    /// `ModuleKey::exact`, so the in-memory and on-disk versions of a file stay separate.
+    Exact(ModuleKey),
+}
+
+impl LookupModule {
+    pub fn name(self) -> ModuleName {
+        match self {
+            Self::Import(name) => name,
+            Self::Exact(key) => key.name(),
+        }
+    }
+}
+
 pub trait LookupAnswer: Sized {
-    /// Look up the value. If present, the `path` is a hint which can optimize certain cases.
+    /// The module and Python environment used by this lookup.
+    fn handle(&self) -> &Handle;
+
+    /// Look up the value of `k` in `module`.
     ///
     /// Return None if the file is undergoing concurrent modification.
     fn get<'answer, K: Solve<Self> + Exported>(
         &self,
-        module: ModuleName,
-        path: Option<&ModulePath>,
+        module: LookupModule,
         k: &K,
         stack: &'answer ThreadState,
         answer_scope: &'answer AnswerScope,
@@ -1268,6 +1444,16 @@ pub trait LookupAnswer: Sized {
     /// Default implementation does nothing (not supported).
     fn publish_reserved_in_module(&self, _reserved: &mut ReservedSlot<'_, '_, '_, Self>) {}
 
+    /// Look up the Answers of a cross-module SCC member's module, to report on
+    /// that member.
+    ///
+    /// Returns `None` if the Answers are unavailable, in which case
+    /// `reserve_in_module` does not reserve the member either. The default
+    /// implementation returns `None` (not supported).
+    fn answers_in_module(&self, _calc_id: &CalcId) -> Option<Arc<Answers>> {
+        None
+    }
+
     /// Look up the class fields for a class, which may be defined in another
     /// module. The fields are populated during the binding phase and can be
     /// queried without going through the solve code path.
@@ -1279,6 +1465,14 @@ pub trait LookupAnswer: Sized {
     /// incremental rebuilds properly invalidate dependents when class
     /// fields change.
     fn get_class_fields(&self, cls: &Class) -> Option<&ClassFields>;
+
+    /// Look up the definition data of a class of another module: its row in the module's
+    /// binding metadata, or the module's placeholder row if the `ClassDefIndex` is stale.
+    ///
+    /// Implementations must register a dependency on the class's definition facts
+    /// (`ModuleDep::ClassDef`), and must return the same row for a class every time, so that an
+    /// order computed from rows stays consistent while one solver uses it.
+    fn get_class_def(&self, cls: &Class) -> &ClassDef;
 }
 
 impl Answers {
@@ -1521,12 +1715,37 @@ impl Answers {
         if let Some(trace_store) = &self.trace {
             trace_store
                 .lock()
-                .visit_mut(&mut |ty| self.solver.force_mut(ty));
+                .visit_mut(&mut |ty| self.solver.force_mut(ty, &answers_solver));
         }
         // `pre_solve` has published every exported slot. From this point on,
         // the preallocated solutions table represents a complete result set.
+        if self.index.is_some() {
+            for entry in bindings.dunder_slots_entries() {
+                if let Some(class) = answers_solver.get_idx(entry.class_idx).0.as_ref() {
+                    answers_solver.record_attribute_definition_index(
+                        &answers_solver.instantiate(class),
+                        &entry.name.id,
+                        entry.name.range,
+                        AttributeReferenceKind::Slot,
+                    );
+                }
+            }
+        }
         if let Some(index) = &self.index {
             let mut index = index.lock();
+            // Retain export occurrences so unopened reverse dependencies need no AST or answers.
+            for entry in bindings.dunder_all_entries() {
+                if let Some(key) = bindings.dunder_all_binding(&entry.id)
+                    && let Some(IntermediateDefinition::NamedImport(_, module, name, None)) =
+                        key_to_intermediate_definition(bindings, key)
+                {
+                    index
+                        .externally_defined_variable_references
+                        .entry((module, name))
+                        .or_default()
+                        .push(entry.range);
+                }
+            }
             // Index bindings with external definitions.
             for idx in bindings.keys::<Key>() {
                 let key = bindings.idx_to_key(idx);
@@ -1571,7 +1790,8 @@ impl Answers {
             }
         }
 
-        let pysa_solutions = pysa_context.map(PysaSolutions::build);
+        let pysa_solutions =
+            pysa_context.map(|context| PysaSolutions::build(context, &answers_solver));
         let cinderx_solutions =
             enable_cinderx_solutions.then(|| CinderxSolutions::build(&answers_solver));
 
@@ -1797,35 +2017,16 @@ impl Answers {
 
     pub fn get_chosen_overload_trace(&self, range: TextRange) -> Option<Type> {
         let lock = self.trace.as_ref()?.lock();
-        match lock.overloaded_callees.get(&range)? {
-            OverloadedCallee::Resolved { callable } => Some(callable.as_type()),
-            OverloadedCallee::Candidates {
-                closest,
-                is_closest_chosen,
-                ..
-            } if *is_closest_chosen => Some(closest.as_type()),
-            _ => None,
-        }
+        lock.overloaded_callees.get(&range)?.chosen_type()
     }
 
     /// Returns all the overload, and the index of a chosen one
     pub fn get_all_overload_trace(
         &self,
         range: TextRange,
-    ) -> Option<(Vec<Callable>, Option<usize>)> {
+    ) -> Option<(Vec<OverloadTrace>, Option<usize>)> {
         let lock = self.trace.as_ref()?.lock();
-        match lock.overloaded_callees.get(&range)? {
-            OverloadedCallee::Resolved { callable } => {
-                Some((vec![callable.callable.clone()], Some(0)))
-            }
-            OverloadedCallee::Candidates { all, closest, .. } => {
-                let chosen_index = all
-                    .iter()
-                    .position(|signature| signature.callable == closest.callable);
-                let signatures = all.iter().map(|trace| trace.callable.clone()).collect();
-                Some((signatures, chosen_index))
-            }
-        }
+        Some(lock.overloaded_callees.get(&range)?.signatures())
     }
 
     pub fn add_parent_method_mapping(
@@ -1854,10 +2055,15 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         if self.current().trace.is_some()
             && let Some(callable) = ty.clone().to_callable()
         {
+            let receiver = if matches!(ty, Type::BoundMethod(_)) {
+                TraceReceiver::Present
+            } else {
+                TraceReceiver::Unknown
+            };
             self.trace_state().record_resolved_trace(
                 loc,
                 OverloadedCallee::Resolved {
-                    callable: OverloadTrace::new(callable, None),
+                    callable: OverloadTrace::new(callable, None, receiver),
                 },
             );
         }
@@ -1895,6 +2101,26 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             return;
         }
         if let Some(index) = &self.current().index {
+            if let (AttributeReferenceKind::KeywordArgument, Type::ClassDef(cls)) =
+                (reference_kind, base)
+            {
+                let metadata = self.get_metadata_for_class(cls);
+                let is_field_parameter = metadata.dataclass_metadata().is_some_and(|dataclass| {
+                    dataclass.fields.contains_key(attribute_name)
+                        && matches!(
+                            self.get_dataclass_member(cls, attribute_name),
+                            DataclassMember::Field(_, flags) | DataclassMember::InitVar(_, flags)
+                                if flags.init_by_name && (flags.init || metadata.is_pydantic_model())
+                        )
+                        && !matches!(
+                            self.attrs_init_param_name(cls, attribute_name, dataclass),
+                            AttrsInitName::Renamed(_)
+                        )
+                });
+                if !is_field_parameter {
+                    return;
+                }
+            }
             for AttrInfo {
                 name,
                 ty: _,
@@ -1908,8 +2134,32 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     AttrDefinition::FullyResolved {
                         cls,
                         range: _,
-                        docstring_range: _,
+                        doc_ranges: _,
                     } => match reference_kind {
+                        AttributeReferenceKind::Slot => index
+                            .lock()
+                            .slot_references
+                            .entry(cls.module_path().dupe())
+                            .or_default()
+                            .push((
+                                IndexedAttribute {
+                                    cls: cls.index(),
+                                    name,
+                                },
+                                attribute_reference_range,
+                            )),
+                        AttributeReferenceKind::KeywordArgument => index
+                            .lock()
+                            .keyword_argument_references
+                            .entry(cls.module_path().dupe())
+                            .or_default()
+                            .push((
+                                IndexedAttribute {
+                                    cls: cls.index(),
+                                    name,
+                                },
+                                attribute_reference_range,
+                            )),
                         AttributeReferenceKind::ConstructorCall => index
                             .lock()
                             .constructor_references

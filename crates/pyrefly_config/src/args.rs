@@ -23,6 +23,7 @@ use pyrefly_util::arc_id::ArcId;
 use pyrefly_util::display;
 use pyrefly_util::interned_path::InternedPath;
 
+use crate::base::ClassDecoratorBehavior;
 use crate::base::InferReturnTypes;
 use crate::base::Preset;
 use crate::base::RecursionOverflowHandler;
@@ -135,6 +136,16 @@ pub struct EnvironmentArgs {
     #[arg(long, group = "env_source")]
     pub(crate) skip_interpreter_query: bool,
 
+    /// Don't warn that the `PYTHONPATH` environment variable is set when querying
+    /// a Python interpreter.
+    #[arg(
+        long,
+        default_missing_value = "true",
+        require_equals = true,
+        num_args = 0..=1,
+    )]
+    pub(crate) disable_pythonpath_warning: Option<bool>,
+
     /// Override the bundled typeshed with a custom path.
     #[arg(long, value_parser = absolute_path_parser)]
     pub(crate) typeshed_path: Option<PathBuf>,
@@ -166,6 +177,7 @@ impl EnvironmentArgs {
             python_interpreter_path,
             fallback_python_interpreter_name,
             skip_interpreter_query,
+            disable_pythonpath_warning,
             typeshed_path,
             module_names,
             loaded_module_names: _,
@@ -183,6 +195,7 @@ impl EnvironmentArgs {
             || python_interpreter_path.is_some()
             || fallback_python_interpreter_name.is_some()
             || *skip_interpreter_query
+            || disable_pythonpath_warning.is_some()
             || typeshed_path.is_some()
             || module_names.is_some()
     }
@@ -252,6 +265,9 @@ impl EnvironmentArgs {
         }
         if let Some(x) = &self.site_package_path {
             config.python_environment.site_package_path = Some(x.clone());
+        }
+        if let Some(x) = &self.disable_pythonpath_warning {
+            config.disable_pythonpath_warning = *x;
         }
         if self.skip_interpreter_query || config.interpreters.skip_interpreter_query {
             config.interpreters.skip_interpreter_query = true;
@@ -370,6 +386,9 @@ pub struct ConfigOverrideArgs {
     /// are only eligible when --check-unannotated-defs is true.
     #[arg(long)]
     infer_return_types: Option<InferReturnTypes>,
+    /// How class decorators affect class types: ignore or typed-only.
+    #[arg(long)]
+    class_decorator_behavior: Option<ClassDecoratorBehavior>,
     /// Whether Pyrefly will respect ignore statements for other tools, e.g. `# pyright: ignore`.
     /// Equivalent to passing the names of all tools to `--enabled-ignores`.
     #[arg(
@@ -412,6 +431,14 @@ pub struct ConfigOverrideArgs {
     /// Deprecated no-op. Tensor shape support is derived from whether `shape_extensions` is resolvable.
     #[arg(long)]
     tensor_shapes: Option<bool>,
+    /// Use shape comments and shape-stub packages (default true). Native annotations are unaffected.
+    #[arg(
+        long,
+        default_missing_value = "true",
+        require_equals = true,
+        num_args = 0..=1
+    )]
+    use_shape_comments_and_stubs: Option<bool>,
     /// Whether to strictly check callable subtyping for signatures with `*args: Any, **kwargs: Any`.
     /// When false (the default), callables with `*args: Any, **kwargs: Any` are treated as
     /// compatible with any signature (similar to `...` behavior).
@@ -494,6 +521,7 @@ impl ConfigOverrideArgs {
             untyped_def_behavior,
             check_unannotated_defs,
             infer_return_types,
+            class_decorator_behavior,
             permissive_ignores,
             enabled_ignores,
             type_ignore_unknown_tag_behavior,
@@ -505,6 +533,7 @@ impl ConfigOverrideArgs {
             recursion_overflow_handler,
             pytorch_efficiency_lints,
             tensor_shapes,
+            use_shape_comments_and_stubs,
             strict_callable_subtyping,
             strict_partial_subtyping,
             spec_compliant_overloads,
@@ -525,6 +554,7 @@ impl ConfigOverrideArgs {
             || untyped_def_behavior.is_some()
             || check_unannotated_defs.is_some()
             || infer_return_types.is_some()
+            || class_decorator_behavior.is_some()
             || permissive_ignores.is_some()
             || enabled_ignores.is_some()
             || type_ignore_unknown_tag_behavior.is_some()
@@ -536,6 +566,7 @@ impl ConfigOverrideArgs {
             || recursion_overflow_handler.is_some()
             || pytorch_efficiency_lints.is_some()
             || tensor_shapes.is_some()
+            || use_shape_comments_and_stubs.is_some()
             || strict_callable_subtyping.is_some()
             || strict_partial_subtyping.is_some()
             || spec_compliant_overloads.is_some()
@@ -633,6 +664,9 @@ impl ConfigOverrideArgs {
         if let Some(x) = &self.infer_return_types {
             config.root.infer_return_types = Some(*x);
         }
+        if let Some(x) = &self.class_decorator_behavior {
+            config.root.class_decorator_behavior = Some(*x);
+        }
         match (self.permissive_ignores, &self.enabled_ignores) {
             // Special case: if the underlying config sets enabled-ignores and --permissive-ignores
             // is passed on the command-line, we overwrite enabled-ignores.
@@ -705,6 +739,9 @@ impl ConfigOverrideArgs {
         }
         if let Some(x) = &self.pytorch_efficiency_lints {
             config.root.pytorch_efficiency_lints = Some(*x);
+        }
+        if let Some(x) = self.use_shape_comments_and_stubs {
+            config.use_shape_comments_and_stubs = Some(x);
         }
         if let Some(x) = &self.strict_callable_subtyping {
             config.root.strict_callable_subtyping = Some(*x);
@@ -809,6 +846,47 @@ mod tests {
     use crate::config::SubConfig;
 
     #[test]
+    fn use_shape_comments_and_stubs_flag() {
+        for (flag, enabled) in [
+            ("--use-shape-comments-and-stubs=false", false),
+            ("--use-shape-comments-and-stubs=true", true),
+            ("--use-shape-comments-and-stubs", true),
+        ] {
+            let args =
+                ConfigOverrideArgs::parse_from(["pyrefly", "--skip-interpreter-query", flag]);
+            assert!(args.has_overrides());
+            let config =
+                ConfigFile::parse_config(&format!("use-shape-comments-and-stubs = {}\n", !enabled))
+                    .unwrap();
+            let (config, errors) = args.override_config(config);
+            assert!(errors.is_empty());
+            assert_eq!(config.use_shape_comments_and_stubs(), enabled);
+        }
+    }
+
+    #[test]
+    fn disable_pythonpath_warning_flag() {
+        for (flag, disabled) in [
+            ("--disable-pythonpath-warning=false", false),
+            ("--disable-pythonpath-warning=true", true),
+            ("--disable-pythonpath-warning", true),
+        ] {
+            let args =
+                ConfigOverrideArgs::parse_from(["pyrefly", "--skip-interpreter-query", flag]);
+            assert!(args.has_overrides());
+            let config = ConfigFile::parse_config(&format!(
+                "disable-pythonpath-warning = {}
+",
+                !disabled
+            ))
+            .unwrap();
+            let (config, errors) = args.override_config(config);
+            assert!(errors.is_empty());
+            assert_eq!(config.disable_pythonpath_warning, disabled);
+        }
+    }
+
+    #[test]
     fn repeated_python_platform_flags_merge() {
         let args = ConfigOverrideArgs::parse_from([
             "pyrefly",
@@ -850,6 +928,37 @@ mod tests {
     }
 
     #[test]
+    fn class_decorator_behavior_cli_overrides_config() {
+        for (value, expected) in [
+            ("ignore", ClassDecoratorBehavior::Ignore),
+            ("typed-only", ClassDecoratorBehavior::TypedOnly),
+        ] {
+            let args =
+                ConfigOverrideArgs::parse_from(["pyrefly", "--class-decorator-behavior", value]);
+            assert!(args.has_overrides());
+            let mut config = ConfigFile::default();
+            config.interpreters.skip_interpreter_query = true;
+            config.root.class_decorator_behavior =
+                Some(if expected == ClassDecoratorBehavior::Ignore {
+                    ClassDecoratorBehavior::TypedOnly
+                } else {
+                    ClassDecoratorBehavior::Ignore
+                });
+            let (config, errors) = args.override_config(config);
+            assert!(errors.is_empty());
+            assert_eq!(config.root.class_decorator_behavior, Some(expected));
+        }
+        assert!(
+            ConfigOverrideArgs::try_parse_from([
+                "pyrefly",
+                "--class-decorator-behavior",
+                "invalid"
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
     fn cli_interpreter_selection_overrides_config_skip() {
         for command_line in [
             ["pyrefly", "--python-interpreter-path", "python"],
@@ -871,14 +980,14 @@ mod tests {
         let config = ConfigFile {
             sub_configs: vec![
                 SubConfig {
-                    matches: Glob::new("src/**".to_owned()).unwrap(),
+                    matches: Glob::new("src/**".to_owned()).unwrap().into(),
                     settings: ConfigBase {
                         check_unannotated_defs: Some(false),
                         ..Default::default()
                     },
                 },
                 SubConfig {
-                    matches: Glob::new("src/strict/**".to_owned()).unwrap(),
+                    matches: Glob::new("src/strict/**".to_owned()).unwrap().into(),
                     settings: ConfigBase {
                         errors: Some(ErrorDisplayConfig::new(HashMap::from([
                             (ErrorKind::BadReturn, Severity::Warn),
@@ -914,7 +1023,7 @@ mod tests {
     fn cli_error_flags_beat_sub_config_pytorch_efficiency_lints() {
         let config = ConfigFile {
             sub_configs: vec![SubConfig {
-                matches: Glob::new("src/**".to_owned()).unwrap(),
+                matches: Glob::new("src/**".to_owned()).unwrap().into(),
                 settings: ConfigBase {
                     pytorch_efficiency_lints: Some(true),
                     ..Default::default()

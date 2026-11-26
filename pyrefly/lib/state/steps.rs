@@ -27,6 +27,7 @@ use crate::alt::answers::Answers;
 use crate::alt::answers::LookupAnswer;
 use crate::alt::answers::Solutions;
 use crate::binding::bindings::Bindings;
+use crate::config::base::ClassDecoratorBehavior;
 use crate::config::base::InferReturnTypes;
 use crate::config::base::RecursionLimitConfig;
 use crate::error::collector::ErrorCollector;
@@ -64,8 +65,10 @@ pub struct Context<'a, Lookup> {
     pub lookup: &'a Lookup,
     pub check_unannotated_defs: bool,
     pub infer_return_types: InferReturnTypes,
+    pub class_decorator_behavior: ClassDecoratorBehavior,
     pub infer_with_first_use: bool,
     pub tensor_shapes: bool,
+    pub use_shape_comments_and_stubs: bool,
     pub strict_callable_subtyping: bool,
     pub strict_partial_subtyping: bool,
     pub spec_compliant_overloads: bool,
@@ -527,6 +530,8 @@ impl Step {
         let module_ranges = (load.error_style != ErrorStyle::Never).then(|| {
             let module_ranges = ModuleRanges::compute(&module, &load.module_info);
             errors.add_misplaced_ignores(&module_ranges.misplaced_ignore_all);
+            errors.add_invalid_ignores();
+            errors.add_ignore_without_code();
             Arc::new(module_ranges)
         });
         Arc::new(ParsedModule::new(
@@ -561,6 +566,7 @@ impl Step {
         exports: Arc<Exports>,
     ) -> Arc<Answers> {
         let solver = Solver::new(SolverConfig {
+            class_decorator_behavior: ctx.class_decorator_behavior,
             infer_with_first_use: ctx.infer_with_first_use,
             tensor_shapes: ctx.tensor_shapes,
             strict_callable_subtyping: ctx.strict_callable_subtyping,
@@ -588,6 +594,7 @@ impl Step {
             ctx.infer_return_types,
             ctx.treat_all_caps_as_final,
             ctx.infer_param_types_from_docstring,
+            ctx.use_shape_comments_and_stubs,
         );
         Arc::new(Answers::new(
             bindings,

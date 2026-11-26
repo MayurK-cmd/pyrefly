@@ -5,6 +5,8 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use pyrefly_python::sys_info::PythonVersion;
+
 use crate::test::util::TestEnv;
 use crate::testcase;
 
@@ -1279,7 +1281,7 @@ f(C())
     "#,
 );
 
-// https://github.com/facebook/pyrefly/issues/4656
+// https://github.com/pyrefly-org/pyrefly/issues/4656
 testcase!(
     test_self_type_explicit_protocol_subclass,
     r#"
@@ -1296,7 +1298,7 @@ def g(x: Q[int]) -> None: ...
 def h(x: Q[str]) -> None: ...
 
 class C(P):
-    def method(self) -> list[C]:
+    def method(self) -> "list[C]":
         return []
 
     def foo(self) -> P:
@@ -1304,7 +1306,7 @@ class C(P):
         return self
 
 class D(Q[int]):
-    def method(self, x: int) -> list[D]:
+    def method(self, x: int) -> "list[D]":
         return []
 
     def foo(self) -> None:
@@ -1530,6 +1532,731 @@ issubclass(Implementation, DataOnlyProtocol)   # E: Protocol `DataOnlyProtocol` 
 );
 
 testcase!(
+    test_issubclass_with_empty_slots,
+    r#"
+from collections.abc import Buffer
+from typing import SupportsInt, runtime_checkable, Protocol
+
+# >>> stdlib
+
+issubclass(int, SupportsInt)
+issubclass(bytes, Buffer)
+
+# >>> user-defined
+
+@runtime_checkable
+class MyBufferProtocol(Protocol):
+    __slots__ = ()
+
+    def __buffer__(self, flags: int, /) -> memoryview: ...
+
+class MyBufferImpl:
+    def __buffer__(self, flags: int, /) -> memoryview: ...
+
+issubclass(MyBufferImpl, MyBufferProtocol)
+"#,
+);
+
+testcase!(
+    test_issubclass_with_annotated_slots,
+    r#"
+from typing import runtime_checkable, Protocol
+
+@runtime_checkable
+class MyBufferProtocol(Protocol):
+    __slots__: tuple[str, ...]
+
+    def __buffer__(self, flags: int, /) -> memoryview: ...
+
+class MyBufferImpl:
+    def __buffer__(self, flags: int, /) -> memoryview: ...
+
+issubclass(MyBufferImpl, MyBufferProtocol)
+"#,
+);
+
+testcase!(
+    test_issubclass_with_generic_and_empty_slots,
+    TestEnv::new_with_version(PythonVersion::new(3, 12, 0)),
+    r#"
+from typing import Protocol, runtime_checkable
+
+@runtime_checkable
+class P[T](Protocol):
+    __slots__ = ()
+    def m(self, value: T) -> T: ...
+
+class Impl:
+    def m(self, value: int) -> int: ...
+
+issubclass(Impl, P)
+"#,
+);
+
+testcase!(
+    test_isinstance_raise_unsafe_overlap_by_wrong_typing_with_empty_slots,
+    r#"
+from collections.abc import Buffer
+
+class WrongBufferImpl:
+    def __buffer__(self, flags: int, /) -> bytes: ...
+
+isinstance(WrongBufferImpl(), Buffer)  # E: Runtime checkable protocol `Buffer` has an unsafe overlap with type `WrongBufferImpl`
+"#,
+);
+
+testcase!(
+    test_issubclass_raise_non_method_members_by_static_typed_member_with_empty_slots,
+    r#"
+from typing import Protocol, runtime_checkable
+
+@runtime_checkable
+class MyDataProtocol(Protocol):
+    __slots__ = ()
+    name: str
+
+issubclass(bytes, MyDataProtocol)  # E: Protocol `MyDataProtocol` has non-method members and cannot be used with issubclass()
+"#,
+);
+
+testcase!(
+    test_issubclass_raise_non_method_members_by_non_empty_slots,
+    r#"
+from typing import Protocol, runtime_checkable
+
+@runtime_checkable
+class MyDataProtocolStr(Protocol):
+    __slots__ = "name"
+
+@runtime_checkable
+class MyDataProtocolTuple(Protocol):
+    __slots__ = ("name",)
+
+@runtime_checkable
+class MyDataProtocolDict(Protocol):
+    __slots__ = {"name": "doc"}
+
+
+issubclass(bytes, MyDataProtocolStr)  # E: Protocol `MyDataProtocolStr` has non-method members and cannot be used with issubclass()
+issubclass(bytes, MyDataProtocolTuple)  # E: Protocol `MyDataProtocolTuple` has non-method members and cannot be used with issubclass()
+issubclass(bytes, MyDataProtocolDict)  # E: Protocol `MyDataProtocolDict` has non-method members and cannot be used with issubclass()
+"#,
+);
+
+testcase!(
+    bug = "Unresolved `__slots__` cannot be simply treated as non-data or data",
+    test_issubclass_with_unresolved_slots,
+    r#"
+from typing import Protocol, runtime_checkable
+
+def get_slots() -> tuple[str, ...]:
+    return ("name",)
+
+SLOTS: tuple[str, ...] = ("name",)
+
+@runtime_checkable
+class UnknownSlots(Protocol):
+    __slots__ = get_slots()
+
+    def m(self) -> None: ...
+
+@runtime_checkable
+class ConstantSlots(Protocol):
+    __slots__ = SLOTS
+
+    def m(self) -> None: ...
+
+class Impl:
+    def m(self) -> None: ...
+
+issubclass(Impl, UnknownSlots)
+issubclass(Impl, ConstantSlots)
+"#,
+);
+
+testcase!(
+    test_issubclass_runtime_excluded_attributes,
+    r#"
+# `typing.EXCLUDED_ATTRIBUTES` names are excluded from runtime protocol members even when the
+# protocol declares them explicitly.
+
+from typing import Any, Protocol, runtime_checkable
+
+@runtime_checkable
+class ProtocolWithDunders(Protocol):
+    __doc__: str | None
+    __module__: str
+    __annotations__: dict[str, Any]
+    __match_args__: tuple[str, ...]
+
+    def m(self) -> None: ...
+
+
+@runtime_checkable
+class DictSlot(Protocol):
+    __slots__ = ("__dict__",)
+    def m(self) -> None: ...
+
+
+class Impl:
+    def m(self) -> None: ...
+
+
+# Runtime-excluded names remain static protocol members. The runtime check ignores
+# them, but an implementation that lacks them is still an unsafe overlap.
+issubclass(Impl, ProtocolWithDunders)  # E: Runtime checkable protocol `ProtocolWithDunders` has an unsafe overlap with type `Impl`
+
+# `__dict__` is runtime-excluded and has no static member declaration, so there
+# is nothing to compare and no unsafe overlap is reported.
+issubclass(Impl, DictSlot)
+"#,
+);
+
+testcase!(
+    test_issubclass_skips_abc_marker_at_runtime,
+    r#"
+# CPython skips `_abc_*` when collecting runtime protocol members.
+
+from typing import Protocol, runtime_checkable
+
+@runtime_checkable
+class Annotated(Protocol):
+    _abc_marker: int
+    def m(self) -> None: ...
+
+@runtime_checkable
+class SlotNamed(Protocol):
+    __slots__ = ("_abc_marker",)
+    def m(self) -> None: ...
+
+class Impl:
+    def m(self) -> None: ...
+
+issubclass(Impl, Annotated)  # E: Runtime checkable protocol `Annotated` has an unsafe overlap with type `Impl`
+issubclass(Impl, SlotNamed)
+"#,
+);
+
+testcase!(
+    test_isinstance_raise_unsafe_overlap_by_wrong_typing_with_abc_marker,
+    r#"
+from typing import Protocol, runtime_checkable
+
+@runtime_checkable
+class P(Protocol):
+    _abc_marker: int
+    def m(self) -> None: ...
+
+class AnnotatedWrong:
+    _abc_marker: str
+    def m(self) -> None: ...
+
+class AssignedWrong:
+    _abc_marker = "wrong"
+    def m(self) -> None: ...
+
+class Missing:
+    def m(self) -> None: ...
+
+isinstance(AnnotatedWrong(), P)  # E: Runtime checkable protocol `P` has an unsafe overlap with type `AnnotatedWrong`
+isinstance(AssignedWrong(), P)   # E: Runtime checkable protocol `P` has an unsafe overlap with type `AssignedWrong`
+isinstance(Missing(), P)  # E: Runtime checkable protocol `P` has an unsafe overlap with type `Missing`
+"#,
+);
+
+testcase!(
+    test_issubclass_with_child_slots_shadowing_inherited_method,
+    r#"
+# A slot in the child shadows an inherited method at runtime.
+
+from typing import Protocol, runtime_checkable
+
+@runtime_checkable
+class Base(Protocol):
+    def value(self) -> None: ...
+
+@runtime_checkable
+class Child(Base, Protocol):
+    __slots__ = ("value",)
+
+class Impl:
+    def value(self) -> None: ...
+
+issubclass(Impl, Child)  # E: Protocol `Child` has non-method members and cannot be used with issubclass()
+"#,
+);
+
+testcase!(
+    test_issubclass_with_child_method_shadowing_inherited_slots,
+    r#"
+# A method in the child shadows an inherited slot at runtime.
+
+from typing import Protocol, runtime_checkable
+
+@runtime_checkable
+class SlotBase(Protocol):
+    __slots__ = ("value",)
+
+@runtime_checkable
+class MethodChild(SlotBase, Protocol):
+    def value(self) -> None: ...
+
+class Impl:
+    def value(self) -> None: ...
+
+issubclass(Impl, MethodChild)
+"#,
+);
+
+testcase!(
+    test_issubclass_with_annotation_never_shadowing_slots,
+    r#"
+# An annotation-only declaration does not create a class attribute, so `getattr`
+# still finds the inherited slot descriptor at runtime.
+
+from typing import Callable, Protocol, runtime_checkable
+
+@runtime_checkable
+class SlotBase(Protocol):
+    __slots__ = ("value",)
+
+@runtime_checkable
+class AnnotatedChild(SlotBase, Protocol):
+    value: Callable[[], None]
+
+class Impl:
+    def value(self) -> None: ...
+
+issubclass(Impl, AnnotatedChild)  # E: Protocol `AnnotatedChild` has non-method members and cannot be used with issubclass()
+"#,
+);
+
+testcase!(
+    test_issubclass_with_shadowing_by_mro,
+    r#"
+from typing import Protocol, runtime_checkable
+
+@runtime_checkable
+class SlotBase(Protocol):
+    __slots__ = ("value",)
+
+@runtime_checkable
+class MethodBase(Protocol):
+    def value(self) -> None: ...
+
+class MethodFirst(MethodBase, SlotBase, Protocol): ...
+
+class SlotFirst(SlotBase, MethodBase, Protocol): ...
+
+class Impl:
+    def value(self) -> None: ...
+
+issubclass(Impl, MethodFirst)
+issubclass(Impl, SlotFirst)  # E: Protocol `SlotFirst` has non-method members and cannot be used with issubclass()
+"#,
+);
+
+testcase!(
+    test_issubclass_property_member_is_data_member,
+    r#"
+from typing import Callable, Protocol, runtime_checkable
+
+@runtime_checkable
+class P(Protocol):
+    @property
+    def value(self) -> Callable[[], None]: ...
+
+class Impl:
+    def value(self) -> None: ...
+
+issubclass(Impl, P)  # E: Protocol `P` has non-method members and cannot be used with issubclass()
+"#,
+);
+
+testcase!(
+    test_issubclass_decorated_method_is_non_data_member,
+    r#"
+from typing import Protocol, runtime_checkable
+
+@runtime_checkable
+class ClassMethodChild(Protocol):
+    @classmethod
+    def value(cls) -> None: ...
+
+@runtime_checkable
+class StaticMethodChild(Protocol):
+    @staticmethod
+    def value() -> None: ...
+
+class Impl:
+    def value(self) -> None: ...
+
+issubclass(Impl, ClassMethodChild)
+issubclass(Impl, StaticMethodChild)
+"#,
+);
+
+testcase!(
+    bug = "CPython rejects an annotation-only member as callable at runtime",
+    test_issubclass_callable_annotation_member_considered_as_non_data_member,
+    r#"
+from typing import Callable, Protocol, runtime_checkable
+
+@runtime_checkable
+class P(Protocol):
+    __slots__ = ()
+    f: Callable[[], None]
+    def m(self) -> None: ...
+
+class Impl:
+    def f(self) -> None: ...
+    def m(self) -> None: ...
+
+issubclass(Impl, P)
+"#,
+);
+
+testcase!(
+    test_issubclass_with_match_args_3_12,
+    TestEnv::new_with_version(PythonVersion::new(3, 12, 0)),
+    r#"
+# `__match_args__` is a real protocol member on 3.12
+
+from typing import Protocol, runtime_checkable
+
+@runtime_checkable
+class P(Protocol):
+    __match_args__: tuple[str, ...]
+    def m(self) -> None: ...
+
+class Impl:
+    def m(self) -> None: ...
+
+issubclass(Impl, P)  # E: Protocol `P` has non-method members and cannot be used with issubclass()
+"#,
+);
+
+testcase!(
+    test_isinstance_excludes_match_args_3_13,
+    TestEnv::new_with_version(PythonVersion::new(3, 13, 0)),
+    r#"
+# `__match_args__` is an excluded attribute name on 3.13+
+
+from typing import Protocol, runtime_checkable
+
+@runtime_checkable
+class P(Protocol):
+    __match_args__: tuple[str, ...]
+    def m(self) -> None: ...
+
+class Impl:
+    def m(self) -> None: ...
+
+isinstance(Impl(), P)  # E: Runtime checkable protocol `P` has an unsafe overlap with type `Impl`
+"#,
+);
+
+testcase!(
+    test_issubclass_with_class_getitem_3_8,
+    TestEnv::new_with_version(PythonVersion::new(3, 8, 0)),
+    r#"
+# `__class_getitem__` is a real protocol member on 3.8
+
+from typing import Protocol, runtime_checkable
+
+@runtime_checkable
+class P(Protocol):
+    __class_getitem__ = None
+    def m(self) -> None: ...
+
+class Impl:
+    def m(self) -> None: ...
+
+issubclass(Impl, P)  # E: Protocol `P` has non-method members and cannot be used with issubclass()
+"#,
+);
+
+testcase!(
+    test_issubclass_excludes_class_getitem_3_9,
+    TestEnv::new_with_version(PythonVersion::new(3, 9, 0)),
+    r#"
+# `__class_getitem__` is an excluded attribute name on 3.9+
+
+from typing import Protocol, runtime_checkable
+
+@runtime_checkable
+class P(Protocol):
+    __class_getitem__: None
+    def m(self) -> None: ...
+
+class Impl:
+    def m(self) -> None: ...
+
+# `__class_getitem__` is runtime-excluded on 3.9+, and pyrefly also skips it
+# in the unsafe-overlap type check.
+issubclass(Impl, P)
+"#,
+);
+
+testcase!(
+    test_issubclass_with_annotate_3_13,
+    TestEnv::new_with_version(PythonVersion::new(3, 13, 0)),
+    r#"
+# `__annotate__` is not runtime-excluded on 3.13, so an explicit annotation is a
+# non-method member and `issubclass()` rejects the protocol.
+
+from typing import Protocol, runtime_checkable
+
+@runtime_checkable
+class P(Protocol):
+    __annotate__: object
+    def m(self) -> None: ...
+
+class Impl:
+    def m(self) -> None: ...
+
+issubclass(Impl, P)  # E: Protocol `P` has non-method members and cannot be used with issubclass()
+"#,
+);
+
+testcase!(
+    test_issubclass_excludes_annotate_3_14,
+    TestEnv::new_with_version(PythonVersion::new(3, 14, 0)),
+    r#"
+# `__annotate__` is an excluded attribute name on 3.14+
+
+from typing import Protocol, runtime_checkable
+
+@runtime_checkable
+class P(Protocol):
+    __annotate__: object
+    def m(self) -> None: ...
+
+class Impl:
+    def m(self) -> None: ...
+
+issubclass(Impl, P)  # E: Runtime checkable protocol `P` has an unsafe overlap with type `Impl`
+"#,
+);
+
+testcase!(
+    test_isinstance_raise_unsafe_overlap_by_retyping_slot_attributes_and_misaligning_impl,
+    r#"
+from typing import Protocol, runtime_checkable
+
+@runtime_checkable
+class P(Protocol):
+    __slots__ = ("name",)
+    name: int
+    def m(self) -> int: ...
+
+class Mismatched:
+    name: str
+    def m(self) -> int: ...
+
+isinstance(Mismatched(), P)  # E: Runtime checkable protocol `P` has an unsafe overlap with type `Mismatched`
+"#,
+);
+
+testcase!(
+    bug = "Private attribute names are not mangled, so both presence and type check use the wrong name",
+    test_isinstance_with_private_attribute_name,
+    r#"
+from typing import Protocol, runtime_checkable
+
+@runtime_checkable
+class P(Protocol):
+    __x: int
+
+class WrongImpl:
+    __x = None
+
+class WorkableImpl:
+    _P__x = None
+
+isinstance(WrongImpl(), P)  # E: Runtime checkable protocol `P` has an unsafe overlap with type `WrongImpl`
+isinstance(WorkableImpl(), P)
+"#,
+);
+
+testcase!(
+    test_issubclass_excludes_mutable_mapping_marker,
+    r#"
+# `_MutableMapping__marker` is excluded on every version
+
+from typing import Protocol, runtime_checkable
+
+@runtime_checkable
+class P(Protocol):
+    _MutableMapping__marker: object
+    def m(self) -> None: ...
+
+class Impl:
+    def m(self) -> None: ...
+
+issubclass(Impl, P)  # E: Runtime checkable protocol `P` has an unsafe overlap with type `Impl`
+"#,
+);
+
+testcase!(
+    test_issubclass_with_typing_internals_3_11,
+    TestEnv::new_with_version(PythonVersion::new(3, 11, 0)),
+    r#"
+# The 3.12 typing internals are real protocol members on 3.11
+
+from typing import Protocol, runtime_checkable
+
+@runtime_checkable
+class P12(Protocol):
+    __type_params__: tuple[object, ...]
+    __protocol_attrs__: set[str]
+    __non_callable_proto_members__: set[str]
+    __callable_proto_members_only__: bool
+    def m(self) -> None: ...
+
+class Impl:
+    def m(self) -> None: ...
+
+issubclass(Impl, P12)  # E: Protocol `P12` has non-method members and cannot be used with issubclass()
+"#,
+);
+
+testcase!(
+    test_issubclass_excludes_typing_internals_3_12,
+    TestEnv::new_with_version(PythonVersion::new(3, 12, 0)),
+    r#"
+# The typing internals are excluded on 3.12+; the 3.13 names are not yet
+
+from typing import Protocol, runtime_checkable
+
+@runtime_checkable
+class P12(Protocol):
+    __type_params__: tuple[object, ...]
+    __protocol_attrs__: set[str]
+    __non_callable_proto_members__: set[str]
+    __callable_proto_members_only__: bool
+    def m(self) -> None: ...
+
+@runtime_checkable
+class P13(Protocol):
+    __static_attributes__: tuple[str, ...]
+    __firstlineno__: int
+    def m(self) -> None: ...
+
+class Impl:
+    def m(self) -> None: ...
+
+issubclass(Impl, P12)  # E: Runtime checkable protocol `P12` has an unsafe overlap with type `Impl`
+issubclass(Impl, P13)  # E: Protocol `P13` has non-method members and cannot be used with issubclass()
+"#,
+);
+
+testcase!(
+    test_issubclass_excludes_compiler_attributes_3_13,
+    TestEnv::new_with_version(PythonVersion::new(3, 13, 0)),
+    r#"
+# The compiler-set class attributes are excluded on 3.13+; the 3.14 names are not yet
+
+from typing import Protocol, runtime_checkable
+
+@runtime_checkable
+class P13(Protocol):
+    __static_attributes__: tuple[str, ...]
+    __firstlineno__: int
+    def m(self) -> None: ...
+
+@runtime_checkable
+class P14(Protocol):
+    __annotate_func__: object
+    __annotations_cache__: dict[str, object]
+    def m(self) -> None: ...
+
+class Impl:
+    def m(self) -> None: ...
+
+issubclass(Impl, P13)  # E: Runtime checkable protocol `P13` has an unsafe overlap with type `Impl`
+issubclass(Impl, P14)  # E: Protocol `P14` has non-method members and cannot be used with issubclass()
+"#,
+);
+
+testcase!(
+    test_issubclass_excludes_annotation_attributes_3_14,
+    TestEnv::new_with_version(PythonVersion::new(3, 14, 0)),
+    r#"
+# The PEP 749 annotation attributes are excluded on 3.14+; the 3.15 name is not yet
+
+from typing import Protocol, runtime_checkable
+
+@runtime_checkable
+class P14(Protocol):
+    __annotate_func__: object
+    __annotations_cache__: dict[str, object]
+    def m(self) -> None: ...
+
+@runtime_checkable
+class P15(Protocol):
+    __typing_is_deprecated_inherited_runtime_protocol__: bool
+    def m(self) -> None: ...
+
+class Impl:
+    def m(self) -> None: ...
+
+issubclass(Impl, P14)  # E: Runtime checkable protocol `P14` has an unsafe overlap with type `Impl`
+issubclass(Impl, P15)  # E: Protocol `P15` has non-method members and cannot be used with issubclass()
+"#,
+);
+
+testcase!(
+    test_issubclass_excludes_deprecated_protocol_marker_3_15,
+    TestEnv::new_with_version(PythonVersion::new(3, 15, 0)),
+    r#"
+# The deprecated-protocol marker is excluded on 3.15+
+
+from typing import Protocol, runtime_checkable
+
+@runtime_checkable
+class P15(Protocol):
+    __typing_is_deprecated_inherited_runtime_protocol__: bool
+    def m(self) -> None: ...
+
+class Impl:
+    def m(self) -> None: ...
+
+issubclass(Impl, P15)  # E: Runtime checkable protocol `P15` has an unsafe overlap with type `Impl`
+"#,
+);
+
+testcase!(
+    test_isinstance_unsafe_overlap_missing_runtime_excluded_member,
+    TestEnv::new_with_version(PythonVersion::new(3, 14, 0)),
+    r#"
+from typing import Protocol, runtime_checkable
+
+@runtime_checkable
+class P(Protocol):
+    _abc_marker: int
+    def m(self) -> None: ...
+
+class Missing:
+    def m(self) -> None: ...
+
+isinstance(Missing(), P)  # E: Attribute `_abc_marker` is missing
+
+# `__getattr__` does not provide dunder methods, so `__annotate__` is missing.
+@runtime_checkable
+class PA(Protocol):
+    def __annotate__(self, format: int) -> dict[str, object]: ...
+    def m(self) -> None: ...
+
+class GetAttr:
+    def __getattr__(self, name: str) -> object: ...
+    def m(self) -> None: ...
+
+isinstance(GetAttr(), PA)  # E: Attribute `__annotate__` is missing
+"#,
+);
+
+testcase!(
     test_runtime_checkable_non_protocol,
     r#"
 from typing import runtime_checkable
@@ -1635,6 +2362,52 @@ class P(Protocol):
     def f(cls) -> None:
         return None
 P.f()
+    "#,
+);
+
+testcase!(
+    test_call_overloaded_classmethod_on_protocol,
+    r#"
+from typing import Protocol, assert_type, overload
+class Q(Protocol):
+    def q(self) -> None: ...
+class P(Protocol):
+    @overload
+    @classmethod
+    def make(cls: "type[Child]", x: int) -> int: ...
+    @overload
+    @classmethod
+    def make(cls: "type[Child]", x: str) -> str: ...
+    @classmethod
+    def make(cls, x: int | str) -> int | str:
+        return x
+    @overload
+    @classmethod
+    def pick(cls: "type[Child]", x: int) -> int: ...
+    @overload
+    @classmethod
+    def pick(cls: type[Q], x: int) -> str: ...
+    @classmethod
+    def pick(cls, x: int) -> int | str:
+        return x
+    @overload
+    @classmethod
+    def needs_q(cls: type[Q], x: int) -> int: ...
+    @overload
+    @classmethod
+    def needs_q(cls: type[Q], x: str) -> str: ...
+    @classmethod
+    def needs_q(cls, x: int | str) -> int | str:
+        return x
+    @classmethod
+    def plain(cls: "type[Child]") -> int:
+        return 0
+class Child(P, Protocol): ...
+assert_type(Child.plain(), int)
+assert_type(Child.make(1), int)
+# Only the first overload accepts `Child`; `Child` does not implement `Q`.
+assert_type(Child.pick(1), int)
+Child.needs_q(1)  # E: Argument `type[Child]` is not assignable to parameter `cls` with type `type[Q]`
     "#,
 );
 
@@ -1819,11 +2592,11 @@ def f[T: A](a: T) -> T:
     return a
 def g(b: B, c: C):
     f(b)
-    f(c)  # E: `C` is not assignable to upper bound `A`
+    f(c)  # E: While checking parameter `a`: `C` is not assignable to upper bound `A` of type variable `T`
     "#,
 );
 
-// Regression test for https://github.com/facebook/pyrefly/issues/1905
+// Regression test for https://github.com/pyrefly-org/pyrefly/issues/1905
 testcase!(
     test_functor_protocol_and_impl,
     r#"
@@ -1834,12 +2607,12 @@ U = TypeVar('U')
 
 class Functor(Protocol[T]):  # E: Type variable `T` in class `Functor` is declared as invariant, but could be covariant based on its usage
     """A Functor protocol - common in functional programming."""
-    def map(self, f: Callable[[T], U]) -> Functor[U]: ...
+    def map(self, f: Callable[[T], U]) -> "Functor[U]": ...
 
 class Maybe(Generic[T]):
     """A Maybe/Option type that should implement Functor."""
     value: T | None
-    def map(self, f: Callable[[T], U]) -> Maybe[U]: ...
+    def map(self, f: Callable[[T], U]) -> "Maybe[U]": ...
 
 def test():
     m: Maybe[int] = ...  # type: ignore
@@ -1847,7 +2620,7 @@ def test():
 "#,
 );
 
-// Regression test for a case an early implementation of https://github.com/facebook/pyrefly/issues/1905 got wrong
+// Regression test for a case an early implementation of https://github.com/pyrefly-org/pyrefly/issues/1905 got wrong
 testcase!(
     test_second_order_protocol_subset_failure,
     r#"
@@ -1990,7 +2763,7 @@ def to_foo() -> Foo[MySeries]:
 "#,
 );
 
-// Regression test for https://github.com/facebook/pyrefly/issues/1202
+// Regression test for https://github.com/pyrefly-org/pyrefly/issues/1202
 testcase!(
     test_assert_type_structurally_identical_protocols,
     r#"
@@ -2007,7 +2780,7 @@ def f(f2: F2):
 "#,
 );
 
-// https://github.com/facebook/pyrefly/issues/2925
+// https://github.com/pyrefly-org/pyrefly/issues/2925
 testcase!(
     test_protocol_ambiguous_member,
     r#"
@@ -2063,9 +2836,9 @@ R = TypeVar("R", covariant=True)
 
 class Lens(Protocol[S, R]):
     @overload
-    def __call__[S2, R2](self: Lens[S2, R2], state: S2, /, value: R2) -> S2: ...
+    def __call__[S2, R2](self: "Lens[S2, R2]", state: S2, /, value: R2) -> S2: ...
     @overload
-    def __call__[S2, R2](self: Lens[S2, R2], state: S2, /) -> R2: ...
+    def __call__[S2, R2](self: "Lens[S2, R2]", state: S2, /) -> R2: ...
 
 
 class BaseLens(Lens[S, R], Protocol):
@@ -2084,9 +2857,9 @@ S = TypeVar("S", covariant=True)
 
 class A(Protocol[S]):
     @overload
-    def __call__[S2, R2](self: B[S2], state: S2, /, value: R2) -> S2: ...
+    def __call__[S2, R2](self: "B[S2]", state: S2, /, value: R2) -> S2: ...
     @overload
-    def __call__[S2, R2](self: B[S2], state: S2, /) -> R2: ...
+    def __call__[S2, R2](self: "B[S2]", state: S2, /) -> R2: ...
 
 
 class B(Protocol[S]):
@@ -2113,17 +2886,17 @@ R = TypeVar("R", covariant=True)
 
 class Lens(Protocol[S, R]):
     @overload
-    def __call__[S2, R2](self: Lens[S2, R2], state: S2, /, value: R2) -> S2: ...
+    def __call__[S2, R2](self: "Lens[S2, R2]", state: S2, /, value: R2) -> S2: ...
     @overload
-    def __call__[S2, R2](self: Lens[S2, R2], state: S2, /) -> R2: ...
+    def __call__[S2, R2](self: "Lens[S2, R2]", state: S2, /) -> R2: ...
     def extra(self) -> int: ...
 
 
 class HasCallNoExtra(Protocol[S, R]):
     @overload
-    def __call__[S2, R2](self: HasCallNoExtra[S2, R2], state: S2, /, value: R2) -> S2: ...
+    def __call__[S2, R2](self: "HasCallNoExtra[S2, R2]", state: S2, /, value: R2) -> S2: ...
     @overload
-    def __call__[S2, R2](self: HasCallNoExtra[S2, R2], state: S2, /) -> R2: ...
+    def __call__[S2, R2](self: "HasCallNoExtra[S2, R2]", state: S2, /) -> R2: ...
 
 
 def f(x: HasCallNoExtra[int, str]) -> Lens[int, str]:
@@ -2157,7 +2930,7 @@ from typing import Protocol, overload
 
 class Arr[S, T]:
     @overload
-    def astype[S2, T2](self: Arr[S2, T2], dtype: int) -> Arr[S2, T2]: ...
+    def astype[S2, T2](self: "Arr[S2, T2]", dtype: int) -> "Arr[S2, T2]": ...
     @overload
     def astype(self, dtype: str) -> bytes: ...
     def astype(self, dtype: object) -> object: ...
@@ -2177,7 +2950,7 @@ from typing import Protocol, overload
 
 class Arr[S, T]:
     @overload
-    def m[S2](self: Arr[S2, int], x: int) -> int: ...
+    def m[S2](self: "Arr[S2, int]", x: int) -> int: ...
     @overload
     def m(self, x: str) -> str: ...
     def m(self, x: object) -> object: ...
@@ -2217,7 +2990,7 @@ Generic: type[_Generic]
 Protocol: _SpecialForm
 
 class G(Generic[T]): ...  # E: uninitialized
-class P(Protocol):
+class P(Protocol):  # E: `Protocol` is uninitialized
     def f(self) -> int: ...
 class PT(Protocol[T]):  # E: uninitialized
     def f(self, x: T) -> T: ...
@@ -2243,7 +3016,7 @@ class _Protocol: ...
 
 Protocol: type[_Protocol]
 
-class P(Protocol):
+class P(Protocol):  # E: `Protocol` is uninitialized
     def f(self) -> int: ...
 class PT(Protocol[T]):  # E: uninitialized
     def f(self, x: T) -> T: ...
@@ -2255,4 +3028,37 @@ p: P = C()
 pt: PT[int] = C()
 bad: P = D()  # E: `D` is not assignable to `P`
 "#,
+);
+
+// The parameters before a gradual `*args: Any, **kwargs: Any` tail are checked when matching a
+// protocol member, too.
+testcase!(
+    test_protocol_method_gradual_tail_checks_other_params,
+    r#"
+from typing import Any, Literal, Protocol
+
+class TakesStr(Protocol):
+    def method(self, a: str, /) -> None: ...
+
+class A:
+    def method(self, a: int, /, *args: Any, **kwargs: Any) -> None: ...
+
+class B:
+    def method(self, a: str, /, *args: Any, **kwargs: Any) -> None: ...
+
+a: TakesStr = A()  # E: `A` is not assignable to `TakesStr`
+b: TakesStr = B()
+
+class Proto(Protocol):
+    def m(self, x: object, kind: str, /, *args: Any, **kwargs: Any) -> Any: ...
+
+class Narrow:
+    def m(self, x: object, kind: Literal["foo", "bar"], /, *args: Any, **kwargs: Any) -> Any: ...
+
+class Wide:
+    def m(self, x: object, kind: str, /, *args: Any, **kwargs: Any) -> Any: ...
+
+c: Proto = Narrow()  # E: `Narrow` is not assignable to `Proto`
+d: Proto = Wide()
+    "#,
 );

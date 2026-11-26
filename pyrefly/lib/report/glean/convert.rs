@@ -22,6 +22,7 @@ use pyrefly_python::ast::Ast;
 use pyrefly_python::docstring::Docstring;
 use pyrefly_python::dunder;
 use pyrefly_python::module_name::ModuleName;
+use pyrefly_python::module_path::ModulePath;
 use pyrefly_python::module_path::ModulePathDetails;
 use pyrefly_util::arc_id::ArcId;
 use pyrefly_util::visit::Visit;
@@ -123,18 +124,39 @@ fn find_preference_glean() -> FindPreference {
     }
 }
 
+/// The module that `handle`'s imports of `module` resolve to when Pyrefly type checks them.
+fn import_target(
+    transaction: &Transaction,
+    handle: &Handle,
+    module: ModuleName,
+) -> Option<ModulePath> {
+    transaction
+        .import_handle(handle, module, None)
+        .finding()
+        .map(|target| target.path().dupe())
+}
+
+/// Each prefix of `module_name`, from its top-level package to the module itself, with the
+/// range of the prefix's last component when the name starts at `position`.
+///
+/// For example, `a.b.c` gives `a`, `a.b` and `a.b.c`. Empty components are kept, so `a..c`
+/// gives `a`, `a.` and `a..c`.
 fn all_modules_with_range(
     module_name: ModuleName,
     position: TextSize,
 ) -> impl Iterator<Item = (String, TextRange)> {
     module_name.components().into_iter().scan(
-        ("".to_owned(), position),
+        (None::<String>, position),
         |(module, start), component| {
             let name = component.as_str();
             let range = TextRange::at(*start, TextSize::try_from(name.len()).unwrap());
-            *module = join_names(module, name);
+            let prefix = match module {
+                Some(parent) => format!("{parent}.{name}"),
+                None => name.to_owned(),
+            };
+            *module = Some(prefix.clone());
             *start = range.end() + TextSize::from(1);
-            Some((module.to_owned(), range))
+            Some((prefix, range))
         },
     )
 }
@@ -154,11 +176,15 @@ fn to_span(range: TextRange) -> src::ByteSpan {
     }
 }
 
-/// Create a Glean file fact from module info, using forward slashes for
+/// Create a Glean file fact from module info.
+fn file_fact(module_info: &ModuleInfo) -> src::File {
+    src::File::new(file_key(module_info.path().as_path()))
+}
+
+/// The Glean key of a path: relative to the working directory, with forward slashes for
 /// cross-platform consistency regardless of the OS path separator.
 /// Symlinks are resolved so the same physical file always gets the same key.
-fn file_fact(module_info: &ModuleInfo) -> src::File {
-    let file_path = module_info.path().as_path();
+fn file_key(file_path: &Path) -> String {
     let cwd = current_dir().unwrap_or_default();
     let (resolved_path, resolved_cwd) = match (
         std::fs::canonicalize(file_path),
@@ -174,7 +200,7 @@ fn file_fact(module_info: &ModuleInfo) -> src::File {
         .unwrap();
 
     // Normalize to forward slashes so Glean keys are consistent across platforms.
-    src::File::new(relative_path.replace('\\', "/"))
+    relative_path.replace('\\', "/")
 }
 
 /// Inputs beyond Pyrefly's own import resolution that decide the names and files the Glean
@@ -204,9 +230,16 @@ impl GleanNaming {
     ///   covers after its file name alone, so a vendored copy `vendor/cpython/Lib/typing.py`
     ///   resolves as `typing`. Its declaration of `typing.Optional` would then match every
     ///   reference to the stdlib's `typing.Optional`, so it is named `vendor.cpython.Lib.typing`
-    ///   instead. The stdlib sources under `stdlib_root` keep their names;
+    ///   instead. The stdlib sources under `stdlib_root` keep their names, and so does the
+    ///   module that importing a stdlib name finds (`import_target`): a stub on a search path
+    ///   that overrides `__future__` replaces the stdlib's `__future__` for the whole project;
     /// - otherwise `resolved`.
-    fn emitted_module_name(&self, file: Option<&src::File>, resolved: ModuleName) -> ModuleName {
+    fn emitted_module_name(
+        &self,
+        file: Option<&src::File>,
+        resolved: ModuleName,
+        import_target: impl FnOnce() -> Option<ModulePath>,
+    ) -> ModuleName {
         let Some(file) = file else {
             return resolved;
         };
@@ -221,9 +254,13 @@ impl GleanNaming {
             .stdlib_root
             .as_ref()
             .is_some_and(|root| Path::new(&*file.key).starts_with(root));
+        if is_stdlib_source {
+            return resolved;
+        }
         let is_taken = module_names.is_some_and(|names| names.contains_module(resolved))
-            || typeshed().is_ok_and(|stdlib| stdlib.has_module(resolved));
-        if is_taken && !is_stdlib_source {
+            || (typeshed().is_ok_and(|stdlib| stdlib.has_module(resolved))
+                && !import_target().is_some_and(|path| file_key(path.as_path()) == *file.key));
+        if is_taken {
             path_module_name(&file.key)
         } else {
             resolved
@@ -495,7 +532,9 @@ impl GleanState<'_> {
     ) -> GleanState<'a> {
         let module_info = &transaction.get_module_info(handle).unwrap();
         let file = file_fact(module_info);
-        let module_name = naming.emitted_module_name(Some(&file), module_info.name());
+        let module_name = naming.emitted_module_name(Some(&file), module_info.name(), || {
+            import_target(transaction, handle, module_info.name())
+        });
         GleanState {
             transaction,
             handle,
@@ -776,8 +815,13 @@ impl GleanState<'_> {
         // declarations its own file emits.
         let module_name = module.name();
         let file = definition_file_fact(module, self.naming.stdlib_root.as_deref());
-        let emitted_name = self.naming.emitted_module_name(file.as_ref(), module_name);
-        let type_name = base_type.and_then(|ty| ty.qname());
+        let emitted_name = self
+            .naming
+            .emitted_module_name(file.as_ref(), module_name, || {
+                import_target(self.transaction, self.handle, module_name)
+            });
+        let type_env = self.transaction.type_env(self.handle);
+        let type_name = base_type.and_then(|ty| ty.qname(&type_env));
         let local_name = module.code_at(def_range);
 
         if module_name == self.module.name() {
@@ -1509,7 +1553,9 @@ impl GleanState<'_> {
             .and_then(|def| definition_file_fact(&def.module, self.naming.stdlib_root.as_deref()));
         let name = self
             .naming
-            .emitted_module_name(file.as_ref(), module)
+            .emitted_module_name(file.as_ref(), module, || {
+                import_target(self.transaction, self.handle, module)
+            })
             .to_string();
 
         DefinitionLocation { name, file }
@@ -2206,8 +2252,6 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
-    use pyrefly_python::module_path::ModulePath;
-
     use super::*;
 
     fn module_at(path: &str) -> ModuleInfo {
@@ -2216,6 +2260,29 @@ mod tests {
             ModulePath::filesystem(PathBuf::from(path)),
             Arc::new(String::new()),
         )
+    }
+
+    #[test]
+    fn test_module_prefixes_name_the_parents_of_names_with_empty_components() {
+        let prefixes: Vec<String> =
+            all_modules_with_range(ModuleName::from_str("pkg..config.settings"), TextSize::ZERO)
+                .map(|(prefix, _)| prefix)
+                .collect();
+        assert_eq!(
+            prefixes,
+            ["pkg", "pkg.", "pkg..config", "pkg..config.settings"],
+            "the empty component between the two dots should be kept in every prefix"
+        );
+        for pair in prefixes.windows(2) {
+            assert_eq!(
+                create_sname(&pair[1]).key.parent,
+                Some(create_sname(&pair[0])),
+                "the parent SName of {:?} should be the SName of {:?}, so that \
+                 SNameToName can find the parent's name",
+                pair[1],
+                pair[0],
+            );
+        }
     }
 
     #[test]
@@ -2380,6 +2447,16 @@ mod tests {
                 .emitted_module_name(
                     path.map(|path| src::File::new(path.to_owned())).as_ref(),
                     ModuleName::from_str(resolved),
+                    || None,
+                )
+                .to_string()
+        };
+        let emitted_with_import_target = |path: &str, resolved: &str, target: &str| {
+            naming
+                .emitted_module_name(
+                    Some(&src::File::new(path.to_owned())),
+                    ModuleName::from_str(resolved),
+                    || Some(ModulePath::filesystem(PathBuf::from(target))),
                 )
                 .to_string()
         };
@@ -2413,6 +2490,7 @@ mod tests {
                 .emitted_module_name(
                     Some(&src::File::new("arvr/vendor/b.py".to_owned())),
                     ModuleName::unknown(),
+                    || None,
                 )
                 .to_string(),
             "arvr.vendor.b",
@@ -2429,9 +2507,44 @@ mod tests {
             "A name in the module map is taken"
         );
         assert_eq!(
-            emitted(Some("third-party/python/3.12/Lib/typing.py"), "typing"),
+            naming
+                .emitted_module_name(
+                    Some(&src::File::new(
+                        "third-party/python/3.12/Lib/typing.py".to_owned()
+                    )),
+                    ModuleName::from_str("typing"),
+                    || unreachable!("a stdlib source keeps its name without an import lookup"),
+                )
+                .to_string(),
             "typing",
             "The stdlib sources keep their names"
+        );
+        assert_eq!(
+            emitted_with_import_target(
+                "fbcode/ig/stubs/__future__.pyi",
+                "__future__",
+                "fbcode/ig/stubs/__future__.pyi"
+            ),
+            "__future__",
+            "The module that importing a stdlib name finds keeps that name"
+        );
+        assert_eq!(
+            emitted_with_import_target(
+                "fbcode/ig/vendor/typing.py",
+                "typing",
+                "fbcode/ig/stubs/typing.pyi"
+            ),
+            "fbcode.ig.vendor.typing",
+            "A stdlib name is taken when importing it finds another module"
+        );
+        assert_eq!(
+            emitted_with_import_target(
+                "fbcode/copy/foo/__init__.py",
+                "foo",
+                "fbcode/copy/foo/__init__.py"
+            ),
+            "fbcode.copy.foo",
+            "A name in the module map is taken even when importing it finds the file"
         );
         assert_eq!(
             emitted(None, "typing"),

@@ -5,8 +5,557 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use pyrefly_python::dunder;
+use pyrefly_types::callable::Callable;
+use pyrefly_types::callable::Params;
+use pyrefly_types::function::FuncMetadata;
+use pyrefly_util::thread_pool::ThreadCount;
+use ruff_text_size::TextRange;
+
+use crate::alt::callable::CallArg;
+use crate::solver::solver::ArgumentKey;
 use crate::test::util::TestEnv;
+use crate::test::util::get_class;
+use crate::test::util::mk_state;
+use crate::test::util::testcase_for_macro;
 use crate::testcase;
+
+#[test]
+fn test_explicit_new_receiver_with_ellipsis_inputs() {
+    let (handle, state) = mk_state("class Model: pass");
+    let transaction = state.transaction();
+    let class = get_class("Model", &handle, &state.reader());
+    transaction
+        .ad_hoc_solve(&handle, "explicit_new_receiver", |solver| {
+            let mut cls = solver.as_class_type_unchecked(&class);
+            let model_type = solver.heap.mk_class_type(cls.clone());
+            let receiver = solver.heap.mk_type_of(model_type.clone());
+            let first = solver.heap.mk_none();
+            let second = solver.heap.mk_any_explicit();
+            let range = TextRange::default();
+            let args = [
+                CallArg::ty(&receiver, range),
+                CallArg::ty(&first, range),
+                CallArg::ty(&second, range),
+            ];
+            let metadata = FuncMetadata::method(&solver, &class, dunder::NEW);
+            let errors = solver.error_collector();
+            let (_, specialization_errors, return_errors, argmap, _, _) = solver.callable_infer(
+                Callable {
+                    params: Params::Ellipsis,
+                    ret: model_type,
+                },
+                Some(&metadata.kind),
+                None,
+                None,
+                &args,
+                &[],
+                range,
+                &errors,
+                &errors,
+                None,
+                None,
+                None,
+                Some(cls.targs_mut()),
+            );
+            assert!(specialization_errors.is_empty());
+            assert!(return_errors.is_empty());
+            assert!(!errors.has_hard());
+            assert_eq!(
+                argmap.source_argument_type(ArgumentKey::Positional(0)),
+                Some(&receiver),
+                "the explicit cls remains a source input of the __new__ call",
+            );
+            let constructor_inputs = argmap.without_first_positional_argument();
+            assert_eq!(
+                constructor_inputs.source_argument_type(ArgumentKey::Positional(0)),
+                Some(&first),
+                "the constructor source view excludes the synthetic cls",
+            );
+            assert_eq!(
+                constructor_inputs.source_argument_type(ArgumentKey::Positional(1)),
+                Some(&second),
+                "rebasing preserves the second user argument",
+            );
+        })
+        .expect("the test module has been solved");
+}
+// Regression tests for https://github.com/facebook/pyrefly/issues/1134.
+
+testcase!(
+    test_constructor_union_distribution,
+    r#"
+from typing import assert_type
+
+class A[T]:
+    def __init__(self, value: T) -> None: ...
+
+class Pair[T, U]:
+    def __init__(self, x: T, y: U) -> None: ...
+
+class Same[T]:
+    def __init__(self, x: T, y: T) -> None: ...
+
+def f(value: int | str, other: int | str) -> None:
+    positional: A[int] | A[str] = A(value)
+    keyword: A[int] | A[str] = A(value=value)
+    independent: Pair[int, int] | Pair[int, str] | Pair[str, int] | Pair[str, str] = Pair(value, other)
+    mixed_keywords: Pair[int, int] | Pair[int, str] | Pair[str, int] | Pair[str, str] = Pair(value, y=other)
+    # Independent arguments include mixed pairs, not just (int, int) and (str, str).
+    invalid: Same[int] | Same[str] = Same(value, other)  # E: `Same[int | str]` is not assignable to `Same[int] | Same[str]`
+    assert_type(positional, A[int] | A[str])
+    assert_type(keyword, A[int] | A[str])
+
+def unpacked(args: tuple[int | str]) -> None:
+    result: A[int] | A[str] = A(*args)
+"#,
+);
+
+testcase!(
+    test_constructor_union_distribution_bool_and_enum,
+    r#"
+from enum import Enum
+from typing import Literal
+
+class A[T]:
+    def __init__(self, value: T) -> None: ...
+
+class Choice(Enum):
+    INT = 1
+    STR = "s"
+
+def f(flag: bool, choice: Choice) -> None:
+    boolean: A[Literal[True]] | A[Literal[False]] = A(flag)
+    enumeration: A[Literal[Choice.INT]] | A[Literal[Choice.STR]] = A(choice)
+"#,
+);
+
+testcase!(
+    test_constructor_union_distribution_limit,
+    r#"
+from typing import Literal
+
+class Pair[T, U]:
+    def __init__(self, x: T, y: U) -> None: ...
+
+type Low = Literal[0, 1, 2, 3, 4]
+type High = Literal[5, 6, 7, 8, 9]
+type Hints = Pair[Low, Low] | Pair[Low, High] | Pair[High, Low] | Pair[High, High]
+type Eight = Literal[0, 1, 2, 3, 4, 5, 6, 7]
+
+def within_limit(x: Eight, y: Eight) -> None:
+    result: Hints = Pair(x, y)
+
+def exceeds_limit(x: Low | High, y: Low | High) -> None:
+    # The expansion budget counts partial batches as well as complete combinations.
+    result: Hints = Pair(x, y)  # E: is not assignable
+"#,
+);
+
+testcase!(
+    test_constructor_union_distribution_diagnostics,
+    TestEnv::new().enable_deprecated_error(),
+    r#"
+from typing import cast
+from typing_extensions import deprecated
+
+class A[T]:
+    @deprecated("old constructor")
+    def __init__(self, value: T) -> None: ...
+
+class B[T]:
+    def __init__(self, value: T, other: object = None) -> None: ...
+
+@deprecated("old factory")
+def old_factory() -> int | str: ...
+
+def requires_int(value: int) -> object: ...
+
+def f(value: int | str) -> None:
+    constructor: A[int] | A[str] = A(value)  # E: `A.__init__` is deprecated
+    factory: B[int] | B[str] = B(old_factory())  # E: `old_factory` is deprecated
+    redundant_cast: B[int] | B[str] = B(cast(int | str, value))  # E: Redundant cast
+    keyword_factory: B[int] | B[str] = B(value=old_factory())  # E: `old_factory` is deprecated
+    keyword_cast: B[int] | B[str] = B(value=cast(int | str, value))  # E: Redundant cast
+    untouched: B[int] | B[str] = B(value, old_factory())  # E: `old_factory` is deprecated
+    invalid: B[int] | B[str] = B(value, requires_int("bad"))  # E: `B[int | str]` is not assignable # E: is not assignable to parameter `value`
+"#,
+);
+
+testcase!(
+    test_constructor_union_distribution_rejected_batches,
+    TestEnv::new().enable_deprecated_error(),
+    r#"
+from typing_extensions import deprecated
+
+class Pair[T, U]:
+    @deprecated("old constructor")
+    def __init__(self, x: T, y: U) -> None: ...
+
+def f(x: int | str, y: int | str) -> None:
+    # Expanding x alone fails. Expanding y as well accepts all four combinations.
+    pair: Pair[int, int | str] | Pair[str, int] | Pair[str, str] = Pair(x, y)  # E: `Pair.__init__` is deprecated
+
+class A[T]:
+    def __init__(self, value: T) -> None: ...
+
+def g(value: int | str | bytes) -> None:
+    # The bytes expansion must fail without retaining errors from rejected hints.
+    result: A[int] | A[str] = A(value)  # E: `A[bytes | int | str]` is not assignable to `A[int] | A[str]`
+"#,
+);
+
+testcase!(
+    test_constructor_union_distribution_lambda_context,
+    TestEnv::new().enable_implicit_any_lambda_error(),
+    r#"
+from typing import Callable
+
+class A[T]:
+    def __init__(self, callback: Callable[[T], None], value: T) -> None: ...
+
+class Box[T]:
+    def __init__(self, value: T) -> None: ...
+
+class Wrapped[T]:
+    def __init__(self, callback: Box[Callable[[T], None]], value: T) -> None: ...
+
+def f(value: int | str) -> None:
+    positional: A[int] | A[str] = A(lambda arg: None, value)
+    keyword: A[int] | A[str] = A(value=value, callback=lambda arg: None)
+    nested: Wrapped[int] | Wrapped[str] = Wrapped(Box(lambda arg: None), value)
+"#,
+);
+
+testcase!(
+    test_constructor_union_distribution_conditional_lambda,
+    r#"
+from typing import Callable
+
+class A[T]:
+    def __init__(self, cb: Callable[[T], None] | None, value: T) -> None: ...
+
+def f(value: int | str, condition: bool) -> None:
+    valid: A[int] | A[str] = A((lambda arg: None) if condition else None, value)
+    invalid: A[int] | A[str] = A((lambda arg: arg.upper()) if condition else None, value)  # E: is not assignable
+"#,
+);
+
+testcase!(
+    test_constructor_union_distribution_contextual_cast,
+    TestEnv::new().enable_deprecated_error(),
+    r#"
+from typing import Callable, cast
+from typing_extensions import deprecated
+
+class A[T]:
+    def __init__(self, callback: Callable[[T], int], value: T) -> None: ...
+
+@deprecated("old callback")
+def old() -> int: ...
+
+def f(value: int | str, fixed: int) -> None:
+    necessary: A[int] | A[str] = A(lambda arg: cast(int, arg), value)
+    keyword: A[int] | A[str] = A(value=value, callback=lambda arg: cast(int, arg))
+    redundant: A[int] | A[str] = A(lambda arg: cast(int, fixed), value)  # E: Redundant cast
+    deprecated: A[int] | A[str] = A(lambda arg: cast(int, arg) + old(), value)  # E: `old` is deprecated
+"#,
+);
+
+// Expansion probes retain ordinary contextual checks but do not distribute nested calls.
+testcase!(
+    test_constructor_union_distribution_contextual_nested_limit,
+    TestEnv::new().enable_implicit_any_lambda_error(),
+    r#"
+from typing import Callable
+
+class Node[T]:
+    def __init__(self, cb: Callable[[T], None], value: T,
+                 child: "Node[int]" | "Node[str]" | None = None) -> None: ...
+
+def f(value: int | str) -> None:
+    result: Node[int] | Node[str] = Node(lambda arg: None, value, Node(lambda arg: None, value, Node(lambda arg: None, value)))  # E: is not assignable # E: is not assignable # E: is not assignable
+"#,
+);
+
+testcase!(
+    test_constructor_union_distribution_rejected_nested,
+    r#"
+class Node[T]:
+    def __init__(self, value: T, child: "Node[int]" | "Node[str]" | None = None) -> None: ...
+
+def f(value: int | str | bytes) -> None:
+    result: Node[int] | Node[str] = Node(value, Node(value, Node(value)))  # E: is not assignable # E: is not assignable # E: is not assignable
+"#,
+);
+
+testcase!(
+    test_constructor_union_hint_preserves_nested_context,
+    r#"
+class Box[T]:
+    def __init__(self, items: list[T]) -> None: ...
+
+class Outer[T]:
+    def __init__(self, value: T, child: Box[float] | Box[str]) -> None: ...
+
+def need(value: Outer[int] | Outer[str]) -> None: ...
+
+def f(value: int, both: int | str) -> None:
+    plain: Outer[int] | Outer[str] = Outer(value, Box([1]))
+    keyword: Outer[int] | Outer[str] = Outer(value=value, child=Box([1]))
+    need(Outer(value, Box([1])))
+    distributed: Outer[int] | Outer[str] = Outer(both, Box([1]))
+    single: Outer[int] = Outer(value, Box([1]))
+    child: Box[float] | Box[str] = Box([1])
+    separate: Outer[int] | Outer[str] = Outer(value, child)
+    invalid: Outer[int] | Outer[str] = Outer(value, Box([b"bad"]))  # E: is not assignable to parameter `child`
+"#,
+);
+
+testcase!(
+    test_constructor_union_distribution_reveal_type,
+    r#"
+from typing import Callable, assert_type, overload, reveal_type
+
+class A[T]:
+    def __init__(self, cb: Callable[[T], object], value: T) -> None: ...
+
+class B[T]:
+    def __init__(self, cb: Callable[[T], str], value: T) -> None: ...
+
+@overload
+def pick(cb: Callable[[int], object], value: int) -> int: ...
+@overload
+def pick(cb: Callable[[str], object], value: str) -> str: ...
+def pick(cb: Callable[..., object], value: int | str) -> int | str: ...
+
+def f(value: int | str) -> None:
+    without: A[int] | A[str] = A(lambda arg: arg, value)
+    with_reveal: A[int] | A[str] = A(lambda arg: reveal_type(arg), value)  # E: revealed type: int # E: revealed type: str
+    keyword: A[int] | A[str] = A(value=value, cb=lambda arg: reveal_type(arg))  # E: revealed type: int # E: revealed type: str
+    invalid: B[int] | B[str] = B(lambda arg: reveal_type(arg), value)  # E: is not assignable to `B[int] | B[str]` # E: is not assignable to parameter `cb` # E: revealed type: int | str
+    assert_type(pick(lambda arg: reveal_type(arg), value), int | str)  # E: revealed type: int # E: revealed type: str
+    assert_type(pick(lambda arg: reveal_type(arg), 1), int)  # E: revealed type: int
+"#,
+);
+
+testcase!(
+    test_constructor_union_distribution_caller_bounds,
+    r#"
+class A[T]:
+    def __init__(self, x: T) -> None:
+        self.x: T = x
+
+def bounded[T: int](item: A[T] | A[str]) -> T: ...
+def constrained[T: (int, str)](item: A[T] | A[float]) -> None: ...
+
+def f(x: int | str | bytes) -> None:
+    bounded(A(x))  # E: upper bound
+
+def g(x: int | str | float | bytes) -> None:
+    constrained(A(x))  # E: constraints
+
+def valid(x: int | str, y: int | float) -> None:
+    bounded(A(x))
+    constrained(A(y))
+"#,
+);
+
+testcase!(
+    test_constructor_union_distribution_later_hint,
+    TestEnv::new().enable_implicit_any_lambda_error(),
+    r#"
+from typing import Callable
+
+class A[T, U]:
+    def __init__(self, value: T, callback: Callable[[U], str]) -> None: ...
+
+def f(value: int | str) -> None:
+    original: A[int, str] | A[str, str] = A(value, lambda x: x.upper())
+    extended: A[int, int] | A[int, str] | A[str, str] = A(value, lambda x: x.upper())
+    keyword: A[int, int] | A[int, str] | A[str, str] = A(callback=lambda x: x.upper(), value=value)
+"#,
+);
+
+testcase!(
+    test_constructor_union_distribution_caller_mixed_arguments,
+    r#"
+from typing import assert_type
+
+class Pair[T, U]:
+    def __init__(self, x: T, y: U) -> None: ...
+
+def same[T: int](item: Pair[T, T] | Pair[str, str]) -> None: ...
+def mixed[T: int, U: str](item: Pair[T, U] | Pair[str, int]) -> None: ...
+def infer[T](item: Pair[T, int] | Pair[T, str]) -> T: ...
+
+def invalid(x: int | str, y: int | str) -> None:
+    same(Pair(x, y))  # E: upper bound
+    mixed(Pair(x, y))  # E: upper bound # E: upper bound
+
+def valid(x: int | bytes, y: int | str) -> None:
+    assert_type(infer(Pair(x, y)), int | bytes)
+"#,
+);
+
+testcase!(
+    test_constructor_union_distribution_contextual_conversion,
+    TestEnv::new().enable_deprecated_error(),
+    r#"
+from typing import Callable
+from typing_extensions import deprecated
+
+class A[T]:
+    def __init__(self, cb: Callable[[T], object], value: T) -> None: ...
+
+@deprecated("old callback")
+def old(value: object) -> object: ...
+
+def f(value: int | str, fixed: str) -> None:
+    necessary: A[int] | A[str] = A(lambda arg: str(arg), value)
+    redundant: A[int] | A[str] = A(lambda arg: str(fixed), value)  # E: Unnecessary `str()` call
+    deprecated: A[int] | A[str] = A(lambda arg: old(str(arg)), value)  # E: `old` is deprecated
+"#,
+);
+
+testcase!(
+    test_constructor_union_distribution_contextual_comparison,
+    TestEnv::new().enable_incompatible_comparison_error(),
+    r#"
+from typing import Callable
+
+class A[T]:
+    def __init__(self, cb: Callable[[T], object], value: T) -> None: ...
+
+def f(value: int | str, fixed: int) -> None:
+    valid: A[int] | A[str] = A(lambda arg: arg == "a", value)
+    invalid: A[int] | A[str] = A(lambda arg: fixed == "a", value)  # E: Comparison `==` between incompatible types
+"#,
+);
+
+testcase!(
+    test_constructor_union_distribution_binding_budget,
+    TestEnv::new().with_thread_count(ThreadCount::Inline),
+    r#"
+class A[T]:
+    def __init__(self, value: T) -> None: ...
+class Node[T]:
+    def __init__(self, value: T,
+                 child: "Node[int]" | "Node[str]" | None = None) -> None: ...
+class Wrap:
+    def __init__(self, a: Node[int] | Node[str], b: object) -> None: ...
+def need(x: A[int] | A[str]) -> int: ...
+
+def f(w: int | str | bytes, v: int | str) -> None:
+    Wrap(Node(w, Node(w, Node(w, Node(w, Node(w))))), helper(v))  # type: ignore
+
+def helper(v: int | str):
+    return need(A(v))
+"#,
+);
+
+testcase!(
+    test_constructor_union_distribution_sibling_budget,
+    TestEnv::new().with_thread_count(ThreadCount::Inline),
+    r#"
+class A[T]:
+    def __init__(self, value: T) -> None: ...
+class Node[T]:
+    def __init__(self, value: T,
+                 child: "Node[int]" | "Node[str]" | None = None) -> None: ...
+class Wrap:
+    def __init__(self, a: object, b: object) -> None: ...
+def need(x: A[int] | A[str]) -> int: ...
+
+def f(w: int | str | bytes, v: int | str) -> None:
+    Wrap(
+        Node(w, Node(w, Node(w, Node(w, Node(w))))),  # type: ignore
+        need(A(v)),
+    )
+    Wrap(
+        need(A(v)),
+        Node(w, Node(w, Node(w, Node(w, Node(w))))),  # type: ignore
+    )
+"#,
+);
+
+#[test]
+fn test_constructor_union_distribution_plain_calls_budget() -> anyhow::Result<()> {
+    let calls = "P(), ".repeat(1001);
+    let source = format!(
+        r#"
+class P: ...
+class Wrap:
+    def __init__(self, value: object) -> None: ...
+class A[T]:
+    def __init__(self, value: T, *other: object) -> None: ...
+def need(value: A[int] | A[str]) -> int: ...
+def f(value: int | str) -> None:
+    Wrap(({calls}need(A(value))))
+    expanded: A[int] | A[str] = A(value, ({calls}))
+"#
+    );
+    testcase_for_macro(
+        TestEnv::new().with_thread_count(ThreadCount::Inline),
+        &source,
+        file!(),
+        line!(),
+    )
+}
+
+testcase!(
+    test_constructor_union_distribution_new_and_init,
+    r#"
+from typing import Self
+
+class New[T]:
+    def __new__(cls, value: T) -> Self: ...
+
+class Both[T]:
+    def __new__(cls, value: T) -> Self: ...
+    def __init__(self, value: T) -> None: ...
+
+def f(value: int | str) -> None:
+    new: New[int] | New[str] = New(value)
+    both: Both[int] | Both[str] = Both(value)
+"#,
+);
+
+testcase!(
+    test_constructor_union_distribution_typed_dict,
+    r#"
+from typing import TypedDict
+
+class Fields[T](TypedDict):
+    value: T
+
+def f(value: int | str) -> None:
+    fields: Fields[int] | Fields[str] = Fields(value=value)
+"#,
+);
+
+testcase!(
+    test_constructor_union_distribution_nested,
+    r#"
+class Node[T]:
+    def __init__(self, value: T, child: "Node[int]" | "Node[str]" | None = None) -> None: ...
+
+def f(value: int | str) -> None:
+    child: Node[int] | Node[str] = Node(value)
+    separate: Node[int] | Node[str] = Node(value, child)
+    # Nested constructors retain ordinary inference inside a distribution probe.
+    root: Node[int] | Node[str] = Node(  # E: is not assignable
+        value,
+        Node(  # E: is not assignable
+            value,
+            Node(  # E: is not assignable
+                value,
+                Node(value),  # E: is not assignable
+            ),
+        ),
+    )
+"#,
+);
 
 testcase!(
     test_constructor_prepared_argument_contexts,
@@ -97,7 +646,7 @@ testcase!(
 from typing import assert_type
 
 class Node[T]:
-    def __init__(self, value: T, child: Node[int] | Node[str] | None = None) -> None: ...
+    def __init__(self, value: T, child: "Node[int] | Node[str] | None" = None) -> None: ...
 
 def f(value: str) -> None:
     root: Node[int] | Node[str] = Node(value, Node(value, Node(value, Node(value, Node(value, Node(value, Node(value, Node(value))))))))
@@ -151,7 +700,7 @@ from typing import assert_type
 class Box[T]:
     def __init__(self, x: T): pass
 
-    def wrap(self) -> Box[Box[T]]:
+    def wrap(self) -> "Box[Box[T]]":
         return Box(self)
 
 def f() -> int:
@@ -212,7 +761,7 @@ from typing import assert_type
 class Box[T]:
     def __init__[S](self, x: S, y: S):
         pass
-    def wrap(self, x: bool) -> Box[Box[T]]:
+    def wrap(self, x: bool) -> "Box[Box[T]]":
         if x:
             return Box(self, self)
         else:
@@ -535,6 +1084,159 @@ C("5")  # E: Argument `Literal['5']` is not assignable to parameter `x` with typ
     "#,
 );
 
+// https://github.com/pyrefly-org/pyrefly/issues/3679
+// None of these classes has an argument list accepted by both constructor methods.
+testcase!(
+    test_constructor_disjoint_call_shapes,
+    r#"
+from typing import Self, overload
+
+class RequiredNew:
+    def __new__(cls, value: int) -> Self: ...
+    def __init__(self) -> None: ...  # E: accept no common argument list
+
+class RequiredInit:
+    def __new__(cls) -> Self: ...
+    def __init__(self, value: int) -> None: ...  # E: accept no common argument list
+
+class GenericNew:
+    def __new__[T](cls: type[T], value: int) -> T: ...
+    def __init__(self) -> None: ...  # E: accept no common argument list
+
+class PositionalOnly:
+    def __new__(cls, x: int, y: int, /) -> Self: ...
+    def __init__(self, x: int) -> None: ...  # E: accept no common argument list
+
+class KeywordOnly:
+    def __new__(cls, *, x: int) -> Self: ...
+    def __init__(self, *, y: int) -> None: ...  # E: accept no common argument list
+
+class DuplicateArgument:
+    def __new__(cls, x: int, /, *, y: int) -> Self: ...
+    def __init__(self, y: int) -> None: ...  # E: accept no common argument list
+
+class EmptyInit:
+    def __init__(self) -> None: ...
+
+class InheritedInit(EmptyInit):
+    def __new__(cls, value: int) -> Self: ...  # E: accept no common argument list
+
+class UnchangedSubclass(InheritedInit):
+    pass
+
+class OverloadedNew:
+    @overload
+    def __new__(cls, x: int, /) -> Self: ...
+    @overload
+    def __new__(cls, x: int, y: int, /) -> Self: ...
+    def __new__(cls, *args: int) -> Self: ...
+    def __init__(self) -> None: ...  # E: accept no common argument list
+"#,
+);
+
+testcase!(
+    test_constructor_compatible_call_shapes,
+    r#"
+from typing import Self, overload
+
+# https://github.com/DetachHead/basedpyright/issues/1785
+class BroadNew:
+    def __new__(cls, *args: object, **kwargs: object) -> Self: ...
+
+class NarrowInit(BroadNew):
+    def __init__(self, *args: object, param: bool = True, **kwargs: object) -> None: ...
+NarrowInit(param=True)
+
+class CrossedTypes:
+    def __new__(cls, a: int, b: object) -> Self: ...
+    def __init__(self, a: object, b: int) -> None: ...
+CrossedTypes(1, 2)
+
+class Renamed:
+    def __new__(cls, x: int) -> Self: ...
+    def __init__(self, y: int) -> None: ...
+Renamed(1)
+
+class Optional:
+    def __new__(cls, x: int = 0) -> Self: ...
+    def __init__(self) -> None: ...
+Optional()
+
+class SharedKeyword:
+    def __new__(cls, x: int) -> Self: ...
+    def __init__(self, *, x: int) -> None: ...
+SharedKeyword(x=1)
+
+class PositionalOnlyKeyword:
+    def __new__(cls, x: int, /, **kwargs: object) -> Self: ...
+    def __init__(self, y: int, /, *, x: int) -> None: ...
+PositionalOnlyKeyword(1, x=2)
+
+class Overloaded:
+    @overload
+    def __new__(cls, x: int, /) -> Self: ...
+    @overload
+    def __new__(cls) -> Self: ...
+    def __new__(cls, *args: int) -> Self: ...
+    def __init__(self) -> None: ...
+Overloaded()
+
+# Parameter-type incompatibilities are outside the definition check's scope.
+class DisjointTypes:
+    def __new__(cls, x: int) -> Self: ...
+    def __init__(self, x: str) -> None: ...
+"#,
+);
+
+testcase!(
+    test_constructor_call_shape_bypasses,
+    r#"
+from enum import Enum
+from typing import Any, Protocol, Self
+
+class ForeignReturn:
+    def __new__(cls, x: int) -> int: ...
+    def __init__(self) -> None: ...
+
+class AnyReturn:
+    def __new__(cls, x: int) -> Any: ...
+    def __init__(self) -> None: ...
+
+class CustomMeta(type):
+    def __call__(cls, *args: object, **kwargs: object) -> object: ...
+
+class CustomConstruction(metaclass=CustomMeta):
+    def __new__(cls, x: int) -> Self: ...
+    def __init__(self) -> None: ...
+
+class ConstructorProtocol(Protocol):
+    def __new__(cls, x: int) -> Self: ...
+    def __init__(self) -> None: ...
+
+class UnannotatedMeta(type):
+    def __call__(cls, *args: object, **kwargs: object): ...
+
+class UnannotatedConstruction(metaclass=UnannotatedMeta):
+    def __new__(cls, x: int) -> Self: ...
+    def __init__(self) -> None: ...
+
+class EnumConstruction(Enum):
+    def __new__(cls, x: int) -> Self: ...
+    def __init__(self, x: int, label: str) -> None: ...
+
+unknown_init: Any = None
+class UnknownInit:
+    def __new__(cls, x: int) -> Self: ...
+    __init__ = unknown_init
+
+class OnlyNew:
+    def __new__(cls, x: int) -> Self: ...
+
+class OnlyInit:
+    def __init__(self, x: int) -> None: ...
+"#,
+);
+
 testcase!(
     test_new_and_inherited_init,
     r#"
@@ -548,7 +1250,7 @@ class GoodChild(Parent2):
     def __new__[T](cls: type[T], x: int) -> T: ...
 class BadChild(Parent1):
     # Incompatible with inherited __init__
-    def __new__[T](cls: type[T], x: int) -> T: ...
+    def __new__[T](cls: type[T], x: int) -> T: ...  # E: accept no common argument list
 GoodChild(0)
 GoodChild()  # E: Missing argument `x` in function `GoodChild.__new__`
 # Both of these calls error at runtime.
@@ -581,13 +1283,40 @@ assert_type(x, Any)
     "#,
 );
 
+// https://github.com/pyrefly-org/pyrefly/issues/4889: without first-use inference, an unsolved
+// type variable becomes an implicit `Any`.
+testcase!(
+    bug = "An unsolved type variable in `__new__`'s return is treated as a missing annotation",
+    test_new_returns_unsolved_type_var,
+    TestEnv::new_with_infer_with_first_use(false),
+    r#"
+from typing import assert_type
+class ViaNew:
+    def __new__[T](cls) -> T: ...
+d: int = ViaNew()  # E: `ViaNew` is not assignable to `int`
+assert_type(ViaNew(), ViaNew)
+    "#,
+);
+
+testcase!(
+    bug = "A type variable in `__new__`'s return that is solved to `Any` gives the class",
+    test_new_returns_type_var_solved_to_any,
+    r#"
+from typing import assert_type
+class FromArg:
+    def __new__[T](cls, x: T) -> T: ...
+def f(x):
+    assert_type(FromArg(x), FromArg)
+    "#,
+);
+
 testcase!(
     test_type_self_constructor_ignores_concrete_new_return,
     r#"
 from typing import Self, assert_type
 
 class C:
-    def __new__(cls) -> C:
+    def __new__(cls) -> "C":
         return object.__new__(cls)
 
     @classmethod
@@ -670,6 +1399,23 @@ assert_type(C(0), C[int])
 assert_type(C[bool](True), C[bool])
 assert_type(C[bool](0), C[bool])  # E: Argument `Literal[0]` is not assignable to parameter `x` with type `bool`
     "#,
+);
+
+testcase!(
+    test_generic_constructor_specialization_identifies_parameter,
+    r#"
+class Holder[T: int]:
+    def __init__(self, value: T, fallback: T) -> None: ...
+
+Holder(1, 2)
+Holder(1, "bad fallback")  # E: While checking parameter `fallback`: `str` is not assignable to upper bound `int` of type variable `T`
+Holder(1, fallback="bad fallback")  # E: While checking parameter `fallback`: `str` is not assignable to upper bound `int` of type variable `T`
+
+class FromNew[T: int]:
+    def __new__(cls, first: T, second: T) -> "FromNew[T]": ...
+
+FromNew(1, "bad second")  # E: While checking parameter `second`: `str` is not assignable to upper bound `int` of type variable `T`
+"#,
 );
 
 testcase!(
@@ -759,7 +1505,7 @@ from typing import Self
 class A:
     def __new__(cls: type[Self]): ...
 A.__new__(A)  # OK
-A.__new__(int) # E: `int` is not assignable to upper bound `A` of type variable `Self@A`
+A.__new__(int) # E: While checking parameter `cls`: `int` is not assignable to upper bound `A` of type variable `Self@A`
     "#,
 );
 
@@ -769,7 +1515,7 @@ testcase!(
 class A:
     def __new__(cls): ...
 A.__new__(A)  # OK
-A.__new__(int)  # E: `int` is not assignable to upper bound `A` of type variable `Self@A`
+A.__new__(int)  # E: While checking parameter `cls`: `int` is not assignable to upper bound `A` of type variable `Self@A`
     "#,
 );
 
@@ -818,7 +1564,7 @@ testcase!(
     r#"
 from typing import assert_type
 class C[T]:
-    def __new__[T2](cls, x: T2) -> C[T2]: ...
+    def __new__[T2](cls, x: T2) -> "C[T2]": ...
 assert_type(C(0), C[int])
     "#,
 );
@@ -905,7 +1651,7 @@ testcase!(
     r#"
 from typing import assert_type
 class A[T]:
-    def __init__(self: A[str]): pass
+    def __init__(self: "A[str]"): pass
 assert_type(A(), A[str])
     "#,
 );
@@ -931,9 +1677,9 @@ class B: ...
 
 class C[T]:
     @overload
-    def __init__(self: C[A], x: Literal[True]) -> None: ...
+    def __init__(self: "C[A]", x: Literal[True]) -> None: ...
     @overload
-    def __init__(self: C[B], x: Literal[False]) -> None: ...
+    def __init__(self: "C[B]", x: Literal[False]) -> None: ...
     def __init__(self, x):
         pass
 
@@ -942,7 +1688,7 @@ assert_type(C(False), C[B])
     "#,
 );
 
-// Regression test for https://github.com/facebook/pyrefly/issues/4192
+// Regression test for https://github.com/pyrefly-org/pyrefly/issues/4192
 testcase!(
     test_overloaded_init_missing_self,
     r#"
@@ -1042,7 +1788,7 @@ class C[T]:
     "#,
 );
 
-// https://github.com/facebook/pyrefly/issues/4701
+// https://github.com/pyrefly-org/pyrefly/issues/4701
 testcase!(
     test_new_overload_subclass_receiver,
     r#"
@@ -1050,12 +1796,12 @@ from typing import assert_type, overload
 
 class Path:
     @overload
-    def __new__(cls: type[AbsPath], path: str) -> AbsPath: ...
+    def __new__(cls: "type[AbsPath]", path: str) -> "AbsPath": ...
     @overload
-    def __new__(cls: type[RelPath], path: str) -> RelPath: ...
+    def __new__(cls: "type[RelPath]", path: str) -> "RelPath": ...
     @overload
-    def __new__(cls: type[Path], path: str) -> AbsPath | RelPath: ...
-    def __new__(cls: type[Path], path: str) -> Path:
+    def __new__(cls: "type[Path]", path: str) -> "AbsPath | RelPath": ...
+    def __new__(cls: "type[Path]", path: str) -> "Path":
         raise NotImplementedError
 
 class AbsPath(Path): ...
@@ -1074,9 +1820,9 @@ from typing import overload
 
 class Base:
     @overload
-    def __init__(self: Sub, value: int) -> None: ...
+    def __init__(self: "Sub", value: int) -> None: ...
     @overload
-    def __init__(self: Base, value: str) -> None: ...
+    def __init__(self: "Base", value: str) -> None: ...
     def __init__(self, value: int | str):
         pass
 
@@ -1091,8 +1837,8 @@ testcase!(
     test_constructor_subclass_receiver_requires_overload,
     r#"
 class Base:
-    def __new__(cls: type[Sub]) -> Sub: ...  # E: `__new__` method cls type `type[Sub]` refers to class `Sub`, which is not a superclass of class `Base`
-    def __init__(self: Sub) -> None: ...  # E: `__init__` method self type `Sub` is not a superclass of class `Base`
+    def __new__(cls: "type[Sub]") -> "Sub": ...  # E: `__new__` method cls type `type[Sub]` refers to class `Sub`, which is not a superclass of class `Base`
+    def __init__(self: "Sub") -> None: ...  # E: `__init__` method self type `Sub` is not a superclass of class `Base`
 
 class Sub(Base): ...
     "#,
@@ -1110,9 +1856,9 @@ class TypeEngine[T]: ...
 
 class UUID[T: (A, B)](TypeEngine[T]):
     @overload
-    def __init__(self: UUID[A], as_uuid: Literal[True]) -> None: ...
+    def __init__(self: "UUID[A]", as_uuid: Literal[True]) -> None: ...
     @overload
-    def __init__(self: UUID[B], as_uuid: Literal[False]) -> None: ...
+    def __init__(self: "UUID[B]", as_uuid: Literal[False]) -> None: ...
     def __init__(self, as_uuid): ...
 
 class Column[T]:
@@ -1130,10 +1876,10 @@ from typing import Any, Generic, TypeVar, assert_type
 T = TypeVar("T", bound=int, default=Any)
 
 class A(Generic[T]):
-    def __new__(cls, x: T) -> A[T]: ...
+    def __new__(cls, x: T) -> "A[T]": ...
 
 assert_type(A(0), A[int])
-A("oops")  # E: `str` is not assignable to upper bound `int` of type variable `T`
+A("oops")  # E: While checking parameter `x`: `str` is not assignable to upper bound `int` of type variable `T`
     "#,
 );
 
@@ -1143,10 +1889,10 @@ testcase!(
 from typing import Any, assert_type
 
 class A[T = Any]:
-    def __new__(cls, x: T) -> A[T]: ...
+    def __new__(cls, x: T) -> "A[T]": ...
 
 class B[T: int | A[Any] = Any]:
-    def __new__(cls, x: list[A[T]]) -> B[A[T]]: ...
+    def __new__(cls, x: list[A[T]]) -> "B[A[T]]": ...
 
 assert_type(B([A(0)]), B[A[int]])
 B([A("oops")])  # E: `str` is not assignable to upper bound `A | int` of type variable `T`
@@ -1252,7 +1998,7 @@ C("5")  # E: Argument `Literal['5']` is not assignable to parameter `x` with typ
     "#,
 );
 
-// Regression test for a problem in networkx: https://github.com/facebook/pyrefly/issues/3121
+// Regression test for a problem in networkx: https://github.com/pyrefly-org/pyrefly/issues/3121
 testcase!(
     test_return_type_inference_for_constructors,
     r#"
@@ -1372,7 +2118,7 @@ assert_type(d2, D)
     "#,
 );
 
-// Regression test for https://github.com/facebook/pyrefly/issues/3236
+// Regression test for https://github.com/pyrefly-org/pyrefly/issues/3236
 testcase!(
     test_construct_with_hint_and_overloads,
     r#"
@@ -1430,7 +2176,7 @@ assert_type(x, D)
 );
 
 // The `dict` stubs declare `__new__` alongside `__init__`, so subclasses
-// inherit both https://github.com/facebook/pyrefly/issues/4276.
+// inherit both https://github.com/pyrefly-org/pyrefly/issues/4276.
 testcase!(
     test_deeply_nested_dict_subclass_ctor_calls,
     r#"
@@ -1544,7 +2290,7 @@ ok: Callable[[int], list[C[int]]] = C
     "#,
 );
 
-// https://github.com/meta/pyrefly/issues/5591
+// https://github.com/pyrefly-org/pyrefly/issues/5591
 testcase!(
     test_type_of_self_as_callable,
     r#"
@@ -1698,7 +2444,7 @@ Foo(untyped(1), "bad")  # E: Argument `Literal['bad']` is not assignable to para
 "#,
 );
 
-// https://github.com/facebook/pyrefly/issues/5053
+// https://github.com/pyrefly-org/pyrefly/issues/5053
 testcase!(
     test_overloaded_new_cls_annotation_as_callable,
     r#"
@@ -1708,10 +2454,10 @@ from typing import Any, assert_type, overload
 
 class C[T]:
     @overload
-    def __new__(cls: type[C[int]], x: object) -> C[int]: ...
+    def __new__(cls: "type[C[int]]", x: object) -> "C[int]": ...
     @overload
-    def __new__(cls: type[C[str]], x: str) -> C[str]: ...
-    def __new__(cls: type[Any], x: object) -> C[int] | C[str]:
+    def __new__(cls: "type[C[str]]", x: str) -> "C[str]": ...
+    def __new__(cls: type[Any], x: object) -> "C[int] | C[str]":
         raise NotImplementedError
 
 ok: Callable[[str], C[str]] = C[str]
@@ -1740,10 +2486,10 @@ b: Callable[[str], NoAnnotation[str]] = NoAnnotation
 # A bare generic class keeps every overload, since its type parameter is not yet solved.
 class C[T]:
     @overload
-    def __new__(cls: type[C[int]], x: object) -> C[int]: ...
+    def __new__(cls: "type[C[int]]", x: object) -> "C[int]": ...
     @overload
-    def __new__(cls: type[C[str]], x: str) -> C[str]: ...
-    def __new__(cls: type[Any], x: object) -> C[int] | C[str]: ...
+    def __new__(cls: "type[C[str]]", x: str) -> "C[str]": ...
+    def __new__(cls: type[Any], x: object) -> "C[int] | C[str]": ...
 
 bare: Callable[[str], C[str]] = C
 
@@ -1783,9 +2529,9 @@ from typing import Any, assert_type, overload
 
 class I[T]:
     @overload
-    def __init__(self: I[int], x: object) -> None: ...
+    def __init__(self: "I[int]", x: object) -> None: ...
     @overload
-    def __init__(self: I[str], x: str) -> None: ...
+    def __init__(self: "I[str]", x: str) -> None: ...
     def __init__(self, x: Any) -> None: ...
 
 ok: Callable[[str], I[str]] = I[str]

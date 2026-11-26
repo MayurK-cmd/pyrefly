@@ -17,8 +17,10 @@ use pyrefly_types::lit_int::LitInt;
 use pyrefly_types::literal::LitStyle;
 use pyrefly_types::quantified::Quantified;
 use pyrefly_types::quantified::QuantifiedKind;
+use pyrefly_types::quantified::TypeVarLike;
 use pyrefly_types::simplify::intersect;
 use pyrefly_types::type_var::Restriction;
+use pyrefly_util::display::DisplayWithCtx;
 use pyrefly_util::prelude::VecExt;
 use ruff_python_ast::CmpOp;
 use ruff_python_ast::ExprBinOp;
@@ -35,6 +37,7 @@ use crate::alt::answers::LookupAnswer;
 use crate::alt::answers_solver::AnswersSolver;
 use crate::alt::call::CallStyle;
 use crate::alt::callable::CallArg;
+use crate::alt::class::enums::GENERATE_NEXT_VALUE;
 use crate::alt::expr::MAX_TUPLE_LENGTH;
 use crate::alt::narrow::IntersectFallback;
 use crate::alt::solve::TypeFormContext;
@@ -330,6 +333,11 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             }
         } else {
             errors.extend(callee_errors);
+            // A successful call's other soft argument diagnostics stay dropped, but a call that
+            // resolves to a deprecated overload is still reported.
+            errors.extend_filtered(call_errors, |error| {
+                error.error_kind() == ErrorKind::Deprecated
+            });
             OperatorCallOutcome::Returned(self.interpret_operator_return(ret, inferred_placeholder))
         }
     }
@@ -518,7 +526,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         Some(self.heap.mk_concrete_tuple(repeated))
     }
 
-    fn as_hint_for_display(lhs: &Type) -> Option<HintRef> {
+    fn as_hint_for_display(lhs: &Type) -> Option<HintRef<'_, '_>> {
         // In an operation between `lhs` and a container display (e.g., `[3]`, `{"a": 0)]`), the
         // type of the display should be inferred using `lhs` as a hint when the latter is a
         // container type with a display syntax. Hinting is harmless when the types don't match.
@@ -622,6 +630,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     intersect(
                         vec![q.clone().to_type(self.heap), res.clone()],
                         res,
+                        self,
                         self.heap,
                     )
                 } else {
@@ -631,7 +640,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         } else if let Some(narrowed_type) = narrowed_type {
             f(narrowed_type)
         } else {
-            f(&q.upper_bound(self.stdlib, self.heap))
+            f(&q.upper_bound(self, self.heap))
         }
     }
 
@@ -1122,17 +1131,17 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                             && matches!(
                                 (left, right),
                                 (Type::ClassType(left), Type::ClassType(right))
-                                    if (left == self.stdlib.datetime()
-                                        && right == self.stdlib.date())
-                                        || (left == self.stdlib.date()
-                                            && right == self.stdlib.datetime())
+                                    if (left.is(KnownClass::Datetime)
+                                        && right.is(KnownClass::DatetimeDate))
+                                        || (left.is(KnownClass::DatetimeDate)
+                                            && right.is(KnownClass::Datetime))
                             )
                         {
                             self.error(
                                 errors,
                                 x.range,
                                 ErrorKind::UnsupportedOperation,
-                                context().format(),
+                                context().format(self),
                             );
                             return self.heap.mk_class_type(self.stdlib.bool().clone());
                         }
@@ -1153,6 +1162,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                                     &[],
                                     errors,
                                     Some(&context),
+                                    true,
                                 ) {
                                     self.check_dunder_bool_is_callable(&ret, x.range, errors);
                                     self.heap.mk_class_type(self.stdlib.bool().clone())
@@ -1221,6 +1231,14 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     operand_range,
                 )
             };
+            let unsupported = || {
+                self.error(
+                    errors,
+                    x.range,
+                    ErrorKind::UnsupportedOperation,
+                    context().format(self),
+                )
+            };
             match t {
                 Type::Literal(lit) if let Some(ret) = f(&lit.value) => ret,
                 Type::ClassType(_)
@@ -1232,6 +1250,19 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 | Type::Intersect(_) => {
                     self.call_method_or_error(t, method, x.range, &[], &[], errors, Some(&context))
                 }
+                Type::ClassDef(_) | Type::Type(_) => self
+                    .call_magic_dunder_method(
+                        t,
+                        method,
+                        x.range,
+                        &[],
+                        &[],
+                        errors,
+                        Some(&context),
+                        // Operator lookup must not use __getattr__ or __getattribute__.
+                        false,
+                    )
+                    .unwrap_or_else(unsupported),
                 Type::Literal(lit) if let Lit::Enum(lit_enum) = &lit.value => self
                     .call_method_or_error(
                         &self.heap.mk_class_type(lit_enum.class.clone()),
@@ -1244,12 +1275,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     ),
                 // A unary operator on an `Any` keeps its style, like a dunder call on one.
                 Type::Any(style) => Type::Any(*style),
-                _ => self.error(
-                    errors,
-                    x.range,
-                    ErrorKind::UnsupportedOperation,
-                    context().format(),
-                ),
+                _ => unsupported(),
             }
         };
         self.distribute_over_union(t, |t| {
@@ -1290,11 +1316,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         self.unop_types(x, &t, errors)
     }
 
-    /// Checks for unnecessary identity comparisons.
-    ///
-    /// Only emits warnings for identity comparisons (`is` or `is not`) whose result is
-    /// statically known.
-    /// Returns early without warnings for other comparison operators.
+    /// Checks for unnecessary identity and builtin membership comparisons.
     fn check_unnecessary_comparison(
         &self,
         left: &Type,
@@ -1303,6 +1325,57 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         range: TextRange,
         errors: &ErrorCollector,
     ) {
+        if matches!(op, CmpOp::In | CmpOp::NotIn) {
+            // Equality between builtin groups can rule out a match; compatible element types
+            // cannot establish that an element is present. Unknown/custom equality or containment
+            // stays unchecked, and every union alternative must rule out a match.
+            let cannot_match = |element: &Type| {
+                left.as_unions().iter().all(|left| {
+                    self.equality_compatibility_group(left)
+                        .is_some_and(|left_group| {
+                            element.as_unions().iter().all(|element| {
+                                self.equality_compatibility_group(element)
+                                    .is_some_and(|group| group != left_group)
+                            })
+                        })
+                })
+            };
+            let impossible = !left.is_any()
+                && !left.is_never()
+                && right.as_unions().iter().all(|container| match container {
+                    Type::ClassType(class)
+                        if matches!(
+                            class.known(),
+                            Some(
+                                KnownClass::List
+                                    | KnownClass::Set
+                                    | KnownClass::FrozenSet
+                                    | KnownClass::Dict
+                                    | KnownClass::Tuple
+                            )
+                        ) =>
+                    {
+                        class.targs().as_slice().first().is_some_and(cannot_match)
+                    }
+                    Type::Tuple(Tuple::Concrete(elements)) => elements.iter().all(cannot_match),
+                    Type::Tuple(Tuple::Unbounded(element)) => cannot_match(element),
+                    _ => false,
+                });
+            if impossible {
+                self.error(
+                    errors,
+                    range,
+                    ErrorKind::UnnecessaryComparison,
+                    format!(
+                        "Membership test `{}` is always {}",
+                        op.as_str(),
+                        if op == CmpOp::In { "False" } else { "True" }
+                    ),
+                );
+            }
+            return;
+        }
+
         // Only check identity comparisons
         if !matches!(op, CmpOp::Is | CmpOp::IsNot) {
             return;
@@ -1347,24 +1420,54 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         match (left, right) {
             // If both are literals/None, check for predictable results
             (Type::Literal(l1), Type::Literal(l2)) => {
+                // Two members of one enum are the same object when their values are equal, so
+                // the result is only known when the values are provably different.
+                if let (Lit::Enum(e1), Lit::Enum(e2)) = (&l1.value, &l2.value)
+                    && e1.class.class_object() == e2.class.class_object()
+                {
+                    let values_differ = match (&e1.ty, &e2.ty) {
+                        (Type::Literal(v1), Type::Literal(v2)) => {
+                            v1.value.general_class_type(self.stdlib)
+                                == v2.value.general_class_type(self.stdlib)
+                                && v1.value != v2.value
+                        }
+                        // From 3.13, the default `_generate_next_value_` returns the largest
+                        // value so far plus one, so every `auto()` member gets a new value.
+                        (Type::ClassType(c1), Type::ClassType(c2)) => {
+                            c1.is(KnownClass::EnumAuto)
+                                && c2.is(KnownClass::EnumAuto)
+                                && self.bindings().sys_info().version().at_least(3, 13)
+                                && self
+                                    .get_class_member_with_defining_class(
+                                        e1.class.class_object(),
+                                        &GENERATE_NEXT_VALUE,
+                                    )
+                                    .is_some_and(|field| field.defining_class.is(KnownClass::Enum))
+                        }
+                        _ => false,
+                    };
+                    if !values_differ {
+                        return;
+                    }
+                }
                 // Explicit/implicit literal style is typing metadata, not runtime identity.
                 if l1.value != l2.value {
                     emit_literal_warning(
-                        &l1.value.to_string(),
-                        &l2.value.to_string(),
+                        &l1.value.display_with(self).to_string(),
+                        &l2.value.display_with(self).to_string(),
                         if is_op { "False" } else { "True" },
                     );
                 } else if is_bool_literal(&l1.value) {
                     emit_literal_warning(
-                        &l1.value.to_string(),
-                        &l2.value.to_string(),
+                        &l1.value.display_with(self).to_string(),
+                        &l2.value.display_with(self).to_string(),
                         if is_op { "True" } else { "False" },
                     );
                 }
             }
             (Type::Literal(l), Type::None) => {
                 emit_literal_warning(
-                    &l.value.to_string(),
+                    &l.value.display_with(self).to_string(),
                     "None",
                     if is_op { "False" } else { "True" },
                 );
@@ -1372,7 +1475,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             (Type::None, Type::Literal(l)) => {
                 emit_literal_warning(
                     "None",
-                    &l.value.to_string(),
+                    &l.value.display_with(self).to_string(),
                     if is_op { "False" } else { "True" },
                 );
             }
@@ -1383,8 +1486,8 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 if !self.is_subset_eq(cdef, ctype) =>
             {
                 emit_instance_is_class_warning(
-                    &ctype.to_string(),
-                    cdef_inner.name().as_str(),
+                    &ctype.display_with(self).to_string(),
+                    cdef_inner.name(self).as_str(),
                     is_op,
                 );
             }
@@ -1418,8 +1521,8 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         if left_group == right_group {
             return;
         }
-        let left_display = self.for_display(left.clone());
-        let right_display = self.for_display(right.clone());
+        let left_display = self.display(left.clone());
+        let right_display = self.display(right.clone());
         self.error(
             errors,
             range,

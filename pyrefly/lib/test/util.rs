@@ -47,6 +47,7 @@ use ruff_text_size::TextSize;
 use tempfile::TempDir;
 
 use crate::binding::binding::KeyExport;
+use crate::config::base::ClassDecoratorBehavior;
 use crate::config::base::InferReturnTypes;
 use crate::config::base::UntypedDefBehavior;
 use crate::config::config::ConfigFile;
@@ -252,6 +253,7 @@ pub struct TestEnv {
     platform: PythonPlatform,
     check_unannotated_defs: bool,
     infer_return_types: InferReturnTypes,
+    class_decorator_behavior: ClassDecoratorBehavior,
     infer_with_first_use: bool,
     non_exhaustive_match_open_type_error: bool,
     recursion_depth_limit: Option<u32>,
@@ -265,6 +267,7 @@ pub struct TestEnv {
     explicit_any_use_error: bool,
     implicit_any_error: bool,
     unannotated_return_error: bool,
+    unannotated_public_return_error: bool,
     implicit_any_parameter_error: bool,
     implicit_any_attribute_error: bool,
     implicit_bool_error: bool,
@@ -273,9 +276,13 @@ pub struct TestEnv {
     implicit_abstract_class_error: bool,
     open_unpacking_error: bool,
     method_assign_error: bool,
+    bad_descriptor_inheritance_error: bool,
+    bad_override_descriptor_error: bool,
     missing_override_decorator_error: bool,
     missing_super_call_error: bool,
     missing_source_error: bool,
+    unsafe_multiple_inheritance_error: bool,
+    import_cycle_error: bool,
     unused_ignore_errors: bool,
     pyre_ignores: bool,
     not_required_key_access_error: bool,
@@ -284,11 +291,13 @@ pub struct TestEnv {
     invalid_cast_warning: bool,
     untyped_class_decorator_error: bool,
     untyped_function_decorator_error: bool,
+    any_function_decorator_error: bool,
     untyped_namedtuple_error: bool,
     unused_call_result_error: bool,
     implicit_any_empty_container_error: bool,
     partially_unknown_type_error: bool,
     string_as_iterable_warning: bool,
+    redundant_type_check_warning: bool,
     unsupported_dynamic_base_error: bool,
     strict_callable_subtyping: bool,
     strict_partial_subtyping: bool,
@@ -296,14 +305,18 @@ pub struct TestEnv {
     legacy_overload_expansion: bool,
     treat_all_caps_as_final: bool,
     infer_param_types_from_docstring: bool,
+    use_shape_comments_and_stubs: bool,
     reveal_type_qualified_names: bool,
     type_ignore_unknown_tag_behavior: TypeIgnoreUnknownTagBehavior,
     no_any_return_error: bool,
     no_any_return_explicit_error: bool,
     no_any_return_implicit_error: bool,
     implicit_any_lambda_error: bool,
+    unnecessary_type_var_error: bool,
+    deprecated_error: bool,
     invalid_abstract_method_error: bool,
     abstract_method_with_implementation_error: bool,
+    property_type_mismatch_error: bool,
     empty_body_error: bool,
     instance_var_assign_error: bool,
     unknown_argument_type_error: bool,
@@ -334,6 +347,7 @@ impl TestEnv {
             platform: PythonPlatform::default(),
             check_unannotated_defs: true,
             infer_return_types: InferReturnTypes::Checked,
+            class_decorator_behavior: ClassDecoratorBehavior::default(),
             infer_with_first_use: true,
             non_exhaustive_match_open_type_error: false,
             recursion_depth_limit: None,
@@ -347,6 +361,7 @@ impl TestEnv {
             explicit_any_use_error: false,
             implicit_any_error: false,
             unannotated_return_error: false,
+            unannotated_public_return_error: false,
             implicit_any_parameter_error: false,
             implicit_any_attribute_error: false,
             implicit_bool_error: false,
@@ -355,9 +370,13 @@ impl TestEnv {
             implicit_abstract_class_error: false,
             open_unpacking_error: false,
             method_assign_error: false,
+            bad_descriptor_inheritance_error: false,
+            bad_override_descriptor_error: false,
             missing_override_decorator_error: false,
             missing_super_call_error: false,
             missing_source_error: false,
+            unsafe_multiple_inheritance_error: false,
+            import_cycle_error: false,
             unused_ignore_errors: false,
             pyre_ignores: false,
             not_required_key_access_error: false,
@@ -366,11 +385,13 @@ impl TestEnv {
             invalid_cast_warning: false,
             untyped_class_decorator_error: false,
             untyped_function_decorator_error: false,
+            any_function_decorator_error: false,
             untyped_namedtuple_error: false,
             unused_call_result_error: false,
             implicit_any_empty_container_error: false,
             partially_unknown_type_error: false,
             string_as_iterable_warning: false,
+            redundant_type_check_warning: false,
             unsupported_dynamic_base_error: false,
             strict_callable_subtyping: false,
             strict_partial_subtyping: false,
@@ -378,14 +399,18 @@ impl TestEnv {
             legacy_overload_expansion: false,
             treat_all_caps_as_final: false,
             infer_param_types_from_docstring: false,
+            use_shape_comments_and_stubs: true,
             reveal_type_qualified_names: false,
             type_ignore_unknown_tag_behavior: TypeIgnoreUnknownTagBehavior::Suppress,
             no_any_return_error: false,
             no_any_return_explicit_error: false,
             no_any_return_implicit_error: false,
             implicit_any_lambda_error: false,
+            unnecessary_type_var_error: false,
+            deprecated_error: false,
             invalid_abstract_method_error: false,
             abstract_method_with_implementation_error: false,
+            property_type_mismatch_error: false,
             empty_body_error: false,
             instance_var_assign_error: false,
             unknown_argument_type_error: false,
@@ -490,6 +515,11 @@ impl TestEnv {
         res
     }
 
+    pub fn with_class_decorator_behavior(mut self, behavior: ClassDecoratorBehavior) -> Self {
+        self.class_decorator_behavior = behavior;
+        self
+    }
+
     pub fn with_recursion_depth_limit(mut self, recursion_depth_limit: u32) -> Self {
         self.recursion_depth_limit = Some(recursion_depth_limit);
         self
@@ -497,6 +527,16 @@ impl TestEnv {
 
     pub fn enable_implicitly_defined_attribute_error(mut self) -> Self {
         self.implicitly_defined_attribute_error = true;
+        self
+    }
+
+    pub fn enable_bad_descriptor_inheritance_error(mut self) -> Self {
+        self.bad_descriptor_inheritance_error = true;
+        self
+    }
+
+    pub fn enable_bad_override_descriptor_error(mut self) -> Self {
+        self.bad_override_descriptor_error = true;
         self
     }
 
@@ -560,6 +600,11 @@ impl TestEnv {
         self
     }
 
+    pub fn enable_unannotated_public_return_error(mut self) -> Self {
+        self.unannotated_public_return_error = true;
+        self
+    }
+
     pub fn enable_implicit_any_parameter_error(mut self) -> Self {
         self.implicit_any_parameter_error = true;
         self
@@ -592,6 +637,16 @@ impl TestEnv {
 
     pub fn enable_missing_source_error(mut self) -> Self {
         self.missing_source_error = true;
+        self
+    }
+
+    pub fn enable_unsafe_multiple_inheritance_error(mut self) -> Self {
+        self.unsafe_multiple_inheritance_error = true;
+        self
+    }
+
+    pub fn enable_import_cycle_error(mut self) -> Self {
+        self.import_cycle_error = true;
         self
     }
 
@@ -635,6 +690,11 @@ impl TestEnv {
         self
     }
 
+    pub fn enable_any_function_decorator_error(mut self) -> Self {
+        self.any_function_decorator_error = true;
+        self
+    }
+
     pub fn enable_untyped_namedtuple_error(mut self) -> Self {
         self.untyped_namedtuple_error = true;
         self
@@ -657,6 +717,11 @@ impl TestEnv {
 
     pub fn enable_string_as_iterable_warning(mut self) -> Self {
         self.string_as_iterable_warning = true;
+        self
+    }
+
+    pub fn enable_redundant_type_check_warning(mut self) -> Self {
+        self.redundant_type_check_warning = true;
         self
     }
 
@@ -692,6 +757,11 @@ impl TestEnv {
 
     pub fn enable_treat_all_caps_as_final(mut self) -> Self {
         self.treat_all_caps_as_final = true;
+        self
+    }
+
+    pub fn disable_use_shape_comments_and_stubs(mut self) -> Self {
+        self.use_shape_comments_and_stubs = false;
         self
     }
 
@@ -733,6 +803,16 @@ impl TestEnv {
         self
     }
 
+    pub fn enable_unnecessary_type_var_error(mut self) -> Self {
+        self.unnecessary_type_var_error = true;
+        self
+    }
+
+    pub fn enable_deprecated_error(mut self) -> Self {
+        self.deprecated_error = true;
+        self
+    }
+
     pub fn enable_invalid_abstract_method_error(mut self) -> Self {
         self.invalid_abstract_method_error = true;
         self
@@ -740,6 +820,11 @@ impl TestEnv {
 
     pub fn enable_abstract_method_with_implementation_error(mut self) -> Self {
         self.abstract_method_with_implementation_error = true;
+        self
+    }
+
+    pub fn enable_property_type_mismatch_error(mut self) -> Self {
+        self.property_type_mismatch_error = true;
         self
     }
 
@@ -892,6 +977,7 @@ impl TestEnv {
         config.python_environment.site_package_path = Some(self.site_package_path.clone());
         config.root.check_unannotated_defs = Some(self.check_unannotated_defs);
         config.root.infer_return_types = Some(self.infer_return_types);
+        config.root.class_decorator_behavior = Some(self.class_decorator_behavior);
         config.root.infer_with_first_use = Some(self.infer_with_first_use);
         config.root.recursion_depth_limit = self.recursion_depth_limit;
         config.root.strict_callable_subtyping = Some(self.strict_callable_subtyping);
@@ -900,6 +986,7 @@ impl TestEnv {
         config.root.legacy_overload_expansion = Some(self.legacy_overload_expansion);
         config.root.treat_all_caps_as_final = Some(self.treat_all_caps_as_final);
         config.root.infer_param_types_from_docstring = Some(self.infer_param_types_from_docstring);
+        config.use_shape_comments_and_stubs = Some(self.use_shape_comments_and_stubs);
         config.reveal_type_qualified_names = self.reveal_type_qualified_names;
         if !self.replace_imports_with_any.is_empty() {
             let modules = self
@@ -968,6 +1055,9 @@ impl TestEnv {
         if self.unannotated_return_error {
             errors.set_error_severity(ErrorKind::UnannotatedReturn, Severity::Error);
         }
+        if self.unannotated_public_return_error {
+            errors.set_error_severity(ErrorKind::UnannotatedPublicReturn, Severity::Error);
+        }
         if self.implicit_any_parameter_error {
             errors.set_error_severity(ErrorKind::ImplicitAnyParameter, Severity::Error);
         }
@@ -980,6 +1070,12 @@ impl TestEnv {
         if self.method_assign_error {
             errors.set_error_severity(ErrorKind::MethodAssign, Severity::Error);
         }
+        if self.bad_descriptor_inheritance_error {
+            errors.set_error_severity(ErrorKind::BadDescriptorInheritance, Severity::Error);
+        }
+        if self.bad_override_descriptor_error {
+            errors.set_error_severity(ErrorKind::BadOverrideDescriptor, Severity::Error);
+        }
         if self.missing_override_decorator_error {
             errors.set_error_severity(ErrorKind::MissingOverrideDecorator, Severity::Error);
         }
@@ -988,6 +1084,12 @@ impl TestEnv {
         }
         if self.missing_source_error {
             errors.set_error_severity(ErrorKind::MissingSource, Severity::Error);
+        }
+        if self.unsafe_multiple_inheritance_error {
+            errors.set_error_severity(ErrorKind::UnsafeMultipleInheritance, Severity::Error);
+        }
+        if self.import_cycle_error {
+            errors.set_error_severity(ErrorKind::ImportCycle, Severity::Error);
         }
         if self.unused_ignore_errors {
             errors.set_error_severity(ErrorKind::UnusedIgnore, Severity::Error);
@@ -1029,6 +1131,9 @@ impl TestEnv {
         if self.untyped_function_decorator_error {
             errors.set_error_severity(ErrorKind::UntypedFunctionDecorator, Severity::Error);
         }
+        if self.any_function_decorator_error {
+            errors.set_error_severity(ErrorKind::AnyFunctionDecorator, Severity::Error);
+        }
         if self.untyped_namedtuple_error {
             errors.set_error_severity(ErrorKind::UntypedNamedtuple, Severity::Error);
         }
@@ -1044,6 +1149,9 @@ impl TestEnv {
         if self.string_as_iterable_warning {
             errors.set_error_severity(ErrorKind::StringAsIterable, Severity::Warn);
         }
+        if self.redundant_type_check_warning {
+            errors.set_error_severity(ErrorKind::RedundantTypeCheck, Severity::Warn);
+        }
         if self.unsupported_dynamic_base_error {
             errors.set_error_severity(ErrorKind::UnsupportedDynamicBase, Severity::Error);
         }
@@ -1053,11 +1161,20 @@ impl TestEnv {
         if self.implicit_any_lambda_error {
             errors.set_error_severity(ErrorKind::ImplicitAnyLambda, Severity::Error);
         }
+        if self.unnecessary_type_var_error {
+            errors.set_error_severity(ErrorKind::UnnecessaryTypeVar, Severity::Error);
+        }
+        if self.deprecated_error {
+            errors.set_error_severity(ErrorKind::Deprecated, Severity::Error);
+        }
         if self.invalid_abstract_method_error {
             errors.set_error_severity(ErrorKind::InvalidAbstractMethod, Severity::Error);
         }
         if self.abstract_method_with_implementation_error {
             errors.set_error_severity(ErrorKind::AbstractMethodWithImplementation, Severity::Error);
+        }
+        if self.property_type_mismatch_error {
+            errors.set_error_severity(ErrorKind::PropertyTypeMismatch, Severity::Error);
         }
         if self.empty_body_error {
             errors.set_error_severity(ErrorKind::EmptyBody, Severity::Error);

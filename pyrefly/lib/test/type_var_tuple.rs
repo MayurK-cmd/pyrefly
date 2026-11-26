@@ -5,6 +5,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use pyrefly_python::sys_info::PythonVersion;
+
+use crate::test::util::TestEnv;
 use crate::testcase;
 
 testcase!(
@@ -143,7 +146,7 @@ class Codec[*Ts]:
         self,
         f: Callable[[*Ts], T],
         inv_f: Callable[[T], tuple[*Ts]],
-    ) -> Map[T, *Ts]:
+    ) -> "Map[T, *Ts]":
         return Map(self, f, inv_f)
 
 class Map[T, *Ts](Codec[T]):
@@ -222,7 +225,7 @@ def test[*Ts, T](f: Callable[[*Ts], T], t: tuple[*Ts], *args: *Ts):
 "#,
 );
 
-// https://github.com/facebook/pyrefly/issues/4609
+// https://github.com/pyrefly-org/pyrefly/issues/4609
 testcase!(
     test_type_var_tuple_callable_gradual_fixed_params,
     r#"
@@ -261,7 +264,7 @@ def g[*Ts](x: int, y: str, *xs: *Ts):
 "#,
 );
 
-// https://github.com/facebook/pyrefly/issues/4832
+// https://github.com/pyrefly-org/pyrefly/issues/4832
 testcase!(
     test_type_var_tuple_callable_forward_fixed_params,
     r#"
@@ -646,4 +649,35 @@ Ts = TypeVarTuple('Ts')
 def func(*args: tuple[*Ts]): ...
 func((0,), (1, 2))  # E: `tuple[Literal[1], Literal[2]]` is not assignable to parameter `*args` with type `tuple[int]`
     "#,
+);
+
+testcase!(
+    test_illegal_posargs,
+    r#"
+from typing import TypeVarTuple
+Ts = TypeVarTuple("Ts", int, str)  # E: Unexpected positional argument  # E: Unexpected positional argument
+    "#,
+);
+
+// Python 3.15 adds `bound`, `covariant`, `contravariant`, and `infer_variance` to `TypeVarTuple`.
+testcase!(
+    test_type_var_tuple_py315_keywords,
+    TestEnv::new_with_version(PythonVersion::new(3, 15, 0)),
+    r#"
+from typing import TypeVarTuple
+Ts = TypeVarTuple("Ts", bound=int)
+Xs = TypeVarTuple("Xs", bound=1)  # E: Expected a type form
+Us = TypeVarTuple("Us", covariant=True)
+Vs = TypeVarTuple("Vs", contravariant=True)
+Ws = TypeVarTuple("Ws", infer_variance=True)
+"#,
+);
+
+testcase!(
+    test_type_var_tuple_bound_before_py315,
+    TestEnv::new_with_version(PythonVersion::new(3, 14, 0)),
+    r#"
+from typing import TypeVarTuple
+Ts = TypeVarTuple("Ts", bound=int)  # E: Unexpected keyword argument `bound` to TypeVarTuple
+"#,
 );

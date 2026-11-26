@@ -406,7 +406,7 @@ def f(x):
     "#,
 );
 
-// https://github.com/facebook/pyrefly/issues/3374
+// https://github.com/pyrefly-org/pyrefly/issues/3374
 testcase!(
     test_narrow_after_terminating_conjunction,
     r#"
@@ -2001,7 +2001,7 @@ while foo:  # E: Function object `foo` used as condition
     "#,
 );
 
-// https://github.com/facebook/pyrefly/issues/5151
+// https://github.com/pyrefly-org/pyrefly/issues/5151
 testcase!(
     test_unused_coroutine_condition,
     r#"
@@ -2599,7 +2599,7 @@ def f(a: A):
 testcase!(
     crash_no_try_type,
     r#"
-# Used to crash, https://github.com/facebook/pyrefly/issues/766
+# Used to crash, https://github.com/pyrefly-org/pyrefly/issues/766
 try:
     pass
 except as r: # E: Parse error: Expected one or more exception types
@@ -2628,7 +2628,7 @@ def f():
 "#,
 );
 
-// Regression test for https://github.com/facebook/pyrefly/issues/77
+// Regression test for https://github.com/pyrefly-org/pyrefly/issues/77
 testcase!(
     loop_with_sized_operation,
     r#"
@@ -2674,6 +2674,46 @@ def f_or():
 );
 
 testcase!(
+    test_walrus_in_later_bool_op_operand_narrows,
+    r#"
+import os
+from typing import assert_type
+
+def f(u: str | os.PathLike[str]) -> None:
+    if u and (u := str(u)):
+        assert_type(u, str)
+    assert_type(u, str | os.PathLike[str])
+
+def g(u: str | os.PathLike[str], flag: bool) -> None:
+    if flag and (u := str(u)):
+        assert_type(u, str)
+    else:
+        assert_type(u, str | os.PathLike[str])
+
+def h(u: str | os.PathLike[str]) -> None:
+    if not u or not (u := str(u)):
+        return
+    assert_type(u, str)
+
+def k(u: str | os.PathLike[str]) -> None:
+    while u and (u := str(u)):
+        assert_type(u, str)
+        break
+
+def m(u: str | os.PathLike[str]) -> str:
+    return u if u and (u := str(u)) else ""
+
+def n(u: str | os.PathLike[str]) -> None:
+    x = u and (u := str(u))
+    assert_type(u, str | os.PathLike[str])
+
+def p(u: str | os.PathLike[str]) -> None:
+    if u and (u := str(u)) and u.upper():
+        assert_type(u, str)
+    "#,
+);
+
+testcase!(
     test_setitem_with_loop_and_walrus,
     r#"
 def f():
@@ -2684,7 +2724,7 @@ def f():
     "#,
 );
 
-// Regression test for https://github.com/facebook/pyrefly/issues/528
+// Regression test for https://github.com/pyrefly-org/pyrefly/issues/528
 testcase!(
     test_narrow_in_branch_contained_in_loop,
     r#"
@@ -2790,7 +2830,7 @@ def f(v):
     "#,
 );
 
-// Regression tests for https://github.com/facebook/pyrefly/issues/2382
+// Regression tests for https://github.com/pyrefly-org/pyrefly/issues/2382
 // Walrus operator in ternary test expression
 
 testcase!(
@@ -2868,7 +2908,7 @@ def f() -> int:
     "#,
 );
 
-// Regression tests for https://github.com/facebook/pyrefly/issues/2382
+// Regression tests for https://github.com/pyrefly-org/pyrefly/issues/2382
 // Walrus operator in if-statement test conditions
 
 // The first `if` test always evaluates, so walrus bindings should be in base flow.
@@ -3171,7 +3211,7 @@ f(C())
     "#,
 );
 
-// Regression test for https://github.com/facebook/pyrefly/issues/1246
+// Regression test for https://github.com/pyrefly-org/pyrefly/issues/1246
 testcase!(
     test_boolean_op_narrowing_example,
     r#"
@@ -3789,7 +3829,7 @@ def f(x: Color, y: int | str) -> str:
 "#,
 );
 
-// Regression test for the first example bug reported in https://github.com/facebook/pyrefly/issues/1286
+// Regression test for the first example bug reported in https://github.com/pyrefly-org/pyrefly/issues/1286
 testcase!(
     test_match_can_narrow_union_to_never_in_wildcard,
     r#"
@@ -3852,7 +3892,7 @@ class C:
     "#,
 );
 
-// Regression test for the third example bug reported in https://github.com/facebook/pyrefly/issues/1286
+// Regression test for the third example bug reported in https://github.com/pyrefly-org/pyrefly/issues/1286
 testcase!(
     test_enum_exhaustive_match_and_uninitialized_local,
     r#"
@@ -3877,7 +3917,7 @@ print(y)
     "#,
 );
 
-// Regression test for https://github.com/facebook/pyrefly/issues/5186.
+// Regression test for https://github.com/pyrefly-org/pyrefly/issues/5186.
 testcase!(
     test_noreturn_try_except_narrowing,
     r#"
@@ -4016,7 +4056,7 @@ def main(resolve: bool) -> None:
 "#,
 );
 
-// for https://github.com/facebook/pyrefly/issues/1840
+// for https://github.com/pyrefly-org/pyrefly/issues/1840
 testcase!(
     test_exhaustive_flow_no_fall_through,
     r#"
@@ -4061,7 +4101,7 @@ def test_is_instance_union_aware():
     "#,
 );
 
-// https://github.com/facebook/pyrefly/issues/1896
+// https://github.com/pyrefly-org/pyrefly/issues/1896
 testcase!(
     test_exhaustive_flow_no_early_return_narrow,
     r#"
@@ -4098,7 +4138,7 @@ def demo_pyre_narrowing_failure() -> int:
     "#,
 );
 
-// https://github.com/facebook/pyrefly/issues/2261
+// https://github.com/pyrefly-org/pyrefly/issues/2261
 testcase!(
     test_walrus_in_if_with_is_none,
     r#"
@@ -4109,7 +4149,7 @@ def fun(**kwargs):
     "#,
 );
 
-// https://github.com/facebook/pyrefly/issues/1397
+// https://github.com/pyrefly-org/pyrefly/issues/1397
 testcase!(
     test_walrus_in_chained_if_re_match,
     r#"
@@ -4127,7 +4167,7 @@ if line and (match := ipv4_re.search(line)):
     "#,
 );
 
-// https://github.com/facebook/pyrefly/issues/1397
+// https://github.com/pyrefly-org/pyrefly/issues/1397
 testcase!(
     test_walrus_in_negated_if_with_isinstance,
     r#"
@@ -4143,7 +4183,7 @@ def test(thing: Any) -> None:
     "#,
 );
 
-// https://github.com/facebook/pyrefly/issues/1397
+// https://github.com/pyrefly-org/pyrefly/issues/1397
 testcase!(
     test_walrus_bool_in_if,
     r#"
@@ -4154,7 +4194,7 @@ def f() -> None:
     "#,
 );
 
-// https://github.com/facebook/pyrefly/issues/913
+// https://github.com/pyrefly-org/pyrefly/issues/913
 testcase!(
     test_walrus_in_method_call_chain,
     r#"
@@ -4168,7 +4208,7 @@ def f(mod: str, stubs_path: pathlib.Path):
     "#,
 );
 
-// https://github.com/facebook/pyrefly/issues/913
+// https://github.com/pyrefly-org/pyrefly/issues/913
 testcase!(
     test_walrus_in_comparison,
     r#"
@@ -4179,7 +4219,7 @@ def check():
     "#,
 );
 
-// https://github.com/facebook/pyrefly/issues/913
+// https://github.com/pyrefly-org/pyrefly/issues/913
 testcase!(
     test_walrus_with_and_condition,
     r#"
@@ -4190,7 +4230,7 @@ def f(v):
     "#,
 );
 
-// https://github.com/facebook/pyrefly/issues/913
+// https://github.com/pyrefly-org/pyrefly/issues/913
 testcase!(
     test_walrus_in_compound_and_condition,
     r#"
@@ -4200,7 +4240,7 @@ def hello(x: int, y: int) -> int | None:
     "#,
 );
 
-// https://github.com/facebook/pyrefly/issues/913
+// https://github.com/pyrefly-org/pyrefly/issues/913
 testcase!(
     test_walrus_with_none_reassignment,
     r#"
@@ -4213,7 +4253,7 @@ def func(key: str) -> str:
     "#,
 );
 
-// https://github.com/facebook/pyrefly/issues/913
+// https://github.com/pyrefly-org/pyrefly/issues/913
 testcase!(
     test_walrus_in_loop_with_narrowing,
     r#"
@@ -4694,7 +4734,7 @@ def impossible_isinstance(x: int) -> None:
 );
 
 // A suite that declarations settle as dead never runs, so it should not contribute to the types
-// after the chain. See https://github.com/facebook/pyrefly/issues/3537.
+// after the chain. See https://github.com/pyrefly-org/pyrefly/issues/3537.
 testcase!(
     test_suite_settled_dead_by_declarations_is_pruned,
     r#"
@@ -6469,4 +6509,119 @@ def f(x: Mapping[Any, Any]):
     assert_type(y, dict[Any, Any])
     assert_type(z, dict[Any, Any])
     "#,
+);
+
+testcase!(
+    test_unnecessary_assert_tuple,
+    r#"
+from typing import Any
+
+def check(condition: bool, fixed: tuple[int, str], variable: tuple[int, ...],
+          maybe_empty: tuple[()] | tuple[int], unknown: Any):
+    assert (condition, "message")  # E: Assertion is always true because a nonempty tuple is truthy
+    assert fixed  # E: Assertion is always true because a nonempty tuple is truthy
+    assert (condition,)  # E: Assertion is always true because a nonempty tuple is truthy
+    assert condition, "message"
+    assert variable
+    assert maybe_empty
+    assert unknown
+    assert isinstance(condition, bool)
+    assert True
+    while True:
+        break
+
+def empty():
+    assert ()
+"#,
+);
+
+testcase!(
+    test_unnecessary_runtime_class_condition,
+    TestEnv::new().enable_redundant_type_check_warning(),
+    r#"
+import builtins
+from typing import Any, Protocol, runtime_checkable, assert_type
+
+class Base: pass
+class Child(Base):
+    value: int
+
+def identity(value: int) -> int:
+    return value
+
+@runtime_checkable
+class P(Protocol):
+    def run(self) -> None: ...
+
+class Meta(type):
+    def __instancecheck__(self, value: object) -> bool:
+        return True
+class Dynamic(metaclass=Meta): pass
+
+def check(value: int, child: Child, cls: type[Child], mixed: int | str,
+          gradual: int | Any, unknown: Any, floating: float, dynamic: type[int],
+          class_tuple: tuple[type[int], ...]):
+    if isinstance(value, int): pass  # E: Condition `isinstance(...)` is always `True`
+    if not isinstance(value, str): pass  # E: Condition `not isinstance(...)` is always `True`
+    if isinstance(child, Base): pass  # E: Condition `isinstance(...)` is always `True`
+    if issubclass(cls, Base): pass  # E: Condition `issubclass(...)` is always `True`
+    if isinstance(mixed, (int, str)): pass  # E: Condition `isinstance(...)` is always `True`
+    if isinstance(mixed, int): pass
+    if isinstance(gradual, int): pass
+    if isinstance(unknown, int): pass
+    if isinstance(floating, float): pass
+    if isinstance(value, float): pass
+    if isinstance(value, P): pass
+    if isinstance(value, Dynamic): pass
+    if isinstance(value, dynamic): pass
+    if isinstance(value, class_tuple): pass
+    if builtins.isinstance(value, int): pass
+    if isinstance(identity(value), int): pass
+    if isinstance(child.value, int): pass
+    if isinstance([value][0], int): pass
+    if isinstance(value, builtins.int): pass
+    if isinstance(value, (*class_tuple, int)): pass
+    assert isinstance(value, int)
+    assert issubclass(cls, Base)
+    assert_type(isinstance(value, int), bool)
+    assert_type(issubclass(cls, Base), bool)
+
+
+def require_int(value: int) -> None:
+    if not isinstance(value, int):  # E: Condition `not isinstance(...)` is always `False`
+        raise TypeError
+
+def promoted_classes(float_cls: type[float], complex_cls: type[complex]) -> None:
+    if issubclass(float_cls, float): pass
+    if issubclass(float_cls, int): pass
+    if issubclass(complex_cls, complex): pass
+    if issubclass(complex_cls, float): pass
+
+promoted_classes(int, float)
+"#,
+);
+
+testcase!(
+    test_redundant_type_check_suppression,
+    TestEnv::new().enable_redundant_type_check_warning(),
+    r#"
+def check(value: int, cls: type[int]) -> None:
+    if isinstance(value, int): pass  # pyrefly: ignore[redundant-type-check]
+    if issubclass(cls, int): pass  # pyrefly: ignore[redundant-type-check]
+    if isinstance(value, int): pass  # pyrefly: ignore[redundant-condition]  # E: Condition `isinstance(...)` is always `True` according to the inferred types
+    if issubclass(cls, int): pass  # pyrefly: ignore[redundant-condition]  # E: Condition `issubclass(...)` is always `True` according to the inferred types
+    if check: pass  # pyrefly: ignore[redundant-type-check]  # E: Function object `check` used as condition
+    assert (value, "message")  # pyrefly: ignore[redundant-type-check]  # E: Assertion is always true because a nonempty tuple is truthy
+"#,
+);
+
+testcase!(
+    test_redundant_type_check_default,
+    r#"
+def check(value: int, cls: type[int]) -> None:
+    if isinstance(value, int): pass
+    if issubclass(cls, int): pass
+    if check: pass  # E: Function object `check` used as condition
+    assert (value, "message")  # E: Assertion is always true because a nonempty tuple is truthy
+"#,
 );

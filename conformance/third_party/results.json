@@ -1,9 +1,9 @@
 {
-  "total": 145,
-  "pass": 143,
-  "fail": 2,
-  "pass_rate": 0.99,
-  "differences": 10,
+  "total": 146,
+  "pass": 146,
+  "fail": 0,
+  "pass_rate": 1.0,
+  "differences": 0,
   "passing": [
     "aliases_explicit.py",
     "aliases_implicit.py",
@@ -30,6 +30,7 @@
     "constructors_call_type.py",
     "constructors_callable.py",
     "constructors_consistency.py",
+    "dataclasses_descriptors.py",
     "dataclasses_final.py",
     "dataclasses_frozen.py",
     "dataclasses_hash.py",
@@ -92,6 +93,7 @@
     "generics_typevartuple_overloads.py",
     "generics_typevartuple_specialization.py",
     "generics_typevartuple_unpack.py",
+    "generics_typevartuple_variance.py",
     "generics_upper_bound.py",
     "generics_variance.py",
     "generics_variance_inference.py",
@@ -109,6 +111,7 @@
     "overloads_basic.py",
     "overloads_consistency.py",
     "overloads_definitions.py",
+    "overloads_definitions_stub.pyi",
     "overloads_evaluation.py",
     "protocols_class_objects.py",
     "protocols_definition.py",
@@ -149,9 +152,6 @@
     "typeddicts_usage.py",
     "typeforms_typeform.py"
   ],
-  "failing": {
-    "dataclasses_descriptors.py": 1,
-    "generics_typevartuple_variance.py": 9
-  },
+  "failing": {},
   "comment": "@generated"
 }

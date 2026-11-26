@@ -629,7 +629,7 @@ impl Globs {
         // off the walker's built-in filtering and use it only to enumerate files.
         builder.standard_filters(false);
         builder.hidden(false);
-        builder.follow_links(true);
+        builder.follow_links(false);
         builder.types(Self::python_file_types()?);
 
         // `filter_entry` requires a `Fn + Send + Sync + 'static` predicate for both
@@ -666,8 +666,26 @@ impl Globs {
                 Self::should_skip_walk_error(filter, err, path)
             }
             ignore::Error::Loop { child, .. } => Self::should_skip_path_error(filter, child),
-            ignore::Error::Io(_)
-            | ignore::Error::Glob { .. }
+            // Ignore broken symlinks for files unrelated to Python.
+            ignore::Error::Io(_) => path.is_some_and(|path| {
+                if Self::should_skip_path_error(filter, path) {
+                    return true;
+                }
+                if Glob::is_python_extension(path.extension()) {
+                    return false;
+                }
+                let Some((link, target)) = Self::broken_symlink_walk_error(error, Some(path))
+                else {
+                    return false;
+                };
+                warn!(
+                    "Skipping broken symlink when walking project files: `{}` points to {:?}",
+                    link.display(),
+                    target,
+                );
+                true
+            }),
+            ignore::Error::Glob { .. }
             | ignore::Error::UnrecognizedFileType(_)
             | ignore::Error::InvalidDefinition => {
                 path.is_some_and(|path| Self::should_skip_path_error(filter, path))
@@ -1158,6 +1176,12 @@ impl FilteredGlobs {
         self.filter.excludes.append(excludes);
     }
 
+    /// Whether the excludes, hidden-directory filter, or ignore files of these globs exclude
+    /// `path`, whether or not the includes match it.
+    pub fn is_excluded(&self, path: &Path) -> bool {
+        self.filter.is_excluded(path)
+    }
+
     /// The files that these globs include, sorted. Unlike [`Includes::files_iter`], returns no
     /// files instead of an error when nothing matches.
     pub fn matched_files(&self) -> anyhow::Result<Vec<PathBuf>> {
@@ -1165,13 +1189,34 @@ impl FilteredGlobs {
         Ok(Globs::merged_files_iter(explicit_files, walked_files).collect())
     }
 
-    /// The files under `dirs` that these globs include, sorted. Only `dirs` are walked, so an
-    /// include outside of them is never walked. Returns no files when nothing matches.
-    pub fn matched_files_under(&self, dirs: &Globs) -> anyhow::Result<Vec<PathBuf>> {
-        let (explicit_files, walked_files) = dirs.matched_files(&self.filter, None)?;
+    /// The files under `dir` that these globs include, sorted. Only `dir` is walked, so an include
+    /// outside of it is never walked. Returns no files when nothing matches.
+    pub fn matched_files_under(&self, dir: &Glob) -> anyhow::Result<Vec<PathBuf>> {
+        let (explicit_files, walked_files) =
+            Globs(vec![dir.clone()]).matched_files(&self.filter, None)?;
         Ok(Globs::merged_files_iter(explicit_files, walked_files)
             .filter(|path| self.includes.covers(path))
             .collect())
+    }
+
+    /// These globs without the excludes that match `dir` or one of its parents. The other
+    /// excludes still apply to the files under `dir`.
+    pub fn without_excludes_of(&self, dir: &Path) -> Self {
+        let excludes = self
+            .filter
+            .excludes
+            .globs()
+            .iter()
+            .filter(|exclude| !exclude.matches(dir))
+            .cloned()
+            .collect();
+        Self {
+            includes: self.includes.clone(),
+            filter: GlobFilter {
+                excludes: Globs(excludes),
+                ..self.filter.for_walk()
+            },
+        }
     }
 }
 
@@ -1443,7 +1488,7 @@ mod tests {
     }
 
     // Pyright and gitignore treat a `**` that is not a whole path component as `*`.
-    // https://github.com/facebook/pyrefly/issues/1471
+    // https://github.com/pyrefly-org/pyrefly/issues/1471
     #[test]
     fn test_recursive_wildcard_within_component() {
         let normalized = |pattern: &str| Glob::new(pattern.to_owned()).unwrap().to_string();
@@ -2481,46 +2526,42 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn test_dangling_symlink_errors() {
-        fn check(link_name: &str, target: &str) {
-            let tempdir = tempfile::tempdir().unwrap();
-            let root = tempdir.path();
-            TestPath::setup_test_directory(root, vec![TestPath::file("ok.py")]);
+    fn test_dangling_non_python_symlinks_are_skipped() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let root = tempdir.path();
+        TestPath::setup_test_directory(
+            root,
+            vec![
+                TestPath::file("ok.py"),
+                TestPath::dir("sub", vec![TestPath::file("nested.py")]),
+            ],
+        );
+        let missing_dir = root.join("missing-dir");
+        for (link_name, target) in [
+            (".eslintignore", Path::new("missing-target")),
+            ("generated.txt", Path::new("missing-target")),
+            ("sub/LICENSE", Path::new("../LICENSE")),
+            ("sub/package", missing_dir.as_path()),
+        ] {
             std::os::unix::fs::symlink(target, root.join(link_name)).unwrap();
-
-            let filtered = FilteredGlobs::new(
-                Globs::new_with_root(root, vec!["**".to_owned()]).unwrap(),
-                Globs::empty(),
-                None,
-                HiddenDirFilter::Disabled,
-            );
-
-            let err = filtered.files_iter().err().unwrap();
-            assert!(
-                format!("{err:#}").contains("Broken symlink when walking project files"),
-                "got: {err:#}",
-            );
-            assert!(format!("{err:#}").contains(link_name), "got: {err:#}");
-            assert!(
-                format!("{err:#}").contains(&format!("{:?}", PathBuf::from(target))),
-                "got: {err:#}",
-            );
-            let err = filtered.files_iter_with_limit(10).err().unwrap();
-            assert!(
-                format!("{err:#}").contains("Broken symlink when walking project files"),
-                "got: {err:#}",
-            );
-            assert!(format!("{err:#}").contains(link_name), "got: {err:#}");
-            assert!(
-                format!("{err:#}").contains(&format!("{:?}", PathBuf::from(target))),
-                "got: {err:#}",
-            );
         }
 
-        check(".eslintignore", "missing-target");
-        check("generated.txt", "missing-target");
-        check("broken.py", "missing-target\n");
-        check("package", "missing-target");
+        let filtered = FilteredGlobs::new(
+            Globs::new_with_root(root, vec!["**".to_owned()]).unwrap(),
+            Globs::empty(),
+            None,
+            HiddenDirFilter::Disabled,
+        );
+
+        let expected = vec![root.join("ok.py"), root.join("sub/nested.py")];
+        assert_eq!(filtered.files_iter().unwrap().collect::<Vec<_>>(), expected);
+        assert_eq!(
+            filtered
+                .files_iter_with_limit(10)
+                .unwrap()
+                .collect::<Vec<_>>(),
+            expected
+        );
     }
 
     /// An excluded dangling symlink is not part of the Python file set and
@@ -2550,6 +2591,53 @@ mod tests {
                 .unwrap()
                 .collect::<Vec<_>>(),
             vec![root.join("ok.py")]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_symlinks_are_not_followed() {
+        let tempdir = tempfile::tempdir().unwrap();
+        TestPath::setup_test_directory(
+            tempdir.path(),
+            vec![
+                TestPath::dir("outside", vec![TestPath::file("sibling.py")]),
+                TestPath::dir(
+                    "proj",
+                    vec![
+                        TestPath::file("ok.py"),
+                        TestPath::dir("sub", vec![TestPath::file("nested.py")]),
+                    ],
+                ),
+            ],
+        );
+        let root = tempdir.path().join("proj");
+        std::os::unix::fs::symlink("..", root.join("up")).unwrap();
+        std::os::unix::fs::symlink("../outside", root.join("ext")).unwrap();
+        std::os::unix::fs::symlink(".", root.join("sub/self")).unwrap();
+        std::os::unix::fs::symlink("ok.py", root.join("linked.py")).unwrap();
+        std::os::unix::fs::symlink("missing.py", root.join("broken.py")).unwrap();
+
+        let filtered = FilteredGlobs::new(
+            Globs::new_with_root(&root, vec!["**".to_owned()]).unwrap(),
+            Globs::empty(),
+            None,
+            HiddenDirFilter::Disabled,
+        );
+
+        let expected = vec![
+            root.join("broken.py"),
+            root.join("linked.py"),
+            root.join("ok.py"),
+            root.join("sub/nested.py"),
+        ];
+        assert_eq!(filtered.files_iter().unwrap().collect::<Vec<_>>(), expected);
+        assert_eq!(
+            filtered
+                .files_iter_with_limit(10)
+                .unwrap()
+                .collect::<Vec<_>>(),
+            expected
         );
     }
 
@@ -2607,7 +2695,7 @@ mod tests {
     /// A lone non-existent concrete path now reports a clear "does not exist"
     /// error instead of the generic "no files matched". A non-existent path
     /// alongside a real one is still silently skipped, so tools that pass a mix
-    /// of paths keep working. https://github.com/facebook/pyrefly/issues/3647
+    /// of paths keep working. https://github.com/pyrefly-org/pyrefly/issues/3647
     #[test]
     fn test_explicit_nonexistent_path() {
         let tempdir = tempfile::tempdir().unwrap();

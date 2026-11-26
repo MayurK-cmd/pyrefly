@@ -315,12 +315,16 @@ impl Playground {
         config.python_environment.set_empty_to_default();
         config.interpreters.skip_interpreter_query = true;
 
-        // Determine runtime SysInfo from config (if provided) or previous value
+        // Keep module handles and the source database on the configured Python environment.
         let desired_version = config
             .python_environment
             .python_version
             .unwrap_or(self.sys_info.version());
-        let desired_platform = self.sys_info.platform().clone();
+        let desired_platform = config
+            .python_environment
+            .python_platform
+            .clone()
+            .expect("set_empty_to_default should set the Python platform");
         self.sys_info = SysInfo::new(desired_version, desired_platform.clone());
         config.python_environment.python_version = Some(self.sys_info.version());
         config.python_environment.python_platform = Some(desired_platform);
@@ -639,6 +643,55 @@ impl Playground {
 mod tests {
     use super::*;
     use crate::config::error_kind::ErrorKind;
+
+    // https://github.com/pyrefly-org/pyrefly/issues/5683
+    #[test]
+    fn test_python_platform_config_updates() {
+        let mut state = Playground::new(None).unwrap();
+        for (config, expected) in [
+            (Some("python-platform = 'win32'"), "1"),
+            (Some("python-platform = 'linux'"), "2"),
+            (Some("python-platform = 'darwin'"), "2"),
+            (Some("python-platform = 'all'"), "1, 2"),
+            (Some("python-platform = ['linux', 'win32']"), "1, 2"),
+            (Some("python-platform = 'win32'"), "1"),
+            (Some(""), "2"),
+            (Some("python-platform = 'win32'"), "1"),
+            (None, "2"),
+        ] {
+            let mut files = SmallMap::new();
+            files.insert(
+                "sandbox.py".to_owned(),
+                format!(
+                    r#"
+from typing import Literal, assert_type
+import sys
+
+if sys.platform == 'win32':
+    a = 1
+else:
+    a = 2
+
+assert_type(a, Literal[{expected}])
+"#
+                ),
+            );
+            if let Some(config) = config {
+                files.insert("pyrefly.toml".to_owned(), config.to_owned());
+            }
+            assert!(state.update_sandbox_files(files, true).is_some());
+            assert_eq!(
+                state
+                    .get_errors()
+                    .into_iter()
+                    .filter(|error| error.kind != ErrorKind::InactiveCode.to_name())
+                    .map(|error| error.message_header)
+                    .collect::<Vec<_>>(),
+                Vec::<String>::new(),
+                "unexpected diagnostics for {config:?}"
+            );
+        }
+    }
 
     #[test]
     fn test_parameter_name_inlay_hints_can_be_enabled() {
@@ -1288,7 +1341,7 @@ mod tests {
         assert!(kinds.is_empty(), "unexpected diagnostics: {kinds:?}");
     }
 
-    // https://github.com/facebook/pyrefly/issues/5113
+    // https://github.com/pyrefly-org/pyrefly/issues/5113
     #[test]
     fn test_kind_set_to_hint_in_config() {
         let mut state = Playground::new(None).unwrap();

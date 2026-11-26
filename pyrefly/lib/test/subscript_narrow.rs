@@ -398,7 +398,7 @@ testcase!(
     test_dict_contains_wrong_key_type_get_still_errors,
     r#"
 def use(d: dict[int, str]) -> None:
-    if "x" in d:
+    if "x" in d:  # E: Membership test `in` is always False
         d["x"]  # E: Cannot index into `dict[int, str]`
         d.get("x")  # E: Cannot index into `dict[int, str]`
 "#,

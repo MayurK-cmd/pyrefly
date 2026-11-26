@@ -5,8 +5,6 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-use std::iter;
-
 use dupe::Dupe;
 use dupe::IterDupedExt;
 use itertools::Itertools;
@@ -14,15 +12,14 @@ use pyrefly_graph::index::Idx;
 use pyrefly_python::ast::Ast;
 use pyrefly_python::dunder;
 use pyrefly_python::short_identifier::ShortIdentifier;
+use pyrefly_python::sys_info::PythonVersion;
 use pyrefly_types::annotation::Annotation;
 use pyrefly_types::callable::Params;
 use pyrefly_types::known_class::KnownClass;
 use pyrefly_types::quantified::Quantified;
-use pyrefly_types::quantified::QuantifiedKind;
 use pyrefly_types::type_var::Restriction;
 use pyrefly_types::typed_dict::ExtraItem;
 use pyrefly_types::typed_dict::ExtraItems;
-use pyrefly_types::typed_dict::TypedDict;
 use pyrefly_types::types::Forallable;
 use pyrefly_util::display::DisplayWithCtx;
 use pyrefly_util::prelude::SliceExt;
@@ -68,8 +65,8 @@ use crate::binding::base_class::BaseClass;
 use crate::binding::base_class::BaseClassExpr;
 use crate::binding::base_class::BaseClassGeneric;
 use crate::binding::base_class::BaseClassGenericKind;
+use crate::binding::binding::Binding;
 use crate::binding::binding::ClassFieldDefinition;
-use crate::binding::binding::ExprOrBinding;
 use crate::binding::binding::Key;
 use crate::binding::binding::KeyAnnotation;
 use crate::binding::binding::KeyClassField;
@@ -93,6 +90,46 @@ use crate::types::keywords::TypeMap;
 use crate::types::literal::Lit;
 use crate::types::types::CalleeKind;
 use crate::types::types::Type;
+
+/// Whether CPython's `typing._get_protocol_attrs` skips `name` when it collects the members a
+/// runtime protocol check inspects. This mirrors `typing.EXCLUDED_ATTRIBUTES` in
+/// https://github.com/python/cpython/blob/main/Lib/typing.py, gated by the minor version that
+/// first excludes each name. CPython 3.11.5 and later 3.11 releases also exclude `__final__`;
+/// it is not listed because no other minor version excludes it.
+fn is_excluded_runtime_attribute(name: &Name, version: PythonVersion) -> bool {
+    let first_minor = match name.as_str() {
+        "_is_protocol"
+        | "_is_runtime_protocol"
+        | "_MutableMapping__marker"
+        | "__abstractmethods__"
+        | "__annotations__"
+        | "__dict__"
+        | "__doc__"
+        | "__init__"
+        | "__module__"
+        | "__new__"
+        | "__orig_bases__"
+        | "__orig_class__"
+        | "__parameters__"
+        | "__slots__"
+        | "__subclasshook__"
+        | "__weakref__" => 0,
+        "__class_getitem__" => 9,
+        // CPython 3.12.0 and 3.12.1 exclude `__callable_proto_members_only__` where later
+        // releases exclude `__non_callable_proto_members__`. Both are excluded from 3.12 on so
+        // that the gates need not distinguish patch releases.
+        "__protocol_attrs__"
+        | "__type_params__"
+        | "__non_callable_proto_members__"
+        | "__callable_proto_members_only__" => 12,
+        "__match_args__" | "__static_attributes__" | "__firstlineno__" => 13,
+        "__annotate__" | "__annotate_func__" | "__annotations_cache__" => 14,
+        "__typing_is_deprecated_inherited_runtime_protocol__" => 15,
+        // `ABCMeta` injects `_abc_*` attributes into class dictionaries.
+        name => return name.starts_with("_abc_"),
+    };
+    version.at_least(3, first_minor)
+}
 
 #[derive(Debug, Clone)]
 struct ParsedBaseClass<'a> {
@@ -154,9 +191,15 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         errors: &ErrorCollector,
     ) {
         let ty = self.expr_infer(&keyword.value, errors);
-        if let Type::TypedDict(typed_dict) = ty {
-            for (name, field) in self.typed_dict_fields(&typed_dict) {
+        if let Type::ClassType(typed_dict) = &ty
+            && self.is_typed_dict_class(typed_dict.class_object())
+        {
+            for (name, field) in self.typed_dict_fields(typed_dict) {
                 keywords.push((name, Annotation::new_type(field.ty)));
+            }
+        } else if let Type::AnonymousTypedDict(typed_dict) = &ty {
+            for (name, field) in &typed_dict.fields {
+                keywords.push((name.clone(), Annotation::new_type(field.ty.clone())));
             }
         } else if let Some((key, _)) = self.unwrap_mapping(&ty) {
             if !self.is_subset_eq(&key, &self.heap.mk_class_type(self.stdlib.str().clone())) {
@@ -166,7 +209,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     ErrorKind::BadUnpacking,
                     format!(
                         "Expected argument after ** to have `str` keys, got: {}",
-                        self.for_display(key)
+                        self.display(key)
                     ),
                 );
             }
@@ -177,7 +220,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 ErrorKind::BadUnpacking,
                 format!(
                     "Expected argument after ** to be a mapping, got: {}",
-                    self.for_display(ty)
+                    self.display(ty)
                 ),
             );
         }
@@ -204,7 +247,6 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         });
 
         // Compute data that depends on the `BaseClass` representation of base classes.
-        let initial_protocol_metadata = self.initial_protocol_metadata(cls, bases);
         let has_generic_base_class = bases.iter().any(|x| x.is_generic());
         let has_typed_dict_base_class = bases.iter().any(|x| x.is_typed_dict());
 
@@ -215,12 +257,6 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             .map(|x| self.parse_base_class(x, is_new_type))
             .collect::<Vec<_>>();
         let contains_base_class_any = parsed_results.iter().any(|x| x.is_any());
-        let protocol_metadata = self.final_protocol_metadata(
-            initial_protocol_metadata,
-            &decorators,
-            &parsed_results,
-            errors,
-        );
 
         let protocol_base_name = Name::new_static("Protocol");
         let base_metaclasses = bases
@@ -243,7 +279,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 (_, BaseClassParseResult::Parsed(parsed)) if !parsed.has_dynamic_base => parsed
                     .metadata
                     .custom_metaclass()
-                    .map(|metaclass| (parsed.class_object.name(), metaclass)),
+                    .map(|metaclass| (parsed.class_object.name(self), metaclass)),
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -277,7 +313,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         {
             self.error(
                 errors,
-                cls.range(),
+                cls.range(self),
                 ErrorKind::InvalidInheritance,
                 "Metaclass may not be an unbound generic".to_owned(),
             );
@@ -291,29 +327,27 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         if let Some(metaclass) = &mut calculated_metaclass {
             for targ in metaclass.get_mut().targs_mut().as_mut().iter_mut() {
                 if targ.contains_type_variable() {
-                    targ.transform_mut(&mut |ty| match ty {
-                        Type::Quantified(q) => *ty = q.as_gradual_type(),
-                        Type::TypeVar(t) => {
-                            *ty = Quantified::as_gradual_type_helper(t.kind(), t.default())
+                    targ.transform_mut(&mut |ty| {
+                        if let Type::Quantified(q) = ty {
+                            *ty = q.as_gradual_type();
+                        } else if let Some(x) = ty.as_type_var_like() {
+                            *ty = Quantified::as_gradual_type_helper(x.kind(), x.default());
                         }
-                        Type::TypeVarTuple(t) => {
-                            *ty = Quantified::as_gradual_type_helper(
-                                QuantifiedKind::TypeVarTuple,
-                                t.default(),
-                            )
-                        }
-                        Type::ParamSpec(p) => {
-                            *ty = Quantified::as_gradual_type_helper(
-                                QuantifiedKind::ParamSpec,
-                                p.default(),
-                            )
-                        }
-                        _ => {}
                     });
                 }
             }
         }
         let metaclass = calculated_metaclass.as_ref().map(|m| m.get());
+
+        let explicit_slots = self.explicit_slots(cls, metaclass, errors);
+        let initial_protocol_metadata = self.initial_protocol_metadata(cls, bases, &explicit_slots);
+        let protocol_metadata = self.final_protocol_metadata(
+            initial_protocol_metadata,
+            &decorators,
+            &parsed_results,
+            errors,
+        );
+
         // Compute base classes with metadata.
         let bases_with_metadata = self.bases_with_metadata(parsed_results, is_new_type, errors);
         self.check_init_subclass_keywords(
@@ -412,14 +446,14 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             .any(|base| matches!(base, BaseClass::NamedTuple(..)));
         if directly_defines_named_tuple
             && bases_with_metadata.len() > 1
-            && !cls.module().path().is_interface()
+            && !cls.module_path().is_interface()
         {
             // Typeshed models some stdlib namedtuple result objects, such as urllib.parse.ParseResult,
             // by mixing methods into a NamedTuple subclass inside a `.pyi`. Keep rejecting this in
             // user code, but allow it in stubs so we can type-check those result objects precisely.
             self.error(
                 errors,
-                cls.range(),
+                cls.range(self),
                 ErrorKind::InvalidInheritance,
                 "Named tuples do not support multiple inheritance".to_owned(),
             );
@@ -431,7 +465,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             &keyword_annotations,
             &decorators,
             errors,
-            cls.range(),
+            cls.range(self),
         );
 
         let is_typed_dict = has_typed_dict_base_class
@@ -442,9 +476,9 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             && let Some(bad) = bases_with_metadata.iter().find(|x| !x.1.is_typed_dict())
         {
             self.error(errors,
-                cls.range(),
+                cls.range(self),
                 ErrorKind::InvalidInheritance,
-                format!("`{}` is not a typed dictionary. Typed dictionary definitions may only extend other typed dictionaries.", bad.0.name()),
+                format!("`{}` is not a typed dictionary. Typed dictionary definitions may only extend other typed dictionaries.", bad.0.name(self)),
             );
         }
         let typed_dict_metadata = self.typed_dict_metadata(
@@ -457,7 +491,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         if metaclass.is_some() && is_typed_dict {
             self.error(
                 errors,
-                cls.range(),
+                cls.range(self),
                 ErrorKind::InvalidInheritance,
                 "Typed dictionary definitions may not specify a metaclass".to_owned(),
             );
@@ -466,13 +500,12 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         let enum_metadata = self.enum_metadata(cls, metaclass, &bases_with_metadata, errors);
 
         let is_final = decorators.iter().any(|(decorator, _)| {
-            decorator.ty.callee_kind() == Some(CalleeKind::Function(FunctionKind::Final))
+            decorator.ty.callee_kind(self) == Some(CalleeKind::Function(FunctionKind::Final))
         });
         let deprecation = decorators
             .iter()
             .find_map(|(decorator, _)| decorator.deprecation.clone());
 
-        let explicit_slots = self.explicit_slots(cls);
         let has_nonempty_explicit_slots = explicit_slots
             .slots_info()
             .is_some_and(|slots| !slots.names.is_empty());
@@ -480,7 +513,8 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         // an invalid TypedDict/Protocol target as disjoint would let narrowing
         // incorrectly intersect it to Never.
         let has_valid_disjoint_base_decorator = decorators.iter().any(|(decorator, range)| {
-            if decorator.ty.callee_kind() != Some(CalleeKind::Function(FunctionKind::DisjointBase))
+            if decorator.ty.callee_kind(self)
+                != Some(CalleeKind::Function(FunctionKind::DisjointBase))
             {
                 return false;
             }
@@ -507,7 +541,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         let total_ordering_metadata = decorators
             .iter()
             .position(|(decorator, _)| {
-                decorator.ty.callee_kind()
+                decorator.ty.callee_kind(self)
                     == Some(CalleeKind::Function(FunctionKind::TotalOrdering))
             })
             .map(|decorator| TotalOrderingMetadata { decorator });
@@ -580,7 +614,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             // desirable for methods but problematic for fields like `__total__` that should be available on the class
             // but not the instance. For now, we make all fields available on both classes and instances.
             let td_fallback = self.stdlib.typed_dict_fallback();
-            vec![td_fallback.class_object().clone()]
+            vec![*td_fallback.class_object()]
         } else {
             bases_with_metadata
                 .into_iter()
@@ -674,13 +708,13 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             self.as_call_target_or_error(
                 init_subclass,
                 CallStyle::Method(&dunder::INIT_SUBCLASS),
-                cls.range(),
+                cls.range(self),
                 errors,
                 None,
             ),
             &[],
             &keywords,
-            cls.range(),
+            cls.range(self),
             errors,
             None,
             None,
@@ -711,46 +745,87 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             .find_map(|base| self.find_inherited_init_subclass(base, seen))
     }
 
-    fn explicit_slots(&self, cls: &Class) -> ExplicitSlots {
+    fn explicit_slots(
+        &self,
+        cls: &Class,
+        metaclass: Option<&ClassType>,
+        errors: &ErrorCollector,
+    ) -> ExplicitSlots {
         let key = KeyClassField(cls.index(), dunder::SLOTS.clone());
         let Some(idx) = self.bindings().key_to_idx_hashed_opt(Hashed::new(&key)) else {
             return ExplicitSlots::Absent;
         };
         let binding = self.bindings().get::<KeyClassField>(idx);
-        let ClassFieldDefinition::AssignedInBody { value, .. } = &binding.definition else {
+        let Some(entries) = binding.explicit_slots() else {
             return ExplicitSlots::Unknown;
         };
-        let ExprOrBinding::Expr(expr) = value.as_ref() else {
-            return ExplicitSlots::Unknown;
-        };
-
-        fn name_of(expr: &Expr) -> Option<Name> {
-            match expr {
-                Expr::StringLiteral(s) => Some(Name::new(s.value.to_str())),
-                _ => None,
+        let names: SmallSet<Name> = entries.into_iter().map(|(name, _)| name).collect();
+        // A metaclass other than `type` or `ABCMeta` may remove names from the namespace before it
+        // creates the class.
+        if cls.module_path().is_interface()
+            || metaclass.is_some_and(|m| !m.class_object().is(KnownClass::AbcMeta))
+        {
+            return ExplicitSlots::Known(SlotsInfo { names });
+        }
+        for name in &names {
+            // CPython handles these names separately from ordinary slot descriptors.
+            if matches!(name.as_str(), "__dict__" | "__weakref__" | "__qualname__") {
+                continue;
+            }
+            let key = KeyClassField(cls.index(), name.clone());
+            let Some(idx) = self.bindings().key_to_idx_hashed_opt(Hashed::new(&key)) else {
+                continue;
+            };
+            let field = self.bindings().get::<KeyClassField>(idx);
+            // Only a name defined more than once in the body has an `Anywhere` binding. Report the
+            // first of its definitions that binds a value: a bare annotation neither binds one nor
+            // removes one.
+            let binds_value =
+                |key: Idx<Key>| !matches!(self.bindings().get(key), Binding::AnnotatedType(..));
+            let anywhere = Key::Anywhere(Box::new((name.clone(), field.range)));
+            let conflict_range = match self
+                .bindings()
+                .key_to_idx_hashed_opt(Hashed::new(&anywhere))
+            {
+                Some(idx) => {
+                    let Binding::Phi(_, branches) = self.bindings().get(idx) else {
+                        unreachable!("Anywhere bindings merge definitions with Phi")
+                    };
+                    branches
+                        .iter()
+                        .map(|branch| branch.value_key)
+                        .find(|key| binds_value(*key))
+                        .map(|key| self.bindings().idx_to_key(key).range())
+                }
+                None => match &field.definition {
+                    ClassFieldDefinition::AssignedInBody { .. }
+                    | ClassFieldDefinition::MethodLike { .. }
+                    | ClassFieldDefinition::NestedClass { .. } => Some(field.range),
+                    ClassFieldDefinition::DefinedWithoutAssign { definition, .. } => {
+                        binds_value(*definition).then_some(field.range)
+                    }
+                    ClassFieldDefinition::DeclaredByAnnotation { .. }
+                    | ClassFieldDefinition::DeclaredWithoutAnnotation
+                    | ClassFieldDefinition::DefinedInMethod { .. } => None,
+                },
+            };
+            if let Some(range) = conflict_range {
+                self.error(
+                    errors,
+                    range,
+                    ErrorKind::BadClassDefinition,
+                    format!("`{name}` in `__slots__` conflicts with a class variable"),
+                );
             }
         }
-        let names: Option<SmallSet<Name>> = match expr {
-            Expr::Tuple(t) => t.elts.iter().map(name_of).collect(),
-            Expr::List(l) => l.elts.iter().map(name_of).collect(),
-            Expr::Dict(d) => d
-                .items
-                .iter()
-                .map(|item| item.key.as_ref().and_then(name_of))
-                .collect(),
-            Expr::StringLiteral(s) => Some(iter::once(Name::new(s.value.to_str())).collect()),
-            _ => return ExplicitSlots::Unknown,
-        };
-        match names {
-            Some(names) => ExplicitSlots::Known(SlotsInfo { names }),
-            None => ExplicitSlots::Unknown,
-        }
+        ExplicitSlots::Known(SlotsInfo { names })
     }
 
     fn initial_protocol_metadata(
         &self,
         cls: &Class,
         bases: &[BaseClass],
+        explicit_slots: &ExplicitSlots,
     ) -> Option<ProtocolMetadata> {
         if bases.iter().any(|x| {
             matches!(
@@ -761,11 +836,33 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 })
             )
         }) {
+            // CPython excludes the literal `__slots__` but exposes non-excluded slot
+            // names as runtime attributes. An unresolvable declaration cannot prove
+            // data slots, so no error is reported for it.
+            let version = self.bindings().sys_info().version();
+            let mut members = SmallSet::new();
+            let mut runtime_members: SmallSet<Name> = explicit_slots
+                .slots_info()
+                .map(|slots| {
+                    slots
+                        .names
+                        .iter()
+                        .filter(|name| !is_excluded_runtime_attribute(name, version))
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default();
+            if let Some(fields) = self.get_class_fields(cls) {
+                for name in fields.class_body_fields() {
+                    members.insert(name.clone());
+                    if !is_excluded_runtime_attribute(name, version) {
+                        runtime_members.insert(name.clone());
+                    }
+                }
+            }
             Some(ProtocolMetadata {
-                members: self
-                    .get_class_fields(cls)
-                    .map(|f| f.class_body_fields().cloned().collect())
-                    .unwrap_or_default(),
+                members,
+                runtime_members,
                 is_runtime_checkable: false,
             })
         } else {
@@ -791,6 +888,9 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                 {
                     if let Some(base_proto) = metadata.protocol_metadata() {
                         proto.members.extend(base_proto.members.iter().cloned());
+                        proto
+                            .runtime_members
+                            .extend(base_proto.runtime_members.iter().cloned());
                         if base_proto.is_runtime_checkable {
                             proto.is_runtime_checkable = true;
                         }
@@ -805,7 +905,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             }
         }
         for (decorator, range) in decorators {
-            match decorator.ty.callee_kind() {
+            match decorator.ty.callee_kind(self) {
                 Some(CalleeKind::Function(FunctionKind::RuntimeCheckable)) => {
                     if let Some(proto) = &mut protocol_metadata {
                         proto.is_runtime_checkable = true;
@@ -877,7 +977,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     ("closed" | "extra_items", _) if extra_items.is_some() => {
                         self.error(
                             errors,
-                            cls.range(),
+                            cls.range(self),
                             ErrorKind::BadTypedDict,
                             "TypedDict keywords `closed` and `extra_items` cannot be used together"
                                 .to_owned(),
@@ -893,12 +993,12 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         extra_items = Some(ExtraItems::Default);
                     }
                     ("extra_items", value_ty) => {
-                        let ty = self.untype_opt(value_ty.clone(), cls.range(), errors).unwrap_or_else(|| {
+                        let ty = self.untype_opt(value_ty.clone(), cls.range(self), errors).unwrap_or_else(|| {
                             self.error(
                                 errors,
-                                cls.range(),
+                                cls.range(self),
                                 ErrorKind::BadTypedDict,
-                                format!("Expected `extra_items` to be a type form, got instance of `{}`", self.for_display(value_ty.clone())),
+                                format!("Expected `extra_items` to be a type form, got instance of `{}`", self.display(value_ty.clone())),
                             )
                         });
                         extra_items = Some(ExtraItems::extra(ty, &value.qualifiers));
@@ -907,19 +1007,19 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     ("total" | "closed", value_ty) => {
                         self.error(
                             errors,
-                            cls.range(),
+                            cls.range(self),
                             ErrorKind::BadTypedDict,
                             format!(
                                 "Expected literal True or False for keyword `{}`, got instance of `{}`",
                                 name,
-                                self.for_display(value_ty.clone())
+                                self.display(value_ty.clone())
                             ),
                         );
                     }
                     _ => {
                         self.error(
                             errors,
-                            cls.range(),
+                            cls.range(self),
                             ErrorKind::BadTypedDict,
                             format!(
                                 "TypedDict does not support keyword argument `{}`",
@@ -934,7 +1034,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             let extra_items = self.calculate_typed_dict_extra_items(
                 extra_items,
                 bases_with_metadata,
-                cls.range(),
+                cls.range(self),
                 errors,
             );
             Some(TypedDictMetadata {
@@ -968,9 +1068,12 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         match (&cur_extra_items, inherited_extra_items) {
             (ExtraItems::Default, ExtraItems::Closed | ExtraItems::Extra(_)) => {
                 let base = if *inherited_extra_items == ExtraItems::Closed {
-                    format!("closed TypedDict `{}`", base_typed_dict.name())
+                    format!("closed TypedDict `{}`", base_typed_dict.name(self))
                 } else {
-                    format!("TypedDict `{}` with extra items", base_typed_dict.name())
+                    format!(
+                        "TypedDict `{}` with extra items",
+                        base_typed_dict.name(self)
+                    )
                 };
                 self.error(
                     errors,
@@ -989,7 +1092,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     errors,
                     range,
                     ErrorKind::BadTypedDict,
-                    format!("Closed TypedDict cannot inherit from TypedDict `{}` with non-read-only extra items", base_typed_dict.name()),
+                    format!("Closed TypedDict cannot inherit from TypedDict `{}` with non-read-only extra items", base_typed_dict.name(self)),
                 );
             }
             (
@@ -1005,7 +1108,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     ErrorKind::BadTypedDict,
                     format!(
                         "Cannot change the non-read-only extra items type of TypedDict `{}`",
-                        base_typed_dict.name()
+                        base_typed_dict.name(self)
                     ),
                 );
             }
@@ -1038,7 +1141,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             {
                 self.error(
                     errors,
-                    cls.range(),
+                    cls.range(self),
                     ErrorKind::InvalidInheritance,
                     "Enums may not be generic".to_owned(),
                 );
@@ -1076,8 +1179,10 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             if let Type::KwCall(call) = &decorator.ty
                 && call.has_function_kind(FunctionKind::DataclassTransform)
             {
-                dataclass_transform_metadata =
-                    Some(DataclassTransformMetadata::from_type_map(&call.keywords));
+                dataclass_transform_metadata = Some(DataclassTransformMetadata::from_type_map(
+                    &call.keywords,
+                    self,
+                ));
             }
         }
         // A metaclass-based dataclass_transform (e.g. SQLAlchemy's `DCTransformDeclarative`)
@@ -1400,7 +1505,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         }
         let mut has_dataclass_decorator = false;
         for (decorator, _) in decorators {
-            match decorator.ty.callee_kind() {
+            match decorator.ty.callee_kind(self) {
                 // `@dataclass`
                 Some(CalleeKind::Function(FunctionKind::Dataclass)) => {
                     has_dataclass_decorator = true;
@@ -1476,12 +1581,12 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         // hard-reject kinds have no useful dataclass runtime behavior to model, so abort.
         if has_dataclass_decorator
             && self.report_forbidden_dataclass_target(
-                cls.name(),
+                cls.name(self),
                 is_protocol,
                 is_enum,
                 is_typed_dict,
                 is_named_tuple,
-                cls.range(),
+                cls.range(self),
                 errors,
             )
         {
@@ -1621,6 +1726,13 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
     ) -> BaseClassParseResult<'s> {
         let range = base.range();
         let parse_base_class_type = |ty| match ty {
+            ty @ Type::ClassType(_)
+                if is_new_type
+                    && let Type::ClassType(c) = &ty
+                    && self.is_typed_dict_class(c.class_object()) =>
+            {
+                BaseClassParseResult::InvalidType(ty, range)
+            }
             Type::ClassType(c) => {
                 let base_cls = c.class_object();
                 let base_class_metadata = self.get_metadata_for_class(base_cls);
@@ -1645,29 +1757,8 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     }
                 })
             }
-            Type::TypedDict(typed_dict) => {
-                if is_new_type {
-                    BaseClassParseResult::InvalidType(typed_dict.to_type(self.heap), range)
-                } else {
-                    match typed_dict {
-                        TypedDict::TypedDict(inner) => {
-                            let class_object = inner.class_object();
-                            let class_metadata = self.get_metadata_for_class(class_object);
-                            BaseClassParseResult::Parsed({
-                                ParsedBaseClass {
-                                    class_object: class_object.dupe(),
-                                    range,
-                                    metadata: class_metadata,
-                                    has_dynamic_base: false,
-                                }
-                            })
-                        }
-                        TypedDict::Anonymous(_) => {
-                            BaseClassParseResult::InvalidType(typed_dict.to_type(self.heap), range)
-                        }
-                    }
-                }
-            }
+            // An anonymous TypedDict cannot be used as a base class.
+            ty @ Type::AnonymousTypedDict(_) => BaseClassParseResult::InvalidType(ty, range),
             Type::None if is_new_type => {
                 let base_cls = self.stdlib.none_type().class_object();
                 let metadata = self.get_metadata_for_class(base_cls);
@@ -1894,7 +1985,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                             errors,
                             range,
                             ErrorKind::InvalidInheritance,
-                            format!("Invalid base class: `{}`", self.for_display(ty)),
+                            format!("Invalid base class: `{}`", self.display(ty)),
                         );
                     }
                     None
@@ -1914,7 +2005,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                             errors,
                             range,
                             ErrorKind::InvalidInheritance,
-                            format!("Cannot extend final class `{}`", class_object.name()),
+                            format!("Cannot extend final class `{}`", class_object.name(self)),
                         );
                     }
                     if is_new_type {
@@ -1994,14 +2085,14 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         }
                     };
                     self.error(errors,
-                        cls.range(),
+                        cls.range(self),
                         ErrorKind::InvalidInheritance,
                         format!(
                             "Class `{}` has metaclass `{}`{} which is not compatible with metaclass `{}`{}",
-                            cls.name(),
-                            self.for_display(candidate_metaclass_type.clone()),
+                            cls.name(self),
+                            self.display(candidate_metaclass_type.clone()),
                             origin(*candidate_name),
-                            self.for_display(base_metaclass_type),
+                            self.display(base_metaclass_type),
                             origin(Some(base_name)),
                         ),
                     );
@@ -2045,8 +2136,8 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                         ErrorKind::InvalidInheritance,
                         format!(
                             "Metaclass of `{}` has type `{}` which is not a subclass of `type`",
-                            cls.name(),
-                            self.for_display(self.heap.mk_class_type(meta)),
+                            cls.name(self),
+                            self.display(self.heap.mk_class_type(meta)),
                         ),
                     );
                     None
@@ -2057,12 +2148,12 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             ty => {
                 self.error(
                     errors,
-                    cls.range(),
+                    cls.range(self),
                     ErrorKind::InvalidInheritance,
                     format!(
                         "Metaclass of `{}` has type `{}` that is not a simple class type",
-                        cls.name(),
-                        self.for_display(ty),
+                        cls.name(self),
+                        self.display(ty),
                     ),
                 );
                 None
@@ -2087,7 +2178,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         let targs_consistent = |prev: &ClassType, cur: &ClassType| -> bool {
             self.is_subset_eq(&cur.clone().to_type(), &prev.clone().to_type())
         };
-        ClassMro::new(cls, bases_with_mros, errors, &targs_consistent)
+        ClassMro::new(self, cls, bases_with_mros, errors, &targs_consistent)
     }
 
     /// Resolve `cls`'s disjoint-base representative.
@@ -2126,14 +2217,14 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
 
         if survivors.len() > 1 {
             let ctx_classes: Vec<&Class> = std::iter::once(cls).chain(survivors.iter()).collect();
-            let ctx = ClassDisplayContext::new(&ctx_classes);
+            let ctx = ClassDisplayContext::new(self, &ctx_classes);
             let listed = survivors
                 .iter()
                 .map(|s| format!("`{}`", ctx.display(s)))
                 .join(", ");
             self.error(
                 errors,
-                cls.range(),
+                cls.range(self),
                 ErrorKind::InvalidInheritance,
                 format!(
                     "Class `{}` inherits from incompatible disjoint bases {}",
@@ -2207,6 +2298,13 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
     }
 
     fn is_implemented_in_class(&self, cls: &Class, field_name: &Name) -> bool {
+        // Deciding this without the field's type avoids inferring method return types.
+        if self
+            .get_class_fields(cls)
+            .is_some_and(|fields| fields.defines_concrete_field(field_name))
+        {
+            return true;
+        }
         // If the class has a synthesized concrete implementation (e.g., `__dataclass_fields__`
         // from @dataclass), that satisfies any protocol requirement for this field.
         if self
@@ -2219,7 +2317,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             self.get_non_synthesized_class_member_and_defining_class(cls, field_name)
             && (field.value.is_abstract() ||
                 // Uninitialized class vars in protocols are considered abstract, unless it is in a stub file
-                (!cls.module().path().is_interface() && field.value.is_uninit_class_var() &&
+                (!cls.module_path().is_interface() && field.value.is_uninit_class_var() &&
                 self.get_metadata_for_class(&field.defining_class).is_protocol()))
         {
             return false;
@@ -2297,7 +2395,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         let Some(setitem_ty) = self.type_of_magic_dunder_attr(
             &base,
             &dunder::SETITEM,
-            cls.range(),
+            cls.range(self),
             &swallower,
             None,
             "calculate_subscript_symmetry",
@@ -2308,7 +2406,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         let Some(getitem_ty) = self.type_of_magic_dunder_attr(
             &base,
             &dunder::GETITEM,
-            cls.range(),
+            cls.range(self),
             &swallower,
             None,
             "calculate_subscript_symmetry",

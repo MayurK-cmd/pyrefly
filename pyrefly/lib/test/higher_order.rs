@@ -12,7 +12,7 @@
 use crate::test::util::TestEnv;
 use crate::testcase;
 
-// Regression test for https://github.com/facebook/pyrefly/issues/5021.
+// Regression test for https://github.com/pyrefly-org/pyrefly/issues/5021.
 testcase!(
     test_factory_callable_erases_return_only_type_parameter,
     r#"
@@ -29,7 +29,7 @@ reveal_type(make(tuple))  # E: revealed type: tuple[Unknown, ...]
 "#,
 );
 
-// Regression test for https://github.com/facebook/pyrefly/issues/5021.
+// Regression test for https://github.com/pyrefly-org/pyrefly/issues/5021.
 testcase!(
     test_defaultdict_tuple_factory_erases_return_only_type_parameter,
     r#"
@@ -55,7 +55,7 @@ from typing import reveal_type
 def identity[S](f: Callable[[S], S]) -> Callable[[S], S]:
     return f
 
-def generic[T](x: T = ...) -> T:
+def generic[T](x: T = ...) -> T:  # E: Type variable `T` may go unsolved if a call to `generic` omits argument `x`
     ...
 
 result = identity(generic)
@@ -71,7 +71,7 @@ from typing import reveal_type
 
 def deco[**P, R](f: Callable[P, R]) -> Callable[P, R]: ...
 
-def generic[T](x: T = ...) -> T: ...
+def generic[T](x: T = ...) -> T: ...  # E: Type variable `T` may go unsolved if a call to `generic` omits argument `x`
 
 reveal_type(deco(generic))  # E: revealed type: [R](x: R = ...) -> R
 "#,
@@ -751,7 +751,7 @@ def f(x: int) -> float: ...  # E: Overload return type `float` is not assignable
 def f(x: str) -> str: ...  # E: Overload return type `str` is not assignable to implementation return type `None`
 def f(x): ...
 
-result = project(f, 1)  # E: Overload type was not compatible with solved type variables: S = int
+result = project(f, 1)  # E: While checking parameter `f`: Overload type was not compatible with solved type variables: S = int
 reveal_type(result)  # E: revealed type: (Never) -> int
 "#,
 );
@@ -769,7 +769,7 @@ def f(x: int) -> tuple[int, str]: ...  # E: Overload return type `tuple[int, str
 def f(x: str) -> tuple[str, int]: ...  # E: Overload return type `tuple[str, int]` is not assignable to implementation return type `None`
 def f(x): ...
 
-result = project(f, 1, 1)  # E: Overload type was not compatible with solved type variables: S = int, T = int
+result = project(f, 1, 1)  # E: While checking parameter `f`: Overload type was not compatible with solved type variables: S = int, T = int
 # We keep solved type-variable substitutions in the result even when overload pruning
 # later rejects all captured branches.
 reveal_type(result)  # E: revealed type: () -> tuple[int, int]
@@ -793,7 +793,7 @@ def good(x: int) -> str: ...
 @overload
 def good(x: str) -> int: ...
 def good(x: int | str) -> str | int: ...
-result = combine(bad, 1.0, good)  # E: Overload type was not compatible with solved type variables: A = float
+result = combine(bad, 1.0, good)  # E: While checking parameter `f`: Overload type was not compatible with solved type variables: A = float
 reveal_type(result)  # E: revealed type: tuple[Never, Unknown]
     "#,
 );
@@ -811,7 +811,7 @@ def f(x: float) -> float: ...  # E: Overload return type `float` is not assignab
 def f(x: bytes) -> bytes: ...  # E: Overload return type `bytes` is not assignable to implementation return type `None`
 def f(x): ...
 
-result = project(f, 1)  # E: Overload type was not compatible with solved type variables: unknown = int
+result = project(f, 1)  # E: While checking parameter `f`: Overload type was not compatible with solved type variables: unknown = int
 reveal_type(result)  # E: revealed type: (int) -> int
 "#,
 );
@@ -1093,7 +1093,7 @@ async def test(iterator: Iterator[str]) -> None:
 "#,
 );
 
-// Regression tests for https://github.com/facebook/pyrefly/issues/2105
+// Regression tests for https://github.com/pyrefly-org/pyrefly/issues/2105
 // Overloaded callable protocol passed to higher-order function with ParamSpec.
 // The solver commits to one overload branch too early and rejects valid calls.
 
@@ -1265,7 +1265,7 @@ testcase!(
 from functools import reduce
 from operator import add
 xs: list[int | str] = [1, "x"]
-reduce(add, xs)  # E: Overload type was not compatible with solved type variables: _T = int | str
+reduce(add, xs)  # E: While checking parameter `function`: Overload type was not compatible with solved type variables: _T = int | str
     "#,
 );
 
@@ -1381,7 +1381,7 @@ def normalize[N: int](value: N) -> N: ...
 @overload
 def normalize(value: bytes) -> bytes: ...
 def normalize(value: int | bytes) -> int | bytes: ...
-transform_all(["hello"], normalize)  # E: Overload type was not compatible with solved type variables: T = str
+transform_all(["hello"], normalize)  # E: While checking parameter `transform`: Overload type was not compatible with solved type variables: T = str
 assert_type(transform_all([1], normalize), list[int])
     "#,
 );
@@ -2047,7 +2047,7 @@ reveal_type(seven(f, f, f, f, f, f, f))  # E: revealed type: tuple[Unknown, Unkn
     "#,
 );
 
-// https://github.com/facebook/pyrefly/issues/5236
+// https://github.com/pyrefly-org/pyrefly/issues/5236
 testcase!(
     test_lone_overloaded_constructor_with_gradual_argument,
     r#"

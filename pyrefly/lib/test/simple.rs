@@ -449,7 +449,7 @@ assert_type(f(1), int)
 "#,
 );
 
-// https://github.com/facebook/pyrefly/issues/2722
+// https://github.com/pyrefly-org/pyrefly/issues/2722
 testcase!(
     test_signature_diff_no_panic,
     r#"
@@ -819,7 +819,7 @@ x = f"abc{f(1)}def"  # E: `Literal[1]` is not assignable to parameter `x` with t
 "#,
 );
 
-// Regression test for https://github.com/facebook/pyrefly/issues/2669
+// Regression test for https://github.com/pyrefly-org/pyrefly/issues/2669
 testcase!(
     test_fstring_type_errors,
     r#"
@@ -1812,7 +1812,7 @@ testcase!(
     "#,
 );
 
-// https://github.com/facebook/pyrefly/issues/5311
+// https://github.com/pyrefly-org/pyrefly/issues/5311
 testcase!(
     test_syntax_error_walrus_in_pruned_branch,
     r#"
@@ -2216,7 +2216,7 @@ x: list[str] | int = ["a", *["b"]]
 testcase!(
     test_negative_subscript_bytes_no_panic,
     r#"
-# panic reported in https://github.com/facebook/pyrefly/issues/502
+# panic reported in https://github.com/pyrefly-org/pyrefly/issues/502
 b''[-1]  # E: Index `-1` out of range for bytes with 0 elements
 "#,
 );
@@ -2329,7 +2329,7 @@ assert_type(round(0.123456789), int)
 testcase!(
     test_aug_assign_star_no_panic,
     r#"
-# This used to panic: see https://github.com/facebook/pyrefly/issues/454
+# This used to panic: see https://github.com/pyrefly-org/pyrefly/issues/454
 *a += 0  # E: Parse error: Invalid augmented assignment target  # E: Could not find name `a`
     "#,
 );
@@ -2445,7 +2445,7 @@ def f(ok: B | C, bad: B | D):
     if ok: ...
     if bad: ...  # E: The `__bool__` attribute of `D` has type `int`, which is not callable
 
-# Regression tests for https://github.com/facebook/pyrefly/issues/1364
+# Regression tests for https://github.com/pyrefly-org/pyrefly/issues/1364
 def g(ok: B | None, bad1: D | None, bad2: D | E):
     if ok: ...
     if bad1 is None: ...  # This is okay - we are not using a truthiness check
@@ -2532,7 +2532,7 @@ def check(f: T) -> T:
 
 #[test]
 fn test_panic_on_unicode() {
-    // This used to panic, see https://github.com/facebook/pyrefly/issues/501
+    // This used to panic, see https://github.com/pyrefly-org/pyrefly/issues/501
     let _ = testcase_for_macro(TestEnv::new(), "e\u{81}\n", file!(), line!());
     // We manually ignore the missing expectations, because adding `# E:` would change the test.
 }
@@ -2540,7 +2540,7 @@ fn test_panic_on_unicode() {
 testcase!(
     test_crash_on_invalid_walrus,
     r#"
-# Used to crash, https://github.com/facebook/pyrefly/issues/518
+# Used to crash, https://github.com/pyrefly-org/pyrefly/issues/518
 if"":=  # E: Assignment expression target must be an identifier # E: Expected an expression
 "#,
 );
@@ -2548,7 +2548,7 @@ if"":=  # E: Assignment expression target must be an identifier # E: Expected an
 testcase!(
     test_crash_on_invalid_attribute_walrus,
     r#"
-# Regression test for https://github.com/facebook/pyrefly/issues/1903
+# Regression test for https://github.com/pyrefly-org/pyrefly/issues/1903
 (:=).:  # E: Cannot annotate non-self attribute `:=.` # E: Parse error: Expected an expression # E: Parse error: Expected an expression # E: Parse error: Expected an identifier # E: Parse error: Expected an expression
 "#,
 );
@@ -2556,7 +2556,7 @@ testcase!(
 testcase!(
     test_crash_on_incomplete_named_walrus_attribute_annotation,
     r#"
-# Regression test for https://github.com/facebook/pyrefly/issues/3344
+# Regression test for https://github.com/pyrefly-org/pyrefly/issues/3344
 (a:=).:b  # E: Cannot annotate non-self attribute `a:=.` # E: Parse error: Expected an expression # E: Parse error: Expected an identifier # E: Could not find name `b`
 "#,
 );
@@ -2564,7 +2564,7 @@ testcase!(
 testcase!(
     test_crash_on_incomplete_walrus,
     r#"
-# Regression test for https://github.com/facebook/pyrefly/issues/2093
+# Regression test for https://github.com/pyrefly-org/pyrefly/issues/2093
 (:=  # E: Parse error: Expected an expression # E: Parse error: Expected an expression
 "#,
 );
@@ -2572,7 +2572,7 @@ testcase!(
 testcase!(
     test_crash_on_augassign_walrus_rhs,
     r#"
-# Regression test for https://github.com/facebook/pyrefly/issues/1991
+# Regression test for https://github.com/pyrefly-org/pyrefly/issues/1991
 1 += (c := 1)  # E: Parse error: Invalid augmented assignment target
 "#,
 );
@@ -2606,7 +2606,7 @@ def f(x): pass
 testcase!(
     test_invalid_type_as_string,
     r#"
-# Used to crash https://github.com/facebook/pyrefly/issues/517
+# Used to crash https://github.com/pyrefly-org/pyrefly/issues/517
 t: "õ" # E: Could not find name `õ`
 "#,
 );
@@ -2673,7 +2673,7 @@ async def main() -> None:
 testcase!(
     test_loop_forever,
     r#"
-# Used to loop forever, https://github.com/facebook/pyrefly/issues/519
+# Used to loop forever, https://github.com/pyrefly-org/pyrefly/issues/519
 
 # Note: Removing any element makes this test pass.
 while True:
@@ -2690,7 +2690,7 @@ def func() -> int:
 testcase!(
     test_nested_self_init,
     r#"
-# From https://github.com/facebook/pyrefly/issues/444, this used to error
+# From https://github.com/pyrefly-org/pyrefly/issues/444, this used to error
 class MyException:
     def __init__(self) -> None:
         self.x = ""
@@ -2748,7 +2748,7 @@ def f(x: C):
 testcase!(
     test_just_def,
     r#"
-# Used to crash https://github.com/facebook/pyrefly/issues/620
+# Used to crash https://github.com/pyrefly-org/pyrefly/issues/620
 def # E: # E:
 "#,
 );
@@ -2787,7 +2787,7 @@ reveal_type(f) # E: revealed type: (x: int | Unknown = 1) -> int | Unknown
 testcase!(
     test_self_field_gets_lost,
     r#"
-# From https://github.com/facebook/pyrefly/issues/621
+# From https://github.com/pyrefly-org/pyrefly/issues/621
 from typing import assert_type
 
 class NameTable:
@@ -2916,7 +2916,7 @@ assert_type([a for a in [b for b in ["a", "b"]]], list[str])
 
 testcase!(
     test_incomplete_nested_list_comp,
-    r#"# Issue https://github.com/facebook/pyrefly/issues/455
+    r#"# Issue https://github.com/pyrefly-org/pyrefly/issues/455
 [a for [a for # E: Could # E: Parse # E: Could # E: Parse # E: Parse
 "#,
 );
@@ -2996,7 +2996,7 @@ Z = Annotated[0, 'not a type']  # E: Expected a type form, got instance of `Lite
     "#,
 );
 
-// https://github.com/facebook/pyrefly/issues/5429
+// https://github.com/pyrefly-org/pyrefly/issues/5429
 testcase!(
     test_qualifier_subscript_as_runtime_value,
     r#"
@@ -3130,6 +3130,39 @@ def f(x: float):
 );
 
 testcase!(
+    test_min_max_any_with_key,
+    r#"
+from typing import Any, assert_type, reveal_type
+
+def f(found: list[Any]) -> None:
+    prefix = min(found, key=len)
+    reveal_type(prefix)  # E: revealed type: Sized & Any
+    print(prefix + "!")
+    assert_type(len(prefix), int)
+    reveal_type(prefix.__len__())  # E: revealed type: int & Any
+    reveal_type(max(found, key=len))  # E: revealed type: Sized & Any
+
+def unparameterized(found: list) -> None:
+    prefix = min(found, key=len)
+    reveal_type(prefix)  # E: revealed type: Sized & Unknown
+    print(prefix + "!")
+    assert_type(len(prefix), int)
+    reveal_type(prefix.__len__())  # E: revealed type: int & Unknown
+    reveal_type(max(found, key=len))  # E: revealed type: Sized & Unknown
+
+def dynamic(found: Any) -> None:
+    reveal_type(min(found, key=len))  # E: revealed type: Sized & Any
+    reveal_type(min(found.attr, key=len))  # E: revealed type: Sized & Any
+    reveal_type(max(found, key=len))  # E: revealed type: Sized & Any
+    reveal_type(max(found.attr, key=len))  # E: revealed type: Sized & Any
+
+def g(found: list[str]) -> None:
+    assert_type(min(found, key=len), str)
+    assert_type(max(found, key=len), str)
+    "#,
+);
+
+testcase!(
     test_open_return_type,
     r#"
 from io import BufferedReader, TextIOWrapper
@@ -3177,7 +3210,7 @@ def f(x):
     "#,
 );
 
-// Regression test for https://github.com/facebook/pyrefly/issues/2221
+// Regression test for https://github.com/pyrefly-org/pyrefly/issues/2221
 testcase!(
     test_shutil_copyfileobj_with_urlopen,
     r#"
@@ -3188,7 +3221,7 @@ with request.urlopen("https://example.com") as remote, open("out.html", 'wb') as
 "#,
 );
 
-// Regression test for https://github.com/facebook/pyrefly/issues/2866
+// Regression test for https://github.com/pyrefly-org/pyrefly/issues/2866
 testcase!(
     test_reduce_gcd_return_type,
     r#"
@@ -3204,7 +3237,7 @@ def detect_indentation(values: list[int]) -> int:
 "#,
 );
 
-// Regression test for https://github.com/facebook/pyrefly/issues/3048
+// Regression test for https://github.com/pyrefly-org/pyrefly/issues/3048
 testcase!(
     test_enumerate_reversed,
     r#"
@@ -3216,7 +3249,7 @@ class DataFrame:
     def __iter__(self) -> Iterator[Series]: ...
     def __reversed__(self) -> Iterator[Series]: ...
     def __len__(self) -> int: ...
-    def __getitem__(self, key: int | Sequence[int]) -> Series | DataFrame: ...
+    def __getitem__(self, key: int | Sequence[int]) -> "Series | DataFrame": ...
 
 def func(s: Series) -> None: ...
 
@@ -3242,5 +3275,58 @@ def f(b: Box[datetime.date], local: Local, xs: list[int]) -> None:
     reveal_type(xs)  # E: revealed type: list[int]
     if isinstance(b.attr, datetime.date):
         reveal_type(b)  # E: revealed type: foo.Box[datetime.date] (_.attr: datetime.date)
+"#,
+);
+
+// PEP 798: unpacking in comprehensions, added in Python 3.15.
+testcase!(
+    test_unpacking_in_comprehensions,
+    TestEnv::new_with_version(PythonVersion::new(3, 15, 0)),
+    r#"
+from typing import AsyncGenerator, AsyncIterable, Generator, Literal, TypedDict, assert_type
+class TD(TypedDict):
+    a: int
+def f(lists: list[list[int]], sets: list[set[str]], dicts: list[dict[str, bytes]], tds: list[TD]):
+    assert_type([*l for l in lists], list[int])
+    assert_type({*s for s in sets}, set[str])
+    assert_type({**d for d in dicts}, dict[str, bytes])
+    assert_type({**td for td in tds}, dict[str, object])
+    assert_type((*l for l in lists), Generator[int, None, None])
+    assert_type((*("a", 1) for _ in lists), Generator[str | int, None, None])
+    x: list[object] = [*l for l in lists]
+    y: dict[str, object] = {**d for d in dicts}
+    z: dict[Literal["a"], int] = {**{"a": 1} for _ in lists}
+    [*1 for _ in lists]  # E: Expected an iterable, got `int`
+    {**1 for _ in lists}  # E: Expected a mapping, got Literal[1]
+async def g(lists: AsyncIterable[list[int]]):
+    assert_type((*l async for l in lists), AsyncGenerator[int, None])
+"#,
+);
+
+testcase!(
+    test_unpacking_in_nested_comprehensions,
+    TestEnv::new_with_version(PythonVersion::new(3, 15, 0)),
+    r#"
+from typing import Generator, assert_type
+def f(lists: list[list[list[int]]], dicts: list[list[dict[str, bytes]]]):
+    assert_type([*[*l for l in ls] for ls in lists], list[int])
+    assert_type({*{*l for l in ls} for ls in lists}, set[int])
+    assert_type({**{**d for d in ds} for ds in dicts}, dict[str, bytes])
+    assert_type((*(*l for l in ls) for ls in lists), Generator[int, None, None])
+    assert_type([*l for ls in lists for l in ls], list[int])
+"#,
+);
+
+// Before Python 3.15, the parser reports the syntax, and inference still gives the 3.15 types.
+testcase!(
+    test_unpacking_in_comprehensions_before_py315,
+    TestEnv::new_with_version(PythonVersion::new(3, 14, 0)),
+    r#"
+from typing import Generator, assert_type
+def f(lists: list[list[int]], dicts: list[dict[str, bytes]]):
+    assert_type([*l for l in lists], list[int])  # E: Cannot use iterable unpacking in a list comprehension on Python 3.14
+    assert_type({*l for l in lists}, set[int])  # E: Cannot use iterable unpacking
+    assert_type({**d for d in dicts}, dict[str, bytes])  # E: Cannot use
+    assert_type((*l for l in lists), Generator[int, None, None])  # E: Cannot use iterable unpacking
 "#,
 );

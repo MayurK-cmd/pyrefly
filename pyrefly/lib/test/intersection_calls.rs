@@ -5,6 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use crate::test::util::TestEnv;
 use crate::testcase;
 
 testcase!(
@@ -108,7 +109,7 @@ def names(value: StrawberryType | type):
     if isinstance(value, StrawberryUnion):
         reveal_type(value.graphql_name)  # E: revealed type: (str & Any) | (str & Unknown) | (Any & None) | (Unknown & None)
     elif isinstance(value, StrawberryList):
-        reveal_type(value.of_type)  # E: revealed type: (StrawberryType & Unknown) | (type[Any] & Unknown)
+        reveal_type(value.of_type)  # E: revealed type: (StrawberryType & Any) | (StrawberryType & Unknown) | (type[Any] & Any) | (type[Any] & Unknown)
 "#,
 );
 
@@ -432,12 +433,12 @@ class D:
 
 def td_first(x: A):
     if isinstance(x, B):
-        reveal_type(x.make())  # E: revealed type: dict[str, int] & TD
-        reveal_type(x.field)  # E: revealed type: dict[str, int] & TD
+        reveal_type(x.make())  # E: revealed type: TD & dict[str, int]
+        reveal_type(x.field)  # E: revealed type: TD & dict[str, int]
 def dict_first(x: C):
     if isinstance(x, D):
-        reveal_type(x.make())  # E: revealed type: dict[str, int] & TD
-        reveal_type(x.field)  # E: revealed type: dict[str, int] & TD
+        reveal_type(x.make())  # E: revealed type: TD & dict[str, int]
+        reveal_type(x.field)  # E: revealed type: TD & dict[str, int]
 
 witness: TD = {"key": 1}
 assert isinstance(witness, dict) and witness["key"] == 1
@@ -619,18 +620,50 @@ class D:
     def method(self, callback: Callable[[int], int]) -> RetA: ...
 def int_first(a: A):
     if isinstance(a, B):
-        reveal_type(a.method(lambda v: v + 1))  # E: revealed type: RetA & RetB
+        reveal_type(a.method(lambda v: v + 1))  # E: revealed type: RetA
         typed: Callable[[int], int] = lambda v: v + 1
         reveal_type(a.method(typed))  # E: revealed type: RetA
 def str_first(c: C):
     if isinstance(c, D):
-        reveal_type(c.method(lambda v: v + 1))  # E: revealed type: RetA & RetB
+        reveal_type(c.method(lambda v: v + 1))  # E: revealed type: RetA
 def ordinary(a: A):
     assert_type(a.method(lambda v: v + 1), RetA)
 def intrinsic_errors(a: A):
     if isinstance(a, B):
         a.method(lambda v: unknown)  # E: Could not find name `unknown`
         a.method(lambda v: (1).missing)  # E: Object of class `int` has no attribute `missing`
+"#,
+);
+
+testcase!(
+    test_intersection_call_contextual_diagnostics,
+    TestEnv::new()
+        .enable_deprecated_error()
+        .enable_incompatible_comparison_error(),
+    r#"
+from typing import Callable, cast
+from typing_extensions import deprecated
+
+class A:
+    def method(self, cb: Callable[[int], object]) -> object: ...
+class B:
+    def method(self, cb: Callable[[str], object]) -> object: ...
+
+@deprecated("old callback")
+def old(value: object) -> object: ...
+
+def f(a: A, fixed: str) -> None:
+    if isinstance(a, B):
+        a.method(lambda arg: arg == "a")
+        a.method(lambda arg: str(arg))
+        a.method(lambda arg: cast(int, arg))
+        a.method(lambda arg: str(fixed))  # E: Unnecessary `str()` call
+        a.method(lambda arg: old(arg))  # E: `old` is deprecated
+        a.method(lambda arg: arg.missing)  # E: has no attribute `missing`
+
+def reversed_order(b: B) -> None:
+    if isinstance(b, A):
+        b.method(lambda arg: arg.missing)  # E: has no attribute `missing`
 "#,
 );
 
@@ -781,8 +814,8 @@ def typed_dicts(a: A):
         reveal_type(a.field)  # E: revealed type: Flag & Left & Right
 def dictionary(d: D):
     if isinstance(d, A) and isinstance(d, B):
-        reveal_type(d.make())  # E: revealed type: dict[str, object] & Left & Right
-        reveal_type(d.field)  # E: revealed type: dict[str, object] & Left & Right
+        reveal_type(d.make())  # E: revealed type: Left & Right & dict[str, object]
+        reveal_type(d.field)  # E: revealed type: Left & Right & dict[str, object]
 witness = {"left": 1, "right": "ok", "flag": True}
 assert witness["left"] == 1 and witness["right"] == "ok" and witness["flag"] is True
 "#,

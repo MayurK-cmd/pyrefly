@@ -20,12 +20,15 @@ use lsp_types::Uri;
 use protobuf::Message as _;
 use pyrefly_build::handle::Handle;
 use pyrefly_python::ast::Ast;
+use pyrefly_python::docstring::DocRanges;
 use pyrefly_python::docstring::Docstring;
 use pyrefly_python::module::Module;
 use pyrefly_python::module_name::ModuleName;
 use pyrefly_python::module_path::ModulePathDetails;
+use pyrefly_python::short_identifier::ShortIdentifier;
 use pyrefly_python::symbol_kind::SymbolKind;
 use pyrefly_python::sys_info::SysInfo;
+use pyrefly_types::known_class::KnownClass;
 use pyrefly_util::absolutize::Absolutize;
 use pyrefly_util::fs_anyhow;
 use pyrefly_util::lined_buffer::DisplayPos;
@@ -58,10 +61,12 @@ use scip::types::SymbolRole;
 use scip::types::TextEncoding;
 use scip::types::ToolInfo;
 use scip::types::descriptor::Suffix;
+use starlark_map::Hashed;
 use starlark_map::small_map::SmallMap;
 use starlark_map::small_set::SmallSet;
 use tracing::error;
 
+use crate::binding::binding::KeyClass;
 use crate::config::config::ConfigFile;
 use crate::lsp::wasm::hover::HoverOptions;
 use crate::lsp::wasm::hover::HoverResult;
@@ -69,6 +74,7 @@ use crate::lsp::wasm::hover::get_hover_with_verbosity;
 use crate::report::scip::symbols::ScipSymbol;
 use crate::report::scip::symbols::definitions;
 use crate::report::scip::symbols::descriptor;
+use crate::report::scip::test_files::TestFiles;
 use crate::state::lsp::CalleeKind;
 use crate::state::lsp::FindDefinitionItemWithDocstring;
 use crate::state::lsp::FindPreference;
@@ -80,6 +86,7 @@ use crate::types::globals::ImplicitGlobal;
 #[cfg(test)]
 mod snapshot;
 mod symbols;
+mod test_files;
 
 const SCHEME: &str = "scip-python";
 const MANAGER: &str = "python";
@@ -121,14 +128,16 @@ impl Package {
 }
 
 /// Writes a SCIP index as a stream of `Index` messages, which a reader merges into one: the
-/// metadata, then each document as soon as it is built, in no particular order, then the
-/// external symbols. Documents can be written while the files are being checked, from a
-/// solutions hook.
+/// metadata, then each document in path order, then the external symbols. Documents can be
+/// built while the files are being checked, from a solutions hook, and are kept serialized
+/// until they are written.
 pub struct ScipWriter<W> {
     writer: Mutex<W>,
     handles: SmallSet<Handle>,
+    documents: Mutex<Vec<(String, Vec<u8>)>>,
     project_root: PathBuf,
     project: Package,
+    test_files: TestFiles,
     definitions: Mutex<HashMap<Handle, Arc<SmallMap<TextRange, ScipSymbol>>>>,
     asts: Mutex<HashMap<Handle, Arc<ModModule>>>,
     distributions: Mutex<HashMap<PathBuf, Arc<HashMap<Name, Package>>>>,
@@ -144,6 +153,7 @@ impl<W: Write + Send> ScipWriter<W> {
         version: &str,
     ) -> anyhow::Result<Self> {
         let project_root = project_root.absolutize();
+        let test_files = TestFiles::project(&project_root)?;
         Index {
             metadata: Some(Metadata {
                 project_root: Uri::from_directory_path(&project_root)
@@ -170,8 +180,10 @@ impl<W: Write + Send> ScipWriter<W> {
         Ok(Self {
             writer: Mutex::new(writer),
             handles: handles.iter().cloned().collect(),
+            documents: Mutex::new(Vec::new()),
             project_root,
             project,
+            test_files,
             definitions: Mutex::new(HashMap::new()),
             asts: Mutex::new(HashMap::new()),
             distributions: Mutex::new(HashMap::new()),
@@ -203,6 +215,7 @@ impl<W: Write + Send> ScipWriter<W> {
             transaction,
             project_root: &self.project_root,
             project: &self.project,
+            test_files: &self.test_files,
             definitions: &self.definitions,
             asts: &self.asts,
             distributions: &self.distributions,
@@ -210,7 +223,7 @@ impl<W: Write + Send> ScipWriter<W> {
         }
     }
 
-    /// Writes the document of `handle`, if it is one of the indexed files.
+    /// Builds the document of `handle`, if it is one of the indexed files.
     pub fn write_document(&self, transaction: &Transaction, handle: &Handle) -> anyhow::Result<()> {
         if !self.handles.contains(handle) {
             return Ok(());
@@ -218,22 +231,24 @@ impl<W: Write + Send> ScipWriter<W> {
         let Some(document) = self.indexer(transaction).document(handle) else {
             return Ok(());
         };
+        let path = document.relative_path.clone();
         let bytes = Index {
             documents: vec![document],
             ..Default::default()
         }
         .write_to_bytes()?;
-        self.writer.lock().write_all(&bytes)?;
+        self.documents.lock().push((path, bytes));
         Ok(())
     }
 
-    /// Detaches the solutions hook and writes external symbols after every document is written.
+    /// Detaches the solutions hook, then writes the documents and the external symbols.
     pub fn finish(self: Arc<Self>, transaction: &mut Transaction) -> anyhow::Result<W> {
         transaction.set_solutions_hook(None);
         transaction.set_evict_answers_after_scip_hook(false);
         let scip = Arc::into_inner(self).expect("the solutions hook holds the only other copy");
         let Self {
             writer,
+            documents,
             external_symbols,
             definitions,
             asts,
@@ -242,6 +257,11 @@ impl<W: Write + Send> ScipWriter<W> {
         } = scip;
         drop((definitions, asts, distributions));
         let mut writer = writer.into_inner();
+        let mut documents = documents.into_inner();
+        documents.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        for (_, bytes) in documents {
+            writer.write_all(&bytes)?;
+        }
         let mut first_uses: Vec<(String, ExternalUse)> =
             external_symbols.into_inner().into_iter().collect();
         // Most external symbols are documented at their first use. When that hover has no
@@ -300,6 +320,7 @@ struct Indexer<'a> {
     transaction: &'a Transaction<'a>,
     project_root: &'a Path,
     project: &'a Package,
+    test_files: &'a TestFiles,
     /// The definitions of every module seen so far, keyed by the range of the defining identifier.
     definitions: &'a Mutex<HashMap<Handle, Arc<SmallMap<TextRange, ScipSymbol>>>>,
     /// The parsed AST of every dependency seen so far, since only the indexed files keep theirs.
@@ -310,6 +331,34 @@ struct Indexer<'a> {
     /// referenced so far. The symbol is documented with the hover there, so its documentation
     /// doesn't depend on the order documents are built in.
     external_symbols: &'a Mutex<HashMap<String, ExternalUse>>,
+}
+
+/// The parts of a document that are test code, whose occurrences get the `Test` role.
+enum TestCode {
+    /// The document is a test module, which is test code throughout.
+    Module,
+    /// The ranges of the class statements, decorators included, that are test code in a module
+    /// that isn't a test module.
+    TestCases(Vec<TextRange>),
+}
+
+impl TestCode {
+    /// The `Test` role if the occurrence at `range` is in test code, where the module's own
+    /// occurrence has no range.
+    fn role(&self, range: Option<TextRange>) -> i32 {
+        let in_test_code = match (self, range) {
+            (Self::Module, _) => true,
+            (Self::TestCases(classes), Some(range)) => {
+                classes.iter().any(|class| class.contains_range(range))
+            }
+            (Self::TestCases(_), None) => false,
+        };
+        if in_test_code {
+            SymbolRole::Test as i32
+        } else {
+            0
+        }
+    }
 }
 
 /// For a symbol defined outside the project, where to document it when the hover at its use has
@@ -334,10 +383,15 @@ impl Indexer<'_> {
             .ok()?;
         let ast = self.transaction.get_ast(handle)?;
         let definitions = self.definitions(&module, handle.sys_info().dupe())?;
+        let mut classes = Vec::new();
+        ast.body
+            .iter()
+            .for_each(|x| collect_classes(x, &mut classes));
+        let test_code = self.test_code(handle, &module, &classes);
         let mut occurrences = vec![Occurrence {
             range: vec![0, 0, 0],
             symbol: module_symbol(self.project, module.name()),
-            symbol_roles: SymbolRole::Definition as i32,
+            symbol_roles: SymbolRole::Definition as i32 | test_code.role(None),
             ..Default::default()
         }];
         let mut enclosing_ranges = SmallMap::new();
@@ -361,7 +415,7 @@ impl Indexer<'_> {
                     SymbolRole::Definition as i32
                 } else {
                     0
-                },
+                } | test_code.role(Some(*range)),
                 enclosing_range: enclosing_ranges
                     .get(range)
                     .filter(|_| is_definition)
@@ -427,6 +481,7 @@ impl Indexer<'_> {
             occurrences.push(Occurrence {
                 range: scip_range(&module, x.range),
                 symbol,
+                symbol_roles: test_code.role(Some(x.range)),
                 ..Default::default()
             });
         }
@@ -460,10 +515,6 @@ impl Indexer<'_> {
                 );
             }
         }
-        let mut classes = Vec::new();
-        ast.body
-            .iter()
-            .for_each(|x| collect_classes(x, &mut classes));
         for class in classes {
             for (range, implemented) in self.implementations(handle, &module, class) {
                 let Some(symbol) = definitions.get(&range) else {
@@ -493,6 +544,39 @@ impl Indexer<'_> {
             symbols,
             ..Default::default()
         })
+    }
+
+    /// The test code of a document. A module that pytest collects tests or loads fixtures from
+    /// is test code throughout. Elsewhere, test code is the classes that derive from
+    /// `unittest.TestCase`, whose tests unittest runs wherever they are defined.
+    fn test_code(&self, handle: &Handle, module: &Module, classes: &[&StmtClassDef]) -> TestCode {
+        if self.test_files.contains(module.path().as_path()) {
+            return TestCode::Module;
+        }
+        let test_cases = self
+            .transaction
+            .ad_hoc_solve(handle, "scip_test_cases", |solver| {
+                classes
+                    .iter()
+                    .filter(|class| {
+                        let key = KeyClass(ShortIdentifier::new(&class.name));
+                        solver
+                            .bindings()
+                            .key_to_idx_hashed_opt(Hashed::new(&key))
+                            .and_then(|idx| solver.get_idx(idx).0.dupe())
+                            .is_some_and(|class| {
+                                solver
+                                    .get_mro_for_class(&class)
+                                    .ancestors_no_object()
+                                    .iter()
+                                    .any(|base| base.is(KnownClass::UnittestTestCase))
+                            })
+                    })
+                    .map(|class| class.range)
+                    .collect()
+            })
+            .expect("the solutions hook builds a document while the module's answers are live");
+        TestCode::TestCases(test_cases)
     }
 
     /// The symbols that a class and its methods implement, keyed by the range of the defining
@@ -608,7 +692,7 @@ impl Indexer<'_> {
                     metadata: definition.metadata,
                     definition_range: definition.definition_range,
                     module: definition.module,
-                    docstring_range: None,
+                    doc_ranges: DocRanges::default(),
                     display_name: Some(x.identifier.id.to_string()),
                 })
             }
@@ -1236,6 +1320,8 @@ mod tests {
         request_goofiness,
         single_class,
         single_function,
+        test_code,
+        test_code_pytest_config,
         type_parameters,
         unique,
         unresolved_import,

@@ -413,6 +413,10 @@ mod tests {
         assert!(result.is_ok());
         let errors = pyrefly_cfg.root.errors.as_ref().unwrap();
         assert_eq!(errors.severity(ErrorKind::ExplicitAnyUse), Severity::Error);
+        assert_eq!(
+            errors.severity(ErrorKind::AnyFunctionDecorator),
+            Severity::Error
+        );
     }
 
     #[test]

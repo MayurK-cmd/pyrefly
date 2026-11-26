@@ -79,7 +79,7 @@ reveal_type(fp(1))  # E: revealed type: int
 reveal_type(fp("a"))  # E: revealed type: str
 fp(1)
 fp("a")
-fp(object())  # E: `object` is not assignable to any of constraints `int`, `str` of type variable `T`
+fp(object())  # E: While checking parameter `y`: `object` is not assignable to any of constraints `int`, `str` of type variable `T`
 "#,
 );
 
@@ -347,7 +347,7 @@ def f(x: P) -> None:
 
 // ===== Issue regressions (generic / decorator) =====
 
-// Regression: https://github.com/facebook/pyrefly/issues/3330
+// Regression: https://github.com/pyrefly-org/pyrefly/issues/3330
 functools_testcase!(
     test_partial_decorator_erases_signature,
     r#"
@@ -362,7 +362,7 @@ f(None)  # E: Argument `None` is not assignable to parameter `x` with type `int`
 "#,
 );
 
-// Regression: https://github.com/facebook/pyrefly/issues/3329
+// Regression: https://github.com/pyrefly-org/pyrefly/issues/3329
 // Binding only the keyword-only `s` leaves `fun` (and thus `C`) free, bound at decoration time, so
 // there is no spurious bad-specialization against `C`'s upper bound.
 functools_testcase!(
@@ -377,7 +377,7 @@ def test() -> None: ...
 "#,
 );
 
-// Regression: https://github.com/facebook/pyrefly/issues/3638
+// Regression: https://github.com/pyrefly-org/pyrefly/issues/3638
 // `partial(f)` binds nothing, so the overloaded `f` is forwarded unchanged and resolves at the
 // decoration site, preserving `g`'s signature.
 functools_testcase!(
@@ -397,7 +397,7 @@ g(5)
 "#,
 );
 
-// Regression: https://github.com/facebook/pyrefly/issues/3546
+// Regression: https://github.com/pyrefly-org/pyrefly/issues/3546
 // Binding the enclosing-scope `factory` unifies its `_S` with `build`'s `_S`, so the partial keeps a
 // single `_S` and `run(partial_fn)` is `Box[_S]`, matching the declared return with no leaked variable.
 functools_testcase!(

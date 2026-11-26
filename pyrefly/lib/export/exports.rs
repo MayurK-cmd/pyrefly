@@ -11,6 +11,7 @@ use std::fmt::Display;
 use std::sync::Arc;
 
 use pyrefly_graph::calculation::Calculation;
+use pyrefly_python::docstring::DocRanges;
 use pyrefly_python::docstring::Docstring;
 use pyrefly_python::dunder;
 use pyrefly_python::module_name::ModuleName;
@@ -101,7 +102,7 @@ pub struct ExportOrigin {
 pub struct Export {
     pub location: TextRange,
     pub symbol_kind: Option<SymbolKind>,
-    pub docstring_range: Option<TextRange>,
+    pub doc_ranges: DocRanges,
     pub deprecation: Option<Deprecation>,
     /// Whether the exported symbol is marked with the `Final` special form.
     pub is_final: bool,
@@ -155,9 +156,9 @@ impl Display for Exports {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         for x in self.definitions.dunder_all.entries.iter() {
             match x {
-                DunderAllEntry::Name(_, x) => writeln!(f, "export {x}")?,
+                DunderAllEntry::Name(_, x, _) => writeln!(f, "export {x}")?,
                 DunderAllEntry::Module(_, x) => writeln!(f, "from {x} import *")?,
-                DunderAllEntry::Remove(_, x) => writeln!(f, "unexport {x}")?,
+                DunderAllEntry::Remove(_, x, _) => writeln!(f, "unexport {x}")?,
             }
         }
         Ok(())
@@ -241,7 +242,7 @@ impl Exports {
             let mut result = SmallSet::new();
             for x in &self.definitions.dunder_all.entries {
                 match x {
-                    DunderAllEntry::Name(_, x) => {
+                    DunderAllEntry::Name(_, x, _) => {
                         // An empty entry names nothing importable, and the binding pass
                         // does not export empty names, so exporting one here would
                         // promise an export that never exists.
@@ -269,7 +270,7 @@ impl Exports {
                             }
                         }
                     }
-                    DunderAllEntry::Remove(_, x) => {
+                    DunderAllEntry::Remove(_, x, _) => {
                         // This is O(n), but we'd appreciate the determism, and remove is rare in `__all__`.
                         result.shift_remove(x);
                     }
@@ -375,21 +376,27 @@ impl Exports {
 
     /// If `position` is inside a user-specified `__all__` string entry, return its range and name.
     pub fn dunder_all_name_at(&self, position: TextSize) -> Option<(TextRange, Name)> {
-        if self.definitions.dunder_all.kind != DunderAllKind::Specified {
-            return None;
-        }
-        self.definitions
-            .dunder_all
-            .entries
-            .iter()
-            .find_map(|entry| match entry {
-                DunderAllEntry::Name(range, name) | DunderAllEntry::Remove(range, name)
-                    if range.contains_inclusive(position) =>
-                {
-                    Some((*range, name.clone()))
-                }
-                _ => None,
-            })
+        self.dunder_all_names().find_map(|(range, name, _)| {
+            range
+                .contains_inclusive(position)
+                .then(|| (range, name.clone()))
+        })
+    }
+
+    /// Return expression ranges, names, and content ranges from a user-specified `__all__`.
+    pub fn dunder_all_names(&self) -> impl Iterator<Item = (TextRange, &Name, Option<TextRange>)> {
+        let entries = if self.definitions.dunder_all.kind == DunderAllKind::Specified {
+            self.definitions.dunder_all.entries.as_slice()
+        } else {
+            &[]
+        };
+        entries.iter().filter_map(|entry| match entry {
+            DunderAllEntry::Name(range, name, content_range)
+            | DunderAllEntry::Remove(range, name, content_range) => {
+                Some((*range, name, *content_range))
+            }
+            DunderAllEntry::Module(_, _) => None,
+        })
     }
 
     /// Whether `name` is defined in this module as a `Final` whose type is declared rather than
@@ -453,10 +460,10 @@ impl Exports {
 
         for entry in &definitions.dunder_all.entries {
             match entry {
-                DunderAllEntry::Name(_, name) => {
+                DunderAllEntry::Name(_, name, _) => {
                     names.insert(name.clone());
                 }
-                DunderAllEntry::Remove(_, name) => {
+                DunderAllEntry::Remove(_, name, _) => {
                     names.shift_remove(name);
                 }
                 DunderAllEntry::Module(..) => {}
@@ -476,10 +483,10 @@ impl Exports {
 
         for entry in &definitions.dunder_all.entries {
             match entry {
-                DunderAllEntry::Name(_, name) => {
+                DunderAllEntry::Name(_, name, _) => {
                     names.insert(name.clone());
                 }
-                DunderAllEntry::Remove(_, name) => {
+                DunderAllEntry::Remove(_, name, _) => {
                     names.shift_remove(name);
                 }
                 DunderAllEntry::Module(..) => {}
@@ -503,7 +510,7 @@ impl Exports {
         }
         let mut invalid = Vec::new();
         for entry in &self.definitions.dunder_all.entries {
-            if let DunderAllEntry::Name(range, name) = entry {
+            if let DunderAllEntry::Name(range, name, _) = entry {
                 // Check if name exists in definitions
                 if self.definitions.definitions.contains_key(name) {
                     continue;
@@ -550,7 +557,7 @@ impl Exports {
                         ExportLocation::ThisModule(Export {
                             location: definition.range,
                             symbol_kind: Some(*symbol_kind),
-                            docstring_range: definition.docstring_range,
+                            doc_ranges: definition.doc_ranges.clone(),
                             deprecation,
                             is_final,
                             special_export,
@@ -565,7 +572,7 @@ impl Exports {
                     | DefinitionStyle::MutableCapture(..) => ExportLocation::ThisModule(Export {
                         location: definition.range,
                         symbol_kind: None,
-                        docstring_range: definition.docstring_range,
+                        doc_ranges: definition.doc_ranges.clone(),
                         deprecation,
                         is_final,
                         special_export,
@@ -573,7 +580,7 @@ impl Exports {
                     DefinitionStyle::ImplicitGlobal => ExportLocation::ThisModule(Export {
                         location: definition.range,
                         symbol_kind: Some(SymbolKind::Constant),
-                        docstring_range: None,
+                        doc_ranges: DocRanges::default(),
                         deprecation,
                         is_final,
                         special_export,
@@ -609,7 +616,7 @@ impl Exports {
                     ExportLocation::ThisModule(Export {
                         location: range,
                         symbol_kind: None,
-                        docstring_range: None,
+                        doc_ranges: DocRanges::default(),
                         deprecation: None,
                         is_final: false,
                         special_export: None,
@@ -619,6 +626,15 @@ impl Exports {
             Arc::new(result)
         };
         self.exports.calculate(f).unwrap_or_default()
+    }
+
+    /// Returns true if `name` appears in the statically known part of an explicit `__all__`.
+    pub fn is_dunder_all_export(&self, name: &Name) -> bool {
+        self.partially_known_dunder_all.contains(name)
+            || self
+                .explicit_dunder_all_names
+                .as_ref()
+                .is_some_and(|all| all.contains(name))
     }
 
     pub fn is_explicit_reexport(&self, name: &Name) -> bool {
@@ -635,14 +651,7 @@ impl Exports {
     /// Names defined locally, redundantly aliased (`as` same-name), or introduced
     /// via a wildcard import are not implicit re-exports.
     pub fn is_implicit_reexport(&self, name: &Name) -> bool {
-        if self.partially_known_dunder_all.contains(name) {
-            return false;
-        }
-        if self
-            .explicit_dunder_all_names
-            .as_ref()
-            .is_some_and(|all| all.contains(name))
-        {
+        if self.is_dunder_all_export(name) {
             return false;
         }
         self.definitions
@@ -800,6 +809,40 @@ mod tests {
     #[must_use]
     fn contains(exports: &Exports, lookup: &dyn LookupExport, name: &str) -> bool {
         exports.exports(lookup).contains_key(&Name::new(name))
+    }
+
+    #[test]
+    fn test_dunder_all_exports_are_distinct_from_explicit_reexports() {
+        for (dunder_all, has_export) in [
+            ("", false),
+            ("__all__ = ['local', 'imported']", true),
+            (
+                "__all__ = ['local', 'imported']\nfor name in []:\n    __all__.append(name)",
+                true,
+            ),
+        ] {
+            let exports = mk_exports(
+                &format!(
+                    "from source import imported, unlisted, redundant as redundant\nlocal = 1\n{dunder_all}\n"
+                ),
+                ModuleStyle::Executable,
+            );
+            for name in ["local", "imported"] {
+                let name = Name::new(name);
+                assert_eq!(exports.is_dunder_all_export(&name), has_export);
+                assert!(!exports.is_explicit_reexport(&name));
+            }
+            let imported = Name::new("imported");
+            assert_eq!(exports.is_implicit_reexport(&imported), !has_export);
+            let redundant = Name::new("redundant");
+            assert!(exports.is_explicit_reexport(&redundant));
+            assert!(!exports.is_dunder_all_export(&redundant));
+            assert!(!exports.is_implicit_reexport(&redundant));
+            let unlisted = Name::new("unlisted");
+            assert!(!exports.is_explicit_reexport(&unlisted));
+            assert!(!exports.is_dunder_all_export(&unlisted));
+            assert!(exports.is_implicit_reexport(&unlisted));
+        }
     }
 
     #[test]

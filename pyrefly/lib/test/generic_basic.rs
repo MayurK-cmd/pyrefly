@@ -11,6 +11,39 @@ use crate::test::util::TestEnv;
 use crate::testcase;
 
 testcase!(
+    test_parenthesized_generic_arguments,
+    r#"
+from __future__ import annotations
+from typing import TypeVar, assert_type
+
+class Box[T]:
+    def __init__(self, value: T) -> None: ...
+
+type Mapping[K, V] = dict[K, V]
+type Wrapped[T] = Box[T]
+
+K = TypeVar("K")
+V = TypeVar("V")
+T = TypeVar("T")
+LegacyMapping = dict[K, V]
+LegacyWrapped = Box[T]
+
+def f(d: dict[(str, int)], b: Box[(int,)], m: Mapping[(str, int)], w: Wrapped[(int,)]):
+    assert_type(d, dict[str, int])
+    assert_type(b, Box[int])
+    assert_type(m, dict[str, int])
+    assert_type(w, Box[int])
+
+assert_type(dict[(str, int)](), dict[str, int])
+assert_type(Box[(int,)](1), Box[int])
+assert_type(LegacyMapping[(str, int)](), dict[str, int])
+assert_type(LegacyWrapped[(int,)](1), Box[int])
+
+x: list[(str, str)] = []  # E: Expected 1 type argument for `list`, got 2
+"#,
+);
+
+testcase!(
     test_tyvar_constructor,
     r#"
 def test[T](cls: type[T]) -> T:
@@ -51,7 +84,7 @@ from typing import Generic, TypeVar, Any, assert_type
 
 T = TypeVar("T")
 
-class C(list[C[T]]):
+class C(list["C[T]"]):
     t: T
 
 def f(c: C[int]):
@@ -71,7 +104,7 @@ class Box[T]:
 
 class A[R](Box[type[R]]): ...
 class B[R](Box[list[type[R]]]): ...
-class C[R](Box[type[C[R]]]): ...
+class C[R](Box["type[C[R]]"]): ...
 
 R = TypeVar("R")
 class D(Box[type[R]], Generic[R]): ...
@@ -97,12 +130,12 @@ class Box[T]:
     def get(self) -> T: ...
 
 class Base: ...
-class C[T: Base](Base, Box[type[C[C[Any]]]]): ...
+class C[T: Base](Base, Box["type[C[C[Any]]]"]): ...
 
-class P[T: Q](Box[type[P[Q]]]): ...
+class P[T: Q](Box["type[P[Q]]"]): ...
 class Q(P[Any]): ...
 
-class D[T](Box[type[list[D[T]]]]): ...
+class D[T](Box["type[list[D[T]]]"]): ...
 
 def f(c: C[Any], p: P[Q], d: D[int]) -> None:
     assert_type(c.get(), type[C[C[Any]]])
@@ -129,7 +162,7 @@ assert_type(C.m(), int)
     "#,
 );
 
-// https://github.com/facebook/pyrefly/issues/5303
+// https://github.com/pyrefly-org/pyrefly/issues/5303
 testcase!(
     test_descriptor_with_type_of_type_var_in_base_class,
     r#"
@@ -360,11 +393,11 @@ _Ts = TypeVarTuple("_Ts")
 
 class partial(Generic[_P1, _P2, _T, _R_co, *_Ts]):
     @overload
-    def __new__(cls, __func: Callable[_P1, _R_co]) -> partial[_P1, _P1, Any, _R_co]: ... # E: Overload return type `partial[_P1, _P1, Any, _R_co, *tuple[()]]` is not assignable to implementation return type `Self@partial`
+    def __new__(cls, __func: Callable[_P1, _R_co]) -> "partial[_P1, _P1, Any, _R_co]": ... # E: Overload return type `partial[_P1, _P1, Any, _R_co, *tuple[()]]` is not assignable to implementation return type `Self@partial`
     @overload
-    def __new__(cls, __func: Callable[Concatenate[*_Ts, _P2], _R_co], *args: *_Ts) -> partial[Concatenate[*_Ts, _P2], _P2, Any, _R_co, *_Ts]: ... # E: Overload return type `partial[Concatenate[*_Ts, _P2], _P2, Any, _R_co, *_Ts]` is not assignable to implementation return type `Self@partial`
+    def __new__(cls, __func: Callable[Concatenate[*_Ts, _P2], _R_co], *args: *_Ts) -> "partial[Concatenate[*_Ts, _P2], _P2, Any, _R_co, *_Ts]": ... # E: Overload return type `partial[Concatenate[*_Ts, _P2], _P2, Any, _R_co, *_Ts]` is not assignable to implementation return type `Self@partial`
     @overload
-    def __new__(cls, __func: Callable[_P1, _R_co], *args: *_Ts, **kwargs: _T) -> partial[_P1, ..., _T, _R_co, *_Ts]: ... # E: Overload return type `partial[_P1, ..., _T, _R_co, *_Ts]` is not assignable to implementation return type `Self@partial`
+    def __new__(cls, __func: Callable[_P1, _R_co], *args: *_Ts, **kwargs: _T) -> "partial[_P1, ..., _T, _R_co, *_Ts]": ... # E: Overload return type `partial[_P1, ..., _T, _R_co, *_Ts]` is not assignable to implementation return type `Self@partial`
     def __new__(cls, __func, *args, **kwargs):
         return super().__new__(cls)
     def __call__(self, *args: _P2.args, **kwargs: _P2.kwargs) -> _R_co: ...
@@ -485,7 +518,7 @@ def test(s: str, b: bytes, a: Any):
 "#,
 );
 
-// https://github.com/facebook/pyrefly/issues/245
+// https://github.com/pyrefly-org/pyrefly/issues/245
 testcase!(
     test_dict_update,
     r#"
@@ -498,7 +531,7 @@ def f():
 
 def g():
     x: dict[int, int] = {}
-    x.update(a=1) # E: `dict[int, int]` is not assignable to parameter `self` with type `SupportsGetItem[str, int]`
+    x.update(a=1) # E: No matching overload found for function `typing.MutableMapping.update`
 "#,
 );
 
@@ -676,7 +709,7 @@ assert_type(f([None], [0]), int)
     "#,
 );
 
-// Regression test for https://github.com/facebook/pyrefly/issues/1675
+// Regression test for https://github.com/pyrefly-org/pyrefly/issues/1675
 testcase!(
     test_generic_should_equal_itself,
     r#"
@@ -721,7 +754,7 @@ def to_type[T](value: Any, kind: TypeForm[T]) -> T: ...
     "#,
 );
 
-// https://github.com/facebook/pyrefly/issues/1970
+// https://github.com/pyrefly-org/pyrefly/issues/1970
 testcase!(
     test_implicit_any_for_special_forms,
     TestEnv::new().enable_implicit_any_error(),
@@ -779,7 +812,7 @@ class I(G, H): ...  # E: Class `I` has inconsistent type arguments for base clas
 "#,
 );
 
-// https://github.com/facebook/pyrefly/issues/4876
+// https://github.com/pyrefly-org/pyrefly/issues/4876
 testcase!(
     test_indirect_diamond_union_member_order,
     r#"
@@ -941,7 +974,7 @@ assert_type(bad(Sub), Sub)
 "#,
 );
 
-// Regression test for https://github.com/facebook/pyrefly/issues/4187
+// Regression test for https://github.com/pyrefly-org/pyrefly/issues/4187
 testcase!(
     test_generic_keyword_inference_is_order_independent,
     r#"
@@ -1000,8 +1033,8 @@ from typing import assert_type
 list.__add__ # This is a method on `list`
 
 # No error for accessing properties on `GenericAlias`
-assert(list[int].__args__, tuple)
-assert(list[int].__parameters__, tuple)
+assert(list[int].__args__, tuple)  # E: Assertion is always true because a nonempty tuple is truthy
+assert(list[int].__parameters__, tuple)  # E: Assertion is always true because a nonempty tuple is truthy
 
 # No error for accessing methods on `list`
 list[int].__add__
@@ -1025,7 +1058,7 @@ class Bar(Generic[_L]):
 "#,
 );
 
-// Regression test for https://github.com/facebook/pyrefly/issues/1137
+// Regression test for https://github.com/pyrefly-org/pyrefly/issues/1137
 testcase!(
     test_unresolved_typevar_in_union_resolves_to_never,
     r#"
@@ -1045,7 +1078,7 @@ assert_type(b, A[int])
 "#,
 );
 
-// Regression test for https://github.com/facebook/pyrefly/issues/3387
+// Regression test for https://github.com/pyrefly-org/pyrefly/issues/3387
 testcase!(
     test_future_annotations_forward_ref_in_generic_constructor,
     r#"
@@ -1054,7 +1087,7 @@ from __future__ import annotations
 class Foo[T]: ...
 
 class Bar:
-    foo = Foo[Bar]()
+    foo = Foo[Bar]()  # E: `Bar` is uninitialized
     foo2 = Foo[UnknownClass]()  # E:
     foo3 = Foo["UnknownClass"]()  # E:
     foo4 = Foo[]()  # E:
@@ -1085,7 +1118,7 @@ assert_type(g(0, [""]), int | str)
     "#,
 );
 
-// Regression test for https://github.com/facebook/pyrefly/issues/2130
+// Regression test for https://github.com/pyrefly-org/pyrefly/issues/2130
 testcase!(
     test_generic_return_type_with_union_of_scoped_type_params,
     r#"
@@ -1119,6 +1152,79 @@ def f[T](x: T, y: T) -> T: ...
 def g(x: Any):
     # `list[Any]` absorbs `list[int]`
     assert_type(f([x], [1]), list[Any])
+    "#,
+);
+
+testcase!(
+    test_any_lower_bound_with_callable_upper_bound,
+    r#"
+from typing import Any, Callable, assert_type, reveal_type
+
+def apply[T](value: T, callback: Callable[[T], object]) -> T: ...
+def apply_reversed[T](callback: Callable[[T], object], value: T) -> T: ...
+def consume(value: str) -> None: ...
+def consume_union(value: str | bytes) -> None: ...
+def consume_any(value: Any) -> None: ...
+def infer_upper[T](callback: Callable[[T], object]) -> T: ...
+def merge[T](x: T, y: T, callback: Callable[[T], object]) -> T: ...
+
+def test(value: Any, text: str) -> None:
+    reveal_type(apply(value, consume))  # E: revealed type: str & Any
+    reveal_type(apply_reversed(consume, value))  # E: revealed type: str & Any
+    assert_type(apply(text, consume), str)
+    assert_type(infer_upper(consume), str)
+    assert_type(merge(value, text, consume), str)
+    assert_type(merge(text, value, consume), str)
+    assert_type(apply(value, consume_any), Any)
+    result = apply(value, consume)
+    reveal_type(result.upper())  # E: revealed type: str & Any
+    assert_type(result.upper(1), Any)
+    result.unknown_method()
+    union_result = apply(value, consume_union)
+    reveal_type(union_result)  # E: revealed type: (bytes & Any) | (str & Any)
+    assert_type(len(union_result), int)
+    union_result.unknown_method()
+    "#,
+);
+
+testcase!(
+    test_implicit_any_lower_bound_with_upper_bound,
+    r#"
+from typing import Callable, reveal_type
+
+def apply[T](value: T, callback: Callable[[T], object]) -> T: ...
+def apply_reversed[T](callback: Callable[[T], object], value: T) -> T: ...
+def consume(value: str) -> None: ...
+
+def test(value) -> None:
+    reveal_type(apply(value, consume))  # E: revealed type: str & Unknown
+    reveal_type(apply_reversed(consume, value))  # E: revealed type: str & Unknown
+    "#,
+);
+
+// Unknown inputs still produce diagnostics, but contextual return types remain useful.
+testcase!(
+    test_implicit_any_lower_bound_with_context,
+    TestEnv::new()
+        .enable_unknown_argument_type_error()
+        .enable_no_any_return_implicit_error(),
+    r#"
+import os.path
+import re
+
+def escape(value) -> str:
+    return re.escape(value)  # E: The type of this argument is unknown
+
+def expanduser(value) -> str:
+    return os.path.expanduser(value)  # E: The type of this argument is unknown
+
+def dirname(value) -> str:
+    return os.path.dirname(os.path.abspath(value))  # E: The type of this argument is unknown # E: The type of this argument is unknown
+
+def append(value) -> None:
+    parts: list[str] = []
+    parts.append(re.escape(value))  # E: The type of this argument is unknown
+    parts.append(os.path.expanduser(value))  # E: The type of this argument is unknown
     "#,
 );
 

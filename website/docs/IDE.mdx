@@ -51,6 +51,15 @@ treats the dependency files as [unconfigured](../configuration#unconfigured-proj
 an unconfigured dependency, Pyrefly may perform a more conservative analysis and provide
 less precise type information.
 
+The Python environment is the exception. A file found through the importing file's
+[site package path](../import-resolution#site-packages-path) is part of the importer's
+environment, so its own imports also resolve through the importer's site package path, as
+they do at runtime. For example, `library/` might have its own configuration and virtual
+environment and be installed in editable mode into `app/.venv`. Files in `app/` and the
+library files they import then share one copy of each dependency in `app/.venv`. A library
+imported from two environments is checked once in each, and a library file you open is
+checked in its own environment.
+
 Per-file configuration selection can make IDE results differ from `pyrefly check` with no
 file arguments. A check with no file arguments runs in project mode and uses one selected
 configuration for the project and all imported files. The language server and
@@ -140,11 +149,11 @@ Legacy mapping onto the new model:
 - `default` resets both new settings to their unset values (`typeCheckingMode = "auto"`, `disableTypeErrors = false`). Use it to clear a previous `force-on` / `force-off` setting.
 - `error-missing-imports` was removed in v0.64.0 and now behaves identically to `default`.
 
-#### `python.pyrefly.diagnosticMode`
+#### `python.analysis.diagnosticMode`
 
 **Type:** enum (`openFilesOnly`, `workspace`) &nbsp; **Default:** `"openFilesOnly"`
 
-Controls the scope of Pyrefly's diagnostic analysis. When set to `'openFilesOnly'`, diagnostics are only computed for files currently open in the editor. When set to `'workspace'`, Pyrefly publishes diagnostics for all files in a project once any file from that project is opened. Projects are identified through pyrefly config files (`pyrefly.toml` or `pyproject.toml` with `[tool.pyrefly]`) discovered by the normal upward config search. Files not covered by any explicit pyrefly config are not included.
+Controls diagnostic scope. `openFilesOnly` checks open files. `workspace` publishes diagnostics for configured projects once a project file opens. Projects require `pyrefly.toml` or `[tool.pyrefly]` in `pyproject.toml`. Files outside configured projects are excluded from workspace analysis. Existing `python.pyrefly.diagnosticMode` settings remain supported and take precedence.
 
 #### `python.pyrefly.disableLanguageServices`
 
@@ -195,6 +204,14 @@ If true, Pyrefly will sync notebook documents with the language server. Set to `
 **Type:** boolean &nbsp; **Default:** `false`
 
 Enable Pyrefly's Run/Test CodeLens actions for Python files.
+
+#### `python.pyrefly.referencesCodeLens`
+
+**Type:** boolean &nbsp; **Default:** `false`
+
+Show best-effort reference counts above Python definitions. Select a count to show references.
+Counts can be incomplete. Indexing and a supported client are required. Notebook cells are excluded.
+Run/Test actions remain controlled by `runnableCodeLens`.
 
 #### `python.analysis.showHoverGoToLinks`
 
@@ -258,7 +275,7 @@ The keys are the VSCode setting names with the leading `python.` stripped, so `p
 
 Two exceptions: `commentFoldingRanges` sits at the top level rather than under `pyrefly`, and `pyrefly.pyreflyExecutable` / `pyrefly.lspPath` / `pyrefly.lspArguments` / `pyrefly.trace.server` have no `initializationOptions` equivalent at all — they tell the VSCode extension how to launch the server, which your client already does itself.
 
-Below is an example showing every supported key at its default value:
+The example shows the main settings and their default values:
 ```json
 {
   "pythonPath": "/usr/bin/python3",
@@ -283,13 +300,13 @@ Below is an example showing every supported key at its default value:
     "displayTypeErrors": "default",
     "typeErrorDisplayStatusVersion": "v1",
     "disableLanguageServices": false,
-    "diagnosticMode": "openFilesOnly",
     "extraSearchPaths": [],
     "extraProjectExcludes": [],
     "configPath": "",
     "streamDiagnostics": true,
     "syncNotebooks": true,
     "runnableCodeLens": false,
+    "referencesCodeLens": false,
     "disabledLanguageServices": {
       "hover": false,
       "documentSymbol": false,
@@ -341,7 +358,7 @@ Renamed to [`extraSearchPaths`](#pyreflyextrasearchpaths). Still accepted for ba
 
 **Type:** array of strings &nbsp; **Default:** `[]`
 
-Globs to exclude from the project, appended to the [`project-excludes`](../configuration#project-excludes) of whatever config Pyrefly resolves for a file. Files matching them are not type checked: no diagnostics are published for them, and they are skipped when [`diagnosticMode`](#pythonpyreflydiagnosticmode) is `workspace`.
+Globs to exclude from the project, appended to the [`project-excludes`](../configuration#project-excludes) of whatever config Pyrefly resolves for a file. Files matching them are not type checked: no diagnostics are published for them, and they are skipped when [`diagnosticMode`](#pythonanalysisdiagnosticmode) is `workspace`.
 
 Use this to map an editor's own notion of excluded directories (for example PyCharm's "Excluded" content roots) onto Pyrefly without writing a `pyrefly.toml`. Relative globs are resolved against the workspace folder the setting is scoped to; patterns use `/` as the separator on every platform.
 
@@ -367,7 +384,7 @@ Opt in to the [`pyrefly/typeErrorDisplayStatusChanged`](#custom-notification-pyr
 
 **Type:** enum (`openFilesOnly`, `workspace`) &nbsp; **Default:** `"openFilesOnly"`
 
-Same meaning as [`pyrefly.diagnosticMode`](#pythonpyreflydiagnosticmode), and read only as a fallback when that is unset. Exists so that a client already forwarding Pylance's `python.analysis.diagnosticMode` gets the expected behavior for free.
+Controls [diagnostic scope](#pythonanalysisdiagnosticmode). The legacy `pyrefly.diagnosticMode` key remains supported and takes precedence when both are present.
 
 ##### `analysis.importFormat`
 
@@ -474,7 +491,7 @@ current file. Clients should debounce: a single rebuild sends at least a
 
 ## Issues?
 
-If you experience issues with the Pyrefly extension, please create an [issue](https://github.com/facebook/pyrefly/issues) on github.
+If you experience issues with the Pyrefly extension, please create an [issue](https://github.com/pyrefly-org/pyrefly/issues) on github.
 
 ## Other Editors
 Support for other editors is community-driven. If you would like to set this up, please contribute.
@@ -805,4 +822,13 @@ Here's an example of a Zed config with Pyrefly integration:
     }
   }
 }
+```
+
+### Claude Code
+
+Pyrefly ships a [Claude Code](https://code.claude.com) plugin that runs `pyrefly lsp` for `.py` and `.pyi` files. With `pyrefly` on your `PATH`, run:
+
+```
+/plugin marketplace add pyrefly-org/pyrefly
+/plugin install pyrefly-lsp@pyrefly
 ```
