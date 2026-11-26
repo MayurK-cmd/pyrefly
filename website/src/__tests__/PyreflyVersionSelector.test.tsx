@@ -11,6 +11,7 @@ import '@testing-library/jest-dom';
 import { fireEvent, render, waitFor } from '@testing-library/react';
 import React from 'react';
 import PyreflyVersionSelector from '../sandbox/PyreflyVersionSelector';
+import { invalidatePyreflyVersions } from '../sandbox/pyreflyVersions';
 import { restoreFetch, stubFetch } from './__test_utils__/fetchStub';
 
 const VERSIONS_RESPONSE = {
@@ -22,6 +23,10 @@ const VERSIONS_RESPONSE = {
 };
 
 describe('PyreflyVersionSelector', () => {
+    beforeEach(() => {
+        invalidatePyreflyVersions();
+    });
+
     afterEach(() => {
         restoreFetch();
     });
@@ -77,6 +82,41 @@ describe('PyreflyVersionSelector', () => {
             expect(selector).toHaveTextContent('Pyrefly 1.2.0')
         );
         expect(selector).toHaveValue('9.9.9');
+    });
+
+    test('serves a remount from the cached list', async () => {
+        const fetchMock = jest.fn().mockResolvedValue({
+            ok: true,
+            json: async () => VERSIONS_RESPONSE,
+        });
+        stubFetch(fetchMock);
+        const { unmount, getByLabelText } = render(
+            <PyreflyVersionSelector
+                selected={null}
+                onSelect={jest.fn()}
+                disabled={false}
+            />
+        );
+        const selector = getByLabelText('Select Pyrefly version');
+        await waitFor(() =>
+            expect(selector).toHaveTextContent('Pyrefly 1.2.0')
+        );
+        unmount();
+
+        // A remount (an ordinary parent re-render) reuses the one request.
+        const second = render(
+            <PyreflyVersionSelector
+                selected={null}
+                onSelect={jest.fn()}
+                disabled={false}
+            />
+        );
+        await waitFor(() =>
+            expect(
+                second.getByLabelText('Select Pyrefly version')
+            ).toHaveTextContent('Pyrefly 1.2.0')
+        );
+        expect(fetchMock).toHaveBeenCalledTimes(1);
     });
 
     test('falls back to the bundled build when the list fails', async () => {

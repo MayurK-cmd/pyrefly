@@ -23,9 +23,17 @@ const JSDELIVR_DATA_URL = `https://data.jsdelivr.com/v1/packages/npm/${PYREFLY_N
 const MAX_RELEASE_VERSIONS = 15;
 const MAX_PRERELEASE_VERSIONS = 10;
 
-// npm versions are always full semver; the manifest parser drops anything
-// else, so that the version comparison stays well-defined.
-const SEMVER = /^\d+\.\d+\.\d+(?:-.+)?(?:\+.+)?$/;
+// npm versions are always full semver. Identifiers are restricted to
+// letters, digits and dashes so that a version from a shared URL can never
+// contain `/`, `..` or `@`: the loader rejects anything else before it is
+// turned into a URL, which keeps a crafted link inside this package.
+const SEMVER =
+    /^\d+\.\d+\.\d+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
+
+/** Whether `version` is a complete npm version this sandbox can load. */
+export function isValidPyreflyVersion(version: string): boolean {
+    return SEMVER.test(version);
+}
 
 export interface PyreflyVersionInfo {
     /** The npm version, which matches the pyrefly release tag. */
@@ -40,7 +48,9 @@ export interface PyreflyWasmUrls {
 }
 
 export function pyreflyWasmUrls(version: string): PyreflyWasmUrls {
-    const base = `https://cdn.jsdelivr.net/npm/${PYREFLY_NPM_PACKAGE}@${version}`;
+    // The version is one path component: percent-encoding it means no
+    // caller can escape the `pyrefly-wasm@` segment of the URL.
+    const base = `https://cdn.jsdelivr.net/npm/${PYREFLY_NPM_PACKAGE}@${encodeURIComponent(version)}`;
     return {
         glue: `${base}/pyrefly_wasm.js`,
         wasm: `${base}/pyrefly_wasm_bg.wasm`,
@@ -53,8 +63,30 @@ export function isPrerelease(version: string): boolean {
     return version.split('+', 1)[0].includes('-');
 }
 
-/** Fetches the package versions for the selector, newest first. */
-export async function fetchPyreflyVersions(): Promise<PyreflyVersionInfo[]> {
+// The selector mounts and unmounts with ordinary UI updates, so the list is
+// fetched at most once per page load and shared through this promise.
+let catalog: Promise<PyreflyVersionInfo[]> | null = null;
+
+/**
+ * Fetches the package versions for the selector, newest first. Repeated
+ * calls share one request; a failed request is retried by the next call.
+ */
+export function fetchPyreflyVersions(): Promise<PyreflyVersionInfo[]> {
+    if (catalog === null) {
+        catalog = loadCatalog().catch((error) => {
+            catalog = null;
+            throw error;
+        });
+    }
+    return catalog;
+}
+
+/** Drops the cached list, so that the next fetch reaches the network. */
+export function invalidatePyreflyVersions(): void {
+    catalog = null;
+}
+
+async function loadCatalog(): Promise<PyreflyVersionInfo[]> {
     const response = await fetch(JSDELIVR_DATA_URL);
     if (!response.ok) {
         throw new Error(
@@ -99,7 +131,7 @@ function versionsOf(data: unknown): string[] {
                 : null
         )
         .filter((version): version is string => typeof version === 'string')
-        .filter((version) => SEMVER.test(version));
+        .filter(isValidPyreflyVersion);
 }
 
 /** Compares two npm (semver) versions: positive when `a` is later. */

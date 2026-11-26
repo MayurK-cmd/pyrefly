@@ -10,13 +10,19 @@
 import {
     compareVersions,
     fetchPyreflyVersions,
+    invalidatePyreflyVersions,
     isPrerelease,
+    isValidPyreflyVersion,
     parsePyreflyVersions,
     pyreflyWasmUrls,
 } from '../sandbox/pyreflyVersions';
 import { restoreFetch, stubFetch } from './__test_utils__/fetchStub';
 
 describe('pyreflyVersions', () => {
+    // The catalog is cached across calls; each test needs its own fetch.
+    beforeEach(() => {
+        invalidatePyreflyVersions();
+    });
     test('pyreflyWasmUrls builds jsDelivr URLs', () => {
         expect(pyreflyWasmUrls('1.2.0')).toEqual({
             glue: 'https://cdn.jsdelivr.net/npm/pyrefly-wasm@1.2.0/pyrefly_wasm.js',
@@ -87,10 +93,27 @@ describe('pyreflyVersions', () => {
         expect(parsed.filter((info) => info.prerelease)).toHaveLength(10);
     });
 
+    test('isValidPyreflyVersion accepts only complete npm versions', () => {
+        expect(isValidPyreflyVersion('1.2.0')).toBe(true);
+        expect(isValidPyreflyVersion('1.2.0-dev.2')).toBe(true);
+        expect(isValidPyreflyVersion('1.2.0+build')).toBe(true);
+        // Path traversal must not survive into the CDN URL.
+        expect(isValidPyreflyVersion('1/../evil-pkg@1.0.0')).toBe(false);
+        expect(isValidPyreflyVersion('1.2.0-../../evil')).toBe(false);
+        expect(isValidPyreflyVersion('1.2')).toBe(false);
+        expect(isValidPyreflyVersion('')).toBe(false);
+    });
+
     test('parsePyreflyVersions tolerates a malformed response', () => {
         expect(parsePyreflyVersions(null)).toEqual([]);
         expect(parsePyreflyVersions({})).toEqual([]);
         expect(parsePyreflyVersions({ versions: 'oops' })).toEqual([]);
+        // A traversal attempt is not a version and is dropped.
+        expect(
+            parsePyreflyVersions({
+                versions: [{ version: '1.2.0-../../evil' }],
+            })
+        ).toEqual([]);
     });
 
     test('fetchPyreflyVersions parses the jsDelivr data API', async () => {
@@ -115,6 +138,40 @@ describe('pyreflyVersions', () => {
         stubFetch(jest.fn().mockResolvedValue({ ok: false, status: 503 }));
         try {
             await expect(fetchPyreflyVersions()).rejects.toThrow('503');
+        } finally {
+            restoreFetch();
+        }
+    });
+
+    test('fetchPyreflyVersions serves one request to every caller', async () => {
+        const fetchMock = jest.fn().mockResolvedValue({
+            ok: true,
+            json: async () => ({ versions: [{ version: '1.2.0' }] }),
+        });
+        stubFetch(fetchMock);
+        try {
+            const first = fetchPyreflyVersions();
+            const second = fetchPyreflyVersions();
+            expect(second).toBe(first);
+            await expect(first).resolves.toEqual([
+                { version: '1.2.0', prerelease: false },
+            ]);
+            expect(fetchMock).toHaveBeenCalledTimes(1);
+        } finally {
+            restoreFetch();
+        }
+    });
+
+    test('fetchPyreflyVersions retries after a failed request', async () => {
+        const fetchMock = jest
+            .fn()
+            .mockResolvedValueOnce({ ok: false, status: 503 })
+            .mockResolvedValueOnce({ ok: true, json: async () => ({}) });
+        stubFetch(fetchMock);
+        try {
+            await expect(fetchPyreflyVersions()).rejects.toThrow('503');
+            await expect(fetchPyreflyVersions()).resolves.toEqual([]);
+            expect(fetchMock).toHaveBeenCalledTimes(2);
         } finally {
             restoreFetch();
         }

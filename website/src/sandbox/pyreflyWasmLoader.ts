@@ -7,7 +7,7 @@
  * @format
  */
 
-import { pyreflyWasmUrls } from './pyreflyVersions';
+import { isValidPyreflyVersion, pyreflyWasmUrls } from './pyreflyVersions';
 
 /**
  * A loaded pyrefly module: the JS glue, which exports `State` and
@@ -64,6 +64,13 @@ async function loadBundled(): Promise<LoadedPyrefly> {
 }
 
 async function loadFetched(version: string): Promise<LoadedPyrefly> {
+    // Versions reach this function from shared URLs as well as from the
+    // selector, so reject anything that is not a complete npm version before
+    // it is turned into a URL. A crafted value such as `1/../other-pkg@1.0.0`
+    // would otherwise normalize to a different package's JavaScript.
+    if (!isValidPyreflyVersion(version)) {
+        throw new Error(`Invalid pyrefly version: ${version}`);
+    }
     const urls = pyreflyWasmUrls(version);
     // Each version ships its own glue, matched to its wasm ABI, so the glue
     // cannot be shared with the bundled build. Fetch the glue text and
@@ -80,14 +87,16 @@ async function loadFetched(version: string): Promise<LoadedPyrefly> {
     // `webpackIgnore` keeps this a native dynamic import of the blob URL.
     const mod = await import(/* webpackIgnore: true */ blobUrl);
     URL.revokeObjectURL(blobUrl);
+    // `default` accepts a URL and streams the compile, which lets the
+    // browser cache the compiled module for later visits. It must run
+    // before the handshake: `version()` reads a wasm export, which does not
+    // exist until the module is instantiated.
+    await mod.default(urls.wasm);
     // Handshake: reject a build whose glue does not provide the sandbox
     // interface, instead of failing later on a typechecker call.
     const reported = mod.version();
     if (typeof reported !== 'string' || reported.length === 0) {
         throw new Error(`pyrefly ${version} has no version handshake`);
     }
-    // `default` accepts a URL and streams the compile, which lets the
-    // browser cache the compiled module for later visits.
-    await mod.default(urls.wasm);
     return { mod, wasmSource: urls.wasm };
 }

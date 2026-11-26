@@ -97,6 +97,10 @@ export default function Sandbox({
     const [errors, setErrors] =
         useState<ReadonlyArray<PyreflyErrorMessage> | null>([]);
     const [internalError, setInternalError] = useState('');
+    // Why the sandbox fell back to the bundled build. Kept apart from
+    // `internalError`, which every successful check clears, so that the
+    // explanation survives the successful bundled load it causes.
+    const [fallbackWarning, setFallbackWarning] = useState('');
     // Increases when the module is ready again after a crash.
     const [wasmRestarts, setWasmRestarts] = useState(0);
     const [loading, setLoading] = useState(true);
@@ -190,6 +194,7 @@ export default function Sandbox({
     // selection in the URL, so that shared sandbox links reproduce it.
     const handlePyreflyVersionSelect = useCallback((version: string | null) => {
         setPyreflySource(version);
+        setFallbackWarning('');
         updatePyreflyVersionParam(version);
     }, []);
 
@@ -466,7 +471,10 @@ export default function Sandbox({
         };
     }, [isResizing]);
 
-    const TabBar = () => (
+    // Rendered as a direct call rather than `<TabBar />`: a component
+    // defined here would get a new type on every render, remounting the
+    // version selector (and its catalog fetch) on ordinary UI updates.
+    const renderTabBar = () => (
         <div {...stylex.props(styles.tabBar)}>
             {Array.from(models.keys()).map((fileName) => (
                 <div key={fileName} {...stylex.props(styles.tabContainer)}>
@@ -690,37 +698,69 @@ export default function Sandbox({
             return;
         }
 
+        // A load outlives the effect that started it, so an obsolete or
+        // unmounted activation must not publish state or write the URL: a
+        // slow rejection would otherwise erase the param of whatever loaded
+        // after it.
+        let cancelled = false;
+
+        // A fetched build that fails falls back to the bundled build and
+        // records why, in state that the successful bundled load does not
+        // clear.
+        const fallBack = (message: string) => {
+            setFallbackWarning(`${message}. Using the bundled build.`);
+            setPyreflySource(null);
+            updatePyreflyVersionParam(null);
+        };
+
         setLoading(true);
         const pyreflyWasmPromise = loadPyrefly(pyreflySource);
         pyreflyWasmRef.current = pyreflyWasmPromise;
         pyreflyWasmPromise
             .then((loaded) => {
+                if (cancelled) {
+                    return;
+                }
                 try {
-                    setPyreflyVersion(loaded.mod.version());
-                    setPyreService(new loaded.mod.State(pythonVersion));
+                    // Construct the candidate before committing any of the
+                    // identity state: if `State` rejects this build, the
+                    // version, URL and service must keep describing the
+                    // checker that is actually running.
+                    const reported = loaded.mod.version();
+                    const service = new loaded.mod.State(pythonVersion);
+                    setPyreflyVersion(reported);
+                    setPyreService(service);
                     setLoading(false);
                     setInternalError('');
                 } catch (e) {
-                    setLoading(false);
-                    setInternalError(
-                        `Failed to initialize with Python ${pythonVersion}: ${e}`
-                    );
+                    if (pyreflySource !== null) {
+                        fallBack(
+                            `Failed to initialize pyrefly ${pyreflySource}: ${e}`
+                        );
+                    } else {
+                        setLoading(false);
+                        setInternalError(
+                            `Failed to initialize with Python ${pythonVersion}: ${e}`
+                        );
+                    }
                 }
             })
             .catch((e) => {
-                setLoading(false);
+                if (cancelled) {
+                    return;
+                }
                 if (pyreflySource === null) {
+                    setLoading(false);
                     setInternalError(JSON.stringify(e));
                 } else {
                     // A fetched version may be incompatible with the
                     // sandbox; fall back to the bundled build.
-                    setPyreflySource(null);
-                    updatePyreflyVersionParam(null);
-                    setInternalError(
-                        `Failed to load pyrefly ${pyreflySource}: ${e}`
-                    );
+                    fallBack(`Failed to load pyrefly ${pyreflySource}: ${e}`);
                 }
             });
+        return () => {
+            cancelled = true;
+        };
     }, [isInViewport, pythonVersion, pyreflySource]); // Re-run when these change
 
     // Need to add createModel handler in case monaco model was not created at mount time
@@ -1023,7 +1063,7 @@ export default function Sandbox({
                 !isCodeSnippet && !isMobile() && styles.sandboxPadding
             )}
         >
-            {!isCodeSnippet && <TabBar />}
+            {!isCodeSnippet && renderTabBar()}
             <div
                 ref={sandboxContainerRef}
                 {...stylex.props(
@@ -1085,6 +1125,7 @@ export default function Sandbox({
                             goToDef={handleGoToDefFromErrors}
                             errors={errors}
                             internalError={internalError}
+                            fallbackWarning={fallbackWarning}
                             pythonOutput={pythonOutput}
                             pyodideStatus={pyodideStatus}
                             activeTab={activeTab}
